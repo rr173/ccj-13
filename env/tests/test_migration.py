@@ -107,6 +107,37 @@ def test_diff_blocks_cutover(client):
     assert act(client, "cutover", "k5").json()["ok"]
 
 
+def test_extra_record_in_new_blocks_cutover(client):
+    mk_records(client)
+    act(client, "freeze", "k1")
+    assert act(client, "validate", "k2").json()["ok"]
+    # 校验通过后新表多出一条旧表没有的记录 -> 切换前复核必须报出并阻止
+    from app.db import SessionLocal
+    from app.models import RecordNew
+    db = SessionLocal()
+    db.add(RecordNew(id=99, name="多出来的", email="x@x.com", tags=["a"], schema_version=2))
+    db.commit(); db.close()
+    c = act(client, "cutover", "k3").json()
+    assert c["ok"] is False and len(c["diffs"]) == 1
+    d = c["diffs"][0]
+    assert d["record_id"] == 99 and d["field"] == "__extra__"
+    assert d["old"] is None and d["new"]["name"] == "多出来的"
+    assert client.get("/api/status").json()["phase"] == "VALIDATED"  # 未切开
+    # 重新校验同样失败: 差异落审计, 回到冻结态
+    v = act(client, "validate", "k4").json()
+    assert v["ok"] is False and v["diffs"][0]["field"] == "__extra__"
+    assert client.get("/api/status").json()["phase"] == "FROZEN"
+    audits = client.get("/api/admin/audit").json()
+    failed = [a for a in audits if a["action"] == "validate" and a["diffs"]]
+    assert failed and failed[0]["diffs"][0]["record_id"] == 99
+    # 清掉多余记录后校验、切换恢复可用
+    db = SessionLocal()
+    db.query(RecordNew).filter_by(id=99).delete()
+    db.commit(); db.close()
+    assert act(client, "validate", "k5").json()["ok"]
+    assert act(client, "cutover", "k6").json()["ok"]
+
+
 def test_recover_restores_writable_and_cleans_partial(client):
     mk_records(client)
     act(client, "freeze", "k1")

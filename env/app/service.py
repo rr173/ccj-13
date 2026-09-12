@@ -78,9 +78,15 @@ def diff_records(expected: dict, actual: dict, record_id: int) -> list[dict]:
 
 
 def compare_all(session: Session) -> list[dict]:
-    """全量比对旧表与按转换规则应得的新表内容。"""
+    """全量双向比对旧表与按转换规则应得的新表内容。
+
+    正向: 每条旧记录在新表必须存在且字段一致;
+    反向: 新表不允许存在旧表没有的记录 —— 切换后它会静默生效, 必须报出并阻止。
+    """
     diffs: list[dict] = []
+    old_ids: set[int] = set()
     for old in session.query(RecordOld).order_by(RecordOld.id):
+        old_ids.add(old.id)
         new = session.get(RecordNew, old.id)
         if new is None:
             diffs.append({
@@ -91,6 +97,15 @@ def compare_all(session: Session) -> list[dict]:
             })
             continue
         diffs.extend(diff_records(transform(old), new_to_dict(new), old.id))
+    for new in (session.query(RecordNew)
+                .filter(RecordNew.id.notin_(old_ids))
+                .order_by(RecordNew.id)):
+        diffs.append({
+            "record_id": new.id,
+            "field": "__extra__",
+            "old": None,
+            "new": new_to_dict(new),
+        })
     return diffs
 
 
