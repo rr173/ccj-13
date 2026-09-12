@@ -108,6 +108,62 @@ DRAFT ─start→ RUNNING ─pause→ PAUSED ─resume→ RUNNING
                                                   └→ HALTED(超限); 计划取消 → SKIPPED
 ```
 
+## 迁移回放与报告(只读)
+
+管理员可针对**已有迁移计划**先固化一份**持久化审计检查点**，再选择"计划 + 检查点"创建**回放任务**，
+由后台 worker 按**原计划依赖顺序**逐步把检查点快照重放成报告。**回放全程只读**：绝不修改原批次、
+计划、业务新旧表与业务审计，只写 `replay_*` 表。
+
+### 审计检查点(replay_checkpoints)
+
+`POST /api/admin/checkpoints {plan_id}` 在创建时刻为计划固化：
+
+- 全局审计游标 `audit_cursor_id`（当时最大 `audit_log.id`）；
+- 计划级证据：计划须为 `COMPLETED` 且存在 `plan.create` 审计；
+- 逐步骤(批次)证据与快照：步骤须 SUCCESS、批次仍存在、批次有 `freeze` 与 `cutover` 审计
+  （记录关键审计 id，回放时重新核验存在性），并固化批次行（阶段/epoch/水位/freeze_version/
+  active_schema）与范围内**旧表全量快照**（预期状态的唯一来源）及当时新表产出快照。
+- 任何计划都允许固化：审计不完整时检查点状态为 **INCOMPLETE** 并逐条列出原因（仍持久化、可查看），
+  **只有 COMPLETE 检查点可用于回放**；用 INCOMPLETE 检查点创建回放会被 409 明确拒绝。
+- 检查点只追加、不可变。
+
+### 回放任务状态机
+
+```
+QUEUED ──获得并发额度──▶ RUNNING ──全部步骤报告完成──▶ COMPLETED(终态)
+  ▲                        │
+  └──── resume(重新排队) ── PAUSED ◀── pause(步骤边界)
+                           │
+                           ├─ cancel ──▶ CANCELED(终态, 未开始步骤 SKIPPED)
+                           └─ 检查点缺失/审计不完整/快照无法还原/批次已不存在 ──▶ FAILED(终态)
+```
+
+- **排队与并发**：任务创建即 `QUEUED`；同时处于 RUNNING 的回放不超过 `REPLAY_MAX_CONCURRENCY`
+  （默认 2，至少 1），超出排队；暂停后 `resume` 重新进入 QUEUED，再次受并发闸门约束。
+  worker 调度在 Postgres 下用咨询锁串行（SQLite 写事务天然串行），不会越过上限或重复执行。
+- **暂停/恢复/取消**：`pause` 在步骤边界生效（页面显示进度、当前步骤、差异数量、最近错误）；
+  `cancel` 把未开始步骤置 SKIPPED；**已完成步骤的报告在 FAILED/CANCELED 后仍然保留**。
+- **明确失败（FAILED，原因带错误码，未执行步骤 SKIPPED）**：
+  - `checkpoint_missing`：检查点已被删除；
+  - `checkpoint_incomplete`：检查点审计状态不完整；
+  - `audit_incomplete`：检查点记录的 freeze/cutover 关键审计在回放时已不存在（审计被删）；
+  - `snapshot_unrecoverable`：步骤的旧表快照为空/损坏，批次数据已无法还原；
+  - `batch_missing`：批次业务行已不存在。
+  计划不存在/检查点不存在则在**创建回放时**直接 404；检查点不属于该计划则 409。
+- **重启安全**：RUNNING 是崩溃边界（标记先提交、报告后提交）。重启对账把遗留 RUNNING 任务
+  复位到 **QUEUED**（安全的待执行位置）、其遗留 RUNNING 步骤复位为 PENDING（报告未提交，回放只读安全重跑），
+  SUCCESS 报告原样保留，worker 自动续跑。
+- **幂等**：检查点固化与回放创建/暂停/恢复/取消都要求 `idempotency_key`（`replay.*` 命名空间）；
+  同一(计划,检查点)重复创建**幂等返回已有非终态任务**（`already_active:true`，不产生第二个任务），
+  重复控制请求回显首次结果无副作用。
+- **报告**：`GET /api/admin/replays/{id}` 返回任务视图（进度/当前步骤/差异计数/最近错误/事件流水）；
+  `GET /api/admin/replays/{id}/report` 返回每步完整报告——**预期状态**（检查点批次快照 + 由旧表快照
+  按转换规则推导出的记录）、**实际状态**（当前批次行 + 范围内新表记录）、字段差异
+  （`__missing__` 缺行 / `name`/`email`/`tags` 不一致 / `__extra__` 预期外记录，范围外不参与）
+  与批次级状态差异（phase/active_schema/epoch/freeze_version 漂移）。差异是**发现项**：任务仍 COMPLETED，
+  只有数据无法还原类错误才 FAILED。
+- 回放 worker 与计划 worker 同生命周期（单实例后台线程；测试可用 `PLAN_WORKER_ENABLED=0` 一并关闭）。
+
 ## 运行
 
 ```bash
@@ -143,6 +199,14 @@ POST /api/admin/plans/{id}/reject                  {operator, idempotency_key, r
 POST /api/admin/plans/{id}/revoke-approval         {operator, idempotency_key} 启动前撤销审批
 PUT  /api/admin/plans/{id}/window                  {operator, idempotency_key, windows:[{starts_at,ends_at}]}
                                                     (启动前整体替换; 空列表清空限制; POST 同义)
+POST /api/admin/checkpoints          {operator, idempotency_key, plan_id}  固化审计检查点与批次快照
+GET  /api/admin/checkpoints                         检查点列表
+GET  /api/admin/checkpoints/{id}                    检查点详情(逐步骤审计证据/快照统计/不完整原因)
+POST /api/admin/replays              {operator, idempotency_key, plan_id, checkpoint_id} 创建回放并排队
+GET  /api/admin/replays                             回放任务列表(进度/当前步骤/差异数/最近错误)
+GET  /api/admin/replays/{id}                        回放任务详情
+GET  /api/admin/replays/{id}/report                 回放报告详情(逐步预期/实际状态与字段差异)
+POST /api/admin/replays/{id}/pause|resume|cancel    {operator, idempotency_key}
 GET  /api/admin/audit?batch_id=&plan_id=           审计日志(可按批次或计划过滤)
 POST /api/records                                  旧结构写入(批次冻结期 423 / 批次切换后 410)
 POST /api/v2/records                               新结构写入(仅所属批次 DONE)
@@ -157,7 +221,7 @@ GET  /api/records/{id}/compare                     批次冻结窗内双读比�
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 42 个用例:
+python3 -m pytest tests/ -q   # 67 个用例:
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
 # 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
@@ -168,4 +232,11 @@ python3 -m pytest tests/ -q   # 42 个用例:
 #           启动前撤销审批/重复审批拒绝撤销幂等(同键重放+跨键无副作用, 审计不重复)/
 #           低风险审批操作被拒/启动后审批锁定/窗口外暂停窗口内继续(审计)/启动时窗口外等待/
 #           窗口仅启动前可改且幂等/非法窗口原子拒绝/高风险+窗口双闸门叠加/重启保持审批与窗口边界
+# 回放(25): 检查点计划不存在 404/运行中计划检查点 INCOMPLETE 且原因可见/检查点固化幂等/
+#           回放创建计划·检查点缺失 404/检查点跨计划拒绝/不完整检查点拒绝/重复创建幂等回显/
+#           干净回放零差异/字段漂移+缺失检测(范围外不参与)/__extra__ 多余记录+批次状态漂移/
+#           审计删除 FAILED 且保留已完成报告/快照损坏 FAILED/检查点中途删除 FAILED/批次删除 FAILED/
+#           暂停在步骤边界+恢复续跑+终态拒绝/排队取消全部 SKIPPED/执行中取消保留报告/排队暂停不被认领/
+#           并发上限排队+完成后放行/重启 RUNNING 复位排队续跑不丢报告/回放只读(批次/业务表/审计不变)/
+#           依赖顺序 1→2→3/控制请求同键幂等重放/status 汇总/失败终态 worker 不再处理
 ```

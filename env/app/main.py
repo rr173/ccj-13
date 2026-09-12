@@ -6,13 +6,18 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from .db import Base, SessionLocal, engine
-from .models import AuditLog, MigrationBatch, MigrationPlan, RecordNew, RecordOld
-from .plans import PlanWorker
-from .schemas import (
-    AdminAction, BatchCreate, PlanAction, PlanCreate, PlanRejectAction,
-    PlanWindowAction, RecordIn, RecoverAction,
+from .models import (
+    AuditLog, MigrationBatch, MigrationPlan, RecordNew, RecordOld,
+    ReplayCheckpoint, ReplayTask,
 )
-from . import plans, service
+from .plans import PlanWorker
+from .replay import ReplayWorker
+from .schemas import (
+    AdminAction, BatchCreate, CheckpointCreate, PlanAction, PlanCreate,
+    PlanRejectAction, PlanWindowAction, RecordIn, RecoverAction, ReplayAction,
+    ReplayCreate,
+)
+from . import plans, replay, service
 
 APP_VERSION = service.APP_VERSION
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -24,6 +29,7 @@ def _worker_enabled() -> bool:
 
 app = FastAPI(title="结构迁移切换服务(按业务分组批次)", version=APP_VERSION)
 worker = PlanWorker(poll_interval=float(os.getenv("PLAN_WORKER_POLL_INTERVAL", "0.5")))
+replay_worker = ReplayWorker()
 
 
 def get_db():
@@ -66,15 +72,20 @@ def startup():
         # 计划重启对账必须先于 worker: 把遗留 RUNNING 步骤复位, 计划才不会"假运行"
         plans.boot_recover_plans(db)
         db.commit()
+        # 回放重启对账: 遗留 RUNNING 回放回到排队位置, 已完成步骤报告保留
+        replay.boot_recover_replays(db)
+        db.commit()
     finally:
         db.close()
     if _worker_enabled():
         worker.start()
+        replay_worker.start()
 
 
 @app.on_event("shutdown")
 def shutdown():
     worker.stop()
+    replay_worker.stop()
 
 
 # ---------- 错误映射 ----------
@@ -95,10 +106,19 @@ def status(db: Session = Depends(get_db)):
                .order_by(MigrationBatch.created_at, MigrationBatch.id).all())
     plan_rows = (db.query(MigrationPlan)
                  .order_by(MigrationPlan.created_at, MigrationPlan.id).all())
+    checkpoint_rows = (db.query(ReplayCheckpoint)
+                       .order_by(ReplayCheckpoint.created_at, ReplayCheckpoint.id).all())
+    replay_rows = (db.query(ReplayTask)
+                   .order_by(ReplayTask.created_at, ReplayTask.id).all())
     return {
         "app_version": APP_VERSION,
         "batches": [service.batch_to_dict(db, b) for b in batches],
         "plans": [plans.plan_to_dict(db, p) for p in plan_rows],
+        "checkpoints": [replay.checkpoint_to_dict(c, with_steps=False)
+                        for c in checkpoint_rows],
+        "replays": [replay.replay_to_dict(db, t, with_report=False)
+                    for t in replay_rows],
+        "replay_concurrency": replay.max_concurrency(),
     }
 
 
@@ -317,6 +337,112 @@ def update_plan_window(plan_id: str, body: PlanWindowAction,
     return _run_plan(db, "window", body,
                      lambda s, p: plans.do_update_window(s, p, body.operator, windows),
                      plan_id)
+
+
+# ---------- 迁移回放与报告(只读重放: 不改批次/计划/业务记录) ----------
+
+def _replay_not_found(e: Exception):
+    raise HTTPException(status_code=404, detail={"error": "replay_not_found", "reason": str(e)})
+
+
+def _replay_conflict(e: Exception):
+    raise HTTPException(status_code=409, detail={"error": "replay_conflict", "reason": str(e)})
+
+
+def _run_replay(db: Session, action: str, body, fn, task_id: str | None = None):
+    try:
+        result, replayed = replay.run_replay_action(
+            db, action=action, operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            task_id=task_id, fn=fn)
+    except replay.ReplayNotFound as e:
+        db.rollback()
+        _replay_not_found(e)
+    except replay.ReplayStateError as e:
+        db.rollback()
+        _replay_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/checkpoints", status_code=201)
+def create_checkpoint(body: CheckpointCreate, db: Session = Depends(get_db)):
+    """为已有迁移计划固化审计检查点与批次数据快照。计划不存在 -> 404;
+    不完整的检查点同样持久化(status=INCOMPLETE), 但不能用于回放。"""
+    return _run_replay(db, "checkpoint.create", body,
+                       lambda s, _t: replay.do_create_checkpoint(s, _t, body.operator, body.plan_id))
+
+
+@app.get("/api/admin/checkpoints")
+def list_checkpoints(db: Session = Depends(get_db)):
+    rows = (db.query(ReplayCheckpoint)
+            .order_by(ReplayCheckpoint.created_at, ReplayCheckpoint.id).all())
+    return [replay.checkpoint_to_dict(c, with_steps=False) for c in rows]
+
+
+@app.get("/api/admin/checkpoints/{checkpoint_id}")
+def get_checkpoint(checkpoint_id: str, db: Session = Depends(get_db)):
+    cp = db.get(ReplayCheckpoint, checkpoint_id)
+    if cp is None:
+        _replay_not_found(Exception(f"审计检查点 {checkpoint_id} 不存在"))
+    return replay.checkpoint_to_dict(cp)
+
+
+@app.post("/api/admin/replays", status_code=201)
+def create_replay(body: ReplayCreate, db: Session = Depends(get_db)):
+    """选择已有计划 + 持久化检查点创建回放任务并排队。
+    计划/检查点不存在 -> 404; 检查点不属于该计划或审计不完整 -> 409;
+    同(计划,检查点)重复创建幂等返回已有任务(already_active=true)。"""
+    return _run_replay(db, "create", body,
+                       lambda s, _t: replay.do_create_replay(
+                           s, _t, body.operator, body.plan_id, body.checkpoint_id))
+
+
+@app.get("/api/admin/replays")
+def list_replays(db: Session = Depends(get_db)):
+    rows = (db.query(ReplayTask)
+            .order_by(ReplayTask.created_at, ReplayTask.id).all())
+    return [replay.replay_to_dict(db, t, with_report=False) for t in rows]
+
+
+@app.get("/api/admin/replays/{replay_id}")
+def get_replay(replay_id: str, db: Session = Depends(get_db)):
+    """回放任务详情: 进度、当前步骤、差异数量、最近错误、步骤状态、事件流水。"""
+    task = db.get(ReplayTask, replay_id)
+    if task is None:
+        _replay_not_found(Exception(f"回放任务 {replay_id} 不存在"))
+    return replay.replay_to_dict(db, task, with_report=False)
+
+
+@app.get("/api/admin/replays/{replay_id}/report")
+def get_replay_report(replay_id: str, db: Session = Depends(get_db)):
+    """回放报告详情: 每个步骤的预期状态、实际状态、字段差异与批次状态差异;
+    已完成步骤的报告在任务 FAILED/CANCELED 后仍然保留。"""
+    task = db.get(ReplayTask, replay_id)
+    if task is None:
+        _replay_not_found(Exception(f"回放任务 {replay_id} 不存在"))
+    return replay.replay_to_dict(db, task, with_report=True)
+
+
+@app.post("/api/admin/replays/{replay_id}/pause")
+def pause_replay(replay_id: str, body: ReplayAction, db: Session = Depends(get_db)):
+    """暂停回放: 在当前步骤边界停住(已完成报告保留); 重复暂停幂等。"""
+    return _run_replay(db, "pause", body,
+                       lambda s, t: replay.do_pause(s, t, body.operator), replay_id)
+
+
+@app.post("/api/admin/replays/{replay_id}/resume")
+def resume_replay(replay_id: str, body: ReplayAction, db: Session = Depends(get_db)):
+    """恢复回放: 重新排队(再次受并发闸门约束), 从下一未完成步骤续跑; 重复恢复幂等。"""
+    return _run_replay(db, "resume", body,
+                       lambda s, t: replay.do_resume(s, t, body.operator), replay_id)
+
+
+@app.post("/api/admin/replays/{replay_id}/cancel")
+def cancel_replay(replay_id: str, body: ReplayAction, db: Session = Depends(get_db)):
+    """取消回放: 未开始步骤置 SKIPPED, 已完成步骤报告保留; 重复取消幂等。"""
+    return _run_replay(db, "cancel", body,
+                       lambda s, t: replay.do_cancel(s, t, body.operator), replay_id)
 
 
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------

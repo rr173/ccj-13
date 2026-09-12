@@ -4,7 +4,15 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import relationship
 
+from datetime import datetime, timezone
+
 from .db import Base
+
+
+def _utcnow() -> datetime:
+    """Python 端 UTC naive 默认时间(微秒精度): 回放排队 FIFO 依赖创建时刻排序,
+    SQLite 的 CURRENT_TIMESTAMP 只有秒级精度会让同秒创建的任务顺序不确定。"""
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 # 每个批次独立的阶段状态机:
 #   NORMAL --freeze--> FROZEN --validate--> VALIDATING --(通过)--> VALIDATED --cutover--> DONE
@@ -226,3 +234,159 @@ class IdempotencyKey(Base):
     request_hash = Column(String(64), nullable=False)
     response_json = Column(JSON, nullable=False)
     created_at = Column(DateTime, server_default=func.now())
+
+
+# ---------- 迁移回放与报告 ----------
+# 回放任务状态机:
+#   QUEUED(排队, 等待并发额度) --claim--> RUNNING --pause(步骤边界)--> PAUSED --resume--> QUEUED
+#      |                                     |
+#      +--cancel--> CANCELED(终态)           +--全部步骤报告完成--> COMPLETED(终态)
+#                                            +--检查点缺失/审计不完整/快照无法还原--> FAILED(终态)
+# 已完成步骤的报告在任何终态下都保留; 取消时未开始步骤置 SKIPPED。
+CHECKPOINT_STATUSES = ("COMPLETE", "INCOMPLETE")
+REPLAY_TASK_STATUSES = ("QUEUED", "RUNNING", "PAUSED", "CANCELED", "COMPLETED", "FAILED")
+REPLAY_STEP_STATUSES = ("PENDING", "RUNNING", "SUCCESS", "FAILED", "SKIPPED")
+REPLAY_TERMINAL_STATUSES = ("CANCELED", "COMPLETED", "FAILED")
+REPLAY_ACTIVE_STATUSES = ("QUEUED", "RUNNING", "PAUSED")
+
+
+class ReplayCheckpoint(Base):
+    """持久化审计检查点: 面向一个已有迁移计划, 在创建时刻固化审计游标、
+    计划级审计证据与每个步骤(批次)的审计证据和批次数据快照。
+
+    只有 COMPLETE 的检查点可用于创建回放任务: 计划已 COMPLETED、每步批次都有
+    freeze/cutover 审计且计划步骤均 SUCCESS。INCOMPLETE 检查点仍持久化并列出原因,
+    但回放创建会被明确拒绝。检查点只追加、不可变(回放只读它, 永不修改它)。"""
+
+    __tablename__ = "replay_checkpoints"
+
+    id = Column(String(32), primary_key=True)          # "C" + 随机串
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"),
+                     nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="INCOMPLETE", index=True)
+    audit_cursor_id = Column(Integer, nullable=False)  # 创建时全局最大审计 id(WAL 位置)
+    issues = Column(JSON, nullable=True)               # 计划级不完整原因
+    total_steps = Column(Integer, nullable=False, default=0)
+    complete_steps = Column(Integer, nullable=False, default=0)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow)
+
+    steps = relationship("ReplayCheckpointStep", cascade="all, delete-orphan",
+                         order_by="ReplayCheckpointStep.seq")
+
+
+class ReplayCheckpointStep(Base):
+    """检查点内单个计划步骤(批次)的固化内容:
+    批次行快照(阶段/epoch/水位/freeze_version/active_schema)、
+    关键审计 id(freeze/cutover, 回放时重新核验存在性)、
+    范围内旧表全量快照(回放预期状态的唯一来源)与当时新表产出快照。"""
+
+    __tablename__ = "replay_checkpoint_steps"
+    __table_args__ = (
+        UniqueConstraint("checkpoint_id", "seq", name="uq_checkpoint_step_seq"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    checkpoint_id = Column(String(32), ForeignKey("replay_checkpoints.id"),
+                           nullable=False, index=True)
+    plan_step_id = Column(Integer, nullable=False)
+    seq = Column(Integer, nullable=False)
+    batch_id = Column(String(32), nullable=False)
+    audit_status = Column(String(16), nullable=False, default="INCOMPLETE")
+    audit_issues = Column(JSON, nullable=True)
+    required_audit_ids = Column(JSON, nullable=False, default=list)  # freeze/cutover 审计 id
+    audit_action_ids = Column(JSON, nullable=False, default=list)    # 该批次全部审计 id(证据)
+    # 批次行快照
+    batch_phase = Column(String(32), nullable=True)
+    batch_epoch = Column(Integer, nullable=True)
+    batch_watermark = Column(Integer, nullable=True)
+    batch_freeze_version = Column(String(64), nullable=True)
+    batch_active_schema = Column(String(8), nullable=True)
+    # 批次数据快照(不可变; None 表示快照损坏 -> 回放明确失败)
+    old_records = Column(JSON, nullable=True)   # [old_to_dict ...] 预期状态来源
+    new_records = Column(JSON, nullable=True)   # [new_to_dict ...] 切换当时的新表产出
+    old_count = Column(Integer, nullable=False, default=0)
+    new_count = Column(Integer, nullable=False, default=0)
+
+
+class ReplayTask(Base):
+    """迁移回放任务: 基于(计划, 检查点)对原计划做只读重放。
+
+    回放绝不写批次/计划/业务记录/审计日志, 只写 replay_* 表;
+    同一(计划,检查点)同时至多有一个非终态任务, 重复创建幂等返回已有任务。
+    并发执行数受 REPLAY_MAX_CONCURRENCY 限制, 超出的任务排队等待。"""
+
+    __tablename__ = "replay_tasks"
+
+    id = Column(String(32), primary_key=True)          # "R" + 随机串
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"),
+                     nullable=False, index=True)
+    # 注意: 刻意不加 FK 约束 —— 检查点被删/损坏是必须能观测并明确失败的场景
+    checkpoint_id = Column(String(32), nullable=False, index=True)
+    plan_name = Column(String(200), nullable=False)
+    status = Column(String(16), nullable=False, default="QUEUED", index=True)
+    total_steps = Column(Integer, nullable=False, default=0)
+    completed_steps = Column(Integer, nullable=False, default=0)
+    diff_count = Column(Integer, nullable=False, default=0)   # 累计字段差异数
+    state_diff_count = Column(Integer, nullable=False, default=0)
+    current_seq = Column(Integer, nullable=True)             # 当前正在回放的步骤
+    last_error = Column(String(500), nullable=True)          # 页面"最近错误"
+    failure_reason = Column(String(500), nullable=True)      # FAILED 终态原因
+    created_by = Column(String(128), nullable=False)
+    updated_by = Column(String(128), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    task_steps = relationship("ReplayTaskStep", cascade="all, delete-orphan",
+                              order_by="ReplayTaskStep.seq")
+    events = relationship("ReplayTaskEvent", cascade="all, delete-orphan",
+                          order_by="desc(ReplayTaskEvent.id)")
+
+
+class ReplayTaskStep(Base):
+    """回放步骤报告: 从检查点快照生成预期状态、读取当前业务表得到实际状态、
+    记录字段级差异与批次级状态差异。RUNNING 标记先提交(崩溃边界), 报告随步骤成功同事务落库。"""
+
+    __tablename__ = "replay_task_steps"
+    __table_args__ = (
+        UniqueConstraint("task_id", "seq", name="uq_replay_step_seq"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(32), ForeignKey("replay_tasks.id"),
+                     nullable=False, index=True)
+    checkpoint_step_id = Column(Integer, nullable=True)  # 无 FK: 快照缺失要能明确失败
+    plan_step_id = Column(Integer, nullable=False)
+    seq = Column(Integer, nullable=False)
+    batch_id = Column(String(32), nullable=False)
+    depends_on = Column(JSON, nullable=False, default=list)  # [seq ...] 原计划依赖
+    status = Column(String(16), nullable=False, default="PENDING")
+    expected_state = Column(JSON, nullable=True)
+    actual_state = Column(JSON, nullable=True)
+    diffs = Column(JSON, nullable=True)               # 记录字段差异(含 __missing__/__extra__)
+    state_diffs = Column(JSON, nullable=True)         # 批次级状态差异(phase/active_schema)
+    diff_count = Column(Integer, nullable=False, default=0)
+    state_diff_count = Column(Integer, nullable=False, default=0)
+    last_error = Column(String(500), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class ReplayTaskEvent(Base):
+    """回放任务事件流水(只追加): 创建/排队/认领执行/暂停/恢复/取消/
+    步骤开始/成功/失败/跳过/完成/重启对账。回放不写业务审计表 audit_log。"""
+
+    __tablename__ = "replay_task_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=_utcnow)
+    task_id = Column(String(32), ForeignKey("replay_tasks.id"),
+                     nullable=False, index=True)
+    step_seq = Column(Integer, nullable=True)
+    event = Column(String(32), nullable=False)
+    operator = Column(String(128), nullable=False)
+    reason = Column(String(500), nullable=True)
+    detail = Column(JSON, nullable=True)

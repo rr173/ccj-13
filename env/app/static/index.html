@@ -25,6 +25,8 @@
   .BLOCKED { background: #9e9e9e; } .PENDING { background: #1565c0; }
   .FAILED { background: #ef6c00; } .SKIPPED { background: #546e7a; }
   .SUCCESS { background: #2e7d32; }
+  .QUEUED { background: #78909c; }
+  .INCOMPLETE { background: #ef6c00; } .COMPLETE { background: #2e7d32; }
   button { padding: 6px 12px; margin: 2px 4px 2px 0; border: 0; border-radius: 6px;
            background: #1565c0; color: #fff; cursor: pointer; font-size: 12px; }
   button.danger { background: #c62828; }
@@ -106,6 +108,37 @@
 </div>
 
 <div class="card">
+  <b>迁移回放与报告</b>（只读重放: 不改批次/计划/业务记录; 按原计划依赖顺序逐生成预期/实际状态与字段差异）
+  <div style="margin:8px 0">
+    <span class="muted">并发上限: 同时执行中的回放任务不超过 <b id="replayConcurrency">-</b> 个, 超出的任务排队</span>
+  </div>
+  <div class="muted" style="margin:4px 0">
+    ① 选择一个已完成的迁移计划固化审计检查点 → ② 选择"计划 + 检查点"创建回放任务
+  </div>
+  <div style="margin:6px 0">
+    <b>① 固化检查点</b>:
+    <select id="cpPlan" style="max-width:420px"></select>
+    <button onclick="createCheckpoint()">固化审计检查点</button>
+    <span class="muted">只有计划 COMPLETED 且每步 freeze/cutover 审计完整的检查点可用于回放</span>
+  </div>
+  <div>
+    <b>② 创建回放</b>:
+    <select id="rpPlan" style="max-width:260px"></select>
+    <select id="rpCp" style="max-width:200px"></select>
+    <button onclick="createReplay()">创建回放任务</button>
+  </div>
+  <div id="replayMsg" class="msg"></div>
+  <b style="display:block;margin:10px 0 4px">审计检查点</b>
+  <table>
+    <thead><tr><th>检查点</th><th>计划</th><th>状态</th><th>步骤审计</th><th>审计游标</th>
+      <th>创建者/时间</th><th>问题</th></tr></thead>
+    <tbody id="checkpoints"></tbody>
+  </table>
+  <b style="display:block;margin:10px 0 4px">回放任务</b>
+  <div id="replays"></div>
+</div>
+
+<div class="card">
   <b>写入探测</b>（批次内冻结拒写 / 切换后旧路径关闭; 批次外正常读写）:
   <input id="wId" type="number" value="1" style="width:70px">
   <input id="wName" value="demo" size="10">
@@ -166,6 +199,9 @@ async function refresh() {
   }).join('') || '<tr><td colspan="10" class="muted">尚无批次, 请先创建</td></tr>';
   syncPlanStepRows(s.batches);
   renderPlans(s.plans || []);
+  renderReplayControls(s);
+  renderCheckpoints(s.checkpoints || []);
+  renderReplays(s.replays || []);
   const rows = await (await fetch('/api/admin/audit?limit=50')).json();
   document.getElementById('audit').innerHTML = rows.map(r =>
     `<tr><td>${r.ts||''}</td><td>${r.batch_id||r.plan_id||''}</td><td>${r.operator}</td><td>${r.action}</td>
@@ -511,6 +547,154 @@ async function dualRead() {
   if (j.diff) { lastDiffs = j.diff; renderDiffs(`记录 ${id} 双读差异`); }
   document.getElementById('writeMsg').textContent =
     `GET /api/records/${id} -> HTTP ${r.status}\n` + JSON.stringify(j, null, 2);
+}
+
+// ---------- 迁移回放与报告 ----------
+
+function showReplayMsg(ok, text) {
+  const el = document.getElementById('replayMsg');
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+}
+
+function renderReplayControls(s) {
+  document.getElementById('replayConcurrency').textContent = s.replay_concurrency ?? '-';
+  const plans = s.plans || [];
+  const completed = plans.filter(p => p.status === 'COMPLETED');
+  const planOpts = p => completed.map(x =>
+    `<option value="${x.id}" ${x.id===p?'selected':''}>${x.id} · ${escapeHtml(x.name)} (${x.progress.done}/${x.progress.total} 步)</option>`
+  ).join('') || '<option value="">(没有已完成的计划)</option>';
+  const curCp = document.getElementById('rpPlan').value;
+  const curPlan = document.getElementById('cpPlan').value;
+  document.getElementById('cpPlan').innerHTML = planOpts(curPlan);
+  document.getElementById('rpPlan').innerHTML = planOpts(curCp);
+  const selPlan = document.getElementById('rpPlan').value;
+  const cps = (s.checkpoints || []).filter(c => c.plan_id === selPlan);
+  const prevCp = document.getElementById('rpCp').value;
+  document.getElementById('rpCp').innerHTML = cps.map(c =>
+    `<option value="${c.id}" ${c.id===prevCp?'selected':''} ${c.status!=='COMPLETE'?'disabled':''}>${c.id} · ${c.status} (${c.complete_steps}/${c.total_steps})</option>`
+  ).join('') || '<option value="">(该计划暂无检查点)</option>';
+}
+
+function renderCheckpoints(cps) {
+  document.getElementById('checkpoints').innerHTML = cps.map(c =>
+    `<tr>
+      <td>${c.id}</td><td>${c.plan_id}</td>
+      <td><span class="badge ${c.status}">${c.status}</span></td>
+      <td>${c.complete_steps}/${c.total_steps}</td>
+      <td>#${c.audit_cursor_id}</td>
+      <td>${c.created_by}<div class="muted">${c.created_at||''}</div></td>
+      <td>${c.issues && c.issues.length ? c.issues.map(escapeHtml).join('<br>') : '<span class="ok">无</span>'}</td>
+    </tr>`).join('')
+    || '<tr><td colspan="7" class="muted">尚无检查点</td></tr>';
+}
+
+async function createCheckpoint() {
+  const plan_id = document.getElementById('cpPlan').value;
+  if (!plan_id) { showReplayMsg(false, '请先选择一个已完成的计划'); return; }
+  const { status, j } = await post('/api/admin/checkpoints',
+    { operator: operator(), idempotency_key: idemKey(), plan_id });
+  if (status === 201) {
+    showReplayMsg(j.checkpoint_status === 'COMPLETE',
+      (j.replayed ? '[幂等重放] ' : '') + j.detail
+      + (j.issues && j.issues.length ? '\n问题:\n - ' + j.issues.join('\n - ') : ''));
+  } else {
+    showReplayMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  }
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function createReplay() {
+  const plan_id = document.getElementById('rpPlan').value;
+  const checkpoint_id = document.getElementById('rpCp').value;
+  if (!plan_id || !checkpoint_id) { showReplayMsg(false, '请选择计划与检查点'); return; }
+  const { status, j } = await post('/api/admin/replays',
+    { operator: operator(), idempotency_key: idemKey(), plan_id, checkpoint_id });
+  if (status === 201) {
+    showReplayMsg(true, (j.replayed ? '[幂等重放] ' : '')
+      + (j.already_active ? `[已有 ${j.status} 任务, 幂等返回] ` : '') + j.detail);
+  } else {
+    showReplayMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  }
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function replayAct(rid, name) {
+  const { status, j } = await post(`/api/admin/replays/${rid}/${name}`,
+    { operator: operator(), idempotency_key: idemKey() });
+  if (status === 200) showReplayMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showReplayMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function toggleReplayReport(rid, btn) {
+  const box = document.getElementById('rep-' + rid);
+  if (box.dataset.open) { box.innerHTML = ''; box.dataset.open = ''; btn.textContent = '报告详情'; return; }
+  const j = await (await fetch(`/api/admin/replays/${rid}/report`)).json();
+  const stepRows = j.steps.map(st => {
+    const rows = (st.diffs || []).map(d =>
+      `<tr><td>${d.record_id}</td><td>${d.field}</td>
+        <td>${d.field.startsWith('__') ? JSON.stringify(d.expected) : JSON.stringify(d.expected)}</td>
+        <td>${d.field.startsWith('__') ? JSON.stringify(d.actual) : JSON.stringify(d.actual)}</td></tr>`
+    ).join('');
+    const stateRows = (st.state_diffs || []).map(d =>
+      `<tr><td class="muted">批次状态</td><td>${d.field}</td><td>${JSON.stringify(d.expected)}</td>
+        <td>${JSON.stringify(d.actual)}</td></tr>`).join('');
+    const dep = (st.depends_on && st.depends_on.length) ? ' ←依赖[' + st.depends_on.join(',') + ']' : '';
+    return `<div style="margin:6px 0;border-top:1px dashed #ddd;padding-top:6px">
+      <b>步骤 seq=${st.seq}</b> 批次 ${st.batch_id}${dep}
+      <span class="badge ${st.status}">${st.status}</span>
+      <span class="muted">字段差异 ${st.diff_count} · 批次状态差异 ${st.state_diff_count}</span>
+      ${st.last_error ? `<div class="err">${escapeHtml(st.last_error)}</div>` : ''}
+      ${rows || stateRows
+        ? `<table style="margin-top:4px"><thead><tr><th>记录</th><th>字段</th><th>预期(检查点快照)</th><th>实际(当前业务表)</th></tr></thead>
+           <tbody>${rows}${stateRows}</tbody></table>`
+        : '<div class="ok">无差异</div>'}
+    </div>`;
+  }).join('');
+  const expected = j.steps.map(st => st.expected_state
+    ? `<div class="muted">seq=${st.seq}: 预期 ${st.expected_state.record_count} 行 / 实际 ${st.actual_state ? st.actual_state.record_count : '-'} 行</div>`
+    : '').join('');
+  box.innerHTML = `<div style="margin-top:6px">${expected}${stepRows}</div>`;
+  box.dataset.open = '1';
+  btn.textContent = '收起报告';
+}
+
+function renderReplays(replays) {
+  document.getElementById('replays').innerHTML = replays.map(r => {
+    const pct = r.progress.total ? Math.round(100 * r.progress.done / r.progress.total) : 0;
+    const canPause = ['QUEUED', 'RUNNING'].includes(r.status);
+    const canResume = r.status === 'PAUSED';
+    const canCancel = ['QUEUED', 'RUNNING', 'PAUSED'].includes(r.status);
+    return `<div class="card" style="background:#faf7ff">
+      <span class="badge ${r.status}">${r.status}</span>
+      <b>${escapeHtml(r.plan_name)}</b>
+      <span class="muted">任务 ${r.id} · 计划 ${r.plan_id} · 检查点 ${r.checkpoint_id}</span>
+      <span style="margin-left:8px">
+        <button class="plain" ${canPause?'':'disabled'} onclick="replayAct('${r.id}','pause')">暂停</button>
+        <button ${canResume?'':'disabled'} onclick="replayAct('${r.id}','resume')">恢复</button>
+        <button class="danger" ${canCancel?'':'disabled'} onclick="replayAct('${r.id}','cancel')">取消</button>
+        <button class="plain" onclick="toggleReplayReport('${r.id}', this)">报告详情</button>
+      </span>
+      <div style="margin:6px 0">
+        <div class="bar" style="display:inline-block;width:240px;vertical-align:middle">
+          <div style="width:${pct}%;background:#6a1b9a"></div></div>
+        <span class="muted">${r.progress.done}/${r.progress.total} 步</span>
+        <span class="muted" style="margin-left:16px">当前步骤: ${r.current_seq ?? '-'}</span>
+        <span class="muted" style="margin-left:16px">字段差异: <b class="${r.diff_count?'err':'ok'}">${r.diff_count}</b>
+          (批次状态差异 ${r.state_diff_count})</span>
+      </div>
+      ${r.failure_reason ? `<div class="err"><b>失败原因:</b> ${escapeHtml(r.failure_reason)}<br>
+        <span class="muted">已完成步骤的报告保留, 未执行步骤已跳过</span></div>` : ''}
+      ${r.last_error && r.last_error !== r.failure_reason
+        ? `<div class="err"><b>最近错误:</b> ${escapeHtml(r.last_error)}</div>` : ''}
+      <div id="rep-${r.id}"></div>
+      <div class="muted" style="margin-top:4px">创建 ${r.created_by} · ${r.created_at||''}</div>
+    </div>`;
+  }).join('') || '<div class="muted">尚无回放任务</div>';
 }
 
 refresh();

@@ -90,3 +90,23 @@ class PlanRejectAction(PlanAction):
 class PlanWindowAction(PlanAction):
     # 整体替换窗口; 空列表/省略即清空窗口限制(仅启动前 DRAFT 可修改)
     windows: list[PlanWindowIn] = []
+
+
+# ---------- 迁移回放与报告 ----------
+
+class CheckpointCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    plan_id: str = Field(min_length=1)                # 必须是已存在的迁移计划
+
+
+class ReplayCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    plan_id: str = Field(min_length=1)
+    checkpoint_id: str = Field(min_length=1)
+
+
+class ReplayAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
