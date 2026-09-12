@@ -63,14 +63,30 @@ class PlanStepIn(BaseModel):
     max_retries: Optional[int] = Field(default=None, ge=0, le=10)
 
 
+class PlanWindowIn(BaseModel):
+    starts_at: str = Field(min_length=1)          # ISO 8601(建议 UTC, 如 2026-09-12T22:00:00Z)
+    ends_at: str = Field(min_length=1)
+
+
 class PlanCreate(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
     name: str = Field(min_length=1)
+    risk_level: str = "LOW"                        # LOW 可直接启动; HIGH 须另一名管理员审批
     max_retries: int = Field(default=0, ge=0, le=10)  # 每步首次失败后的额外重试次数
     steps: list[PlanStepIn]
+    windows: list[PlanWindowIn] = []               # 允许执行的时间窗口(空=不限制)
 
 
 class PlanAction(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+
+
+class PlanRejectAction(PlanAction):
+    reason: str = Field(min_length=1)              # 拒绝原因必填, 落审计并阻止启动
+
+
+class PlanWindowAction(PlanAction):
+    # 整体替换窗口; 空列表/省略即清空窗口限制(仅启动前 DRAFT 可修改)
+    windows: list[PlanWindowIn] = []

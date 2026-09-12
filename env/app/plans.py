@@ -16,6 +16,7 @@ import json
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
@@ -23,8 +24,8 @@ from sqlalchemy.orm import Session
 
 from . import service
 from .models import (
-    AuditLog, IdempotencyKey, MigrationBatch, MigrationPlan, PlanStep,
-    PlanStepDependency, PlanStepEvent,
+    RISK_LEVELS, AuditLog, IdempotencyKey, MigrationBatch,
+    MigrationPlan, PlanStep, PlanStepDependency, PlanStepEvent, PlanWindow,
 )
 from .service import APP_VERSION
 
@@ -36,6 +37,8 @@ ALLOWED_ACTIONS = {
     "resume": {"PAUSED", "HALTED"},
     "cancel": {"DRAFT", "RUNNING", "PAUSED", "HALTED"},
 }
+# 审批 / 窗口管理只允许在启动前(DRAFT)操作: 启动后审批状态与窗口边界都锁定
+PRE_LAUNCH_ONLY = {"approve", "reject", "revoke-approval", "window"}
 
 
 class PlanNotFound(Exception):
@@ -257,19 +260,87 @@ def run_plan_action(session: Session, *, action: str, operator: str,
 
 # ---------- 创建 / 启动 / 暂停 / 恢复 / 取消 ----------
 
+def _parse_dt(value, field: str) -> datetime:
+    """ISO 8601 -> naive UTC datetime(库内统一无时区存储)。"""
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            raise PlanValidationError([f"{field} 不是合法的 ISO 8601 时间: {value!r}"])
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def validate_windows(raw: list[dict] | None) -> list[tuple[datetime, datetime]]:
+    """聚合校验执行窗口: 每项需含 starts_at/ends_at 且开始 < 结束。返回规范化后的区间列表。"""
+    if not raw:
+        return []
+    windows: list[tuple[datetime, datetime]] = []
+    for i, w in enumerate(raw, 1):
+        if not isinstance(w, dict) or not w.get("starts_at") or not w.get("ends_at"):
+            raise PlanValidationError([f"第 {i} 个执行窗口必须包含 starts_at 与 ends_at"])
+        start = _parse_dt(w["starts_at"], f"第 {i} 个执行窗口 starts_at")
+        end = _parse_dt(w["ends_at"], f"第 {i} 个执行窗口 ends_at")
+        if start >= end:
+            raise PlanValidationError([f"第 {i} 个执行窗口 starts_at 必须早于 ends_at"])
+        windows.append((start, end))
+    return windows
+
+
+def now_utc_naive() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def in_any_window(windows: list[PlanWindow], at: datetime | None = None) -> bool:
+    """当前时刻是否落在任一执行窗口(闭区间)内。无窗口的计划恒为 True。"""
+    if not windows:
+        return True
+    at = at or now_utc_naive()
+    return any(w.starts_at <= at <= w.ends_at for w in windows)
+
+
+def in_any_range(ranges: list[tuple[datetime, datetime]],
+                 at: datetime | None = None) -> bool:
+    at = at or now_utc_naive()
+    return any(s <= at <= e for s, e in ranges)
+
+
+def windows_of(session: Session, plan_id: str) -> list[PlanWindow]:
+    return (session.query(PlanWindow)
+            .filter(PlanWindow.plan_id == plan_id)
+            .order_by(PlanWindow.starts_at, PlanWindow.id).all())
+
+
+def _window_desc(windows: list[PlanWindow]) -> str:
+    if not windows:
+        return "无窗口限制"
+    return "; ".join(f"[{w.starts_at.isoformat()}Z, {w.ends_at.isoformat()}Z]" for w in windows)
+
+
 def do_create_plan(session: Session, _plan, operator: str, name: str,
-                   steps: list[dict], max_retries: int) -> dict:
+                   steps: list[dict], max_retries: int,
+                   risk_level: str = "LOW",
+                   windows: list[dict] | None = None) -> dict:
     if not name or not name.strip():
         raise PlanValidationError(["计划名称不能为空"])
     if max_retries < 0 or max_retries > 10:
         raise PlanValidationError(["max_retries 必须在 0..10 之间"])
+    if risk_level not in RISK_LEVELS:
+        raise PlanValidationError([f"risk_level 必须是 {RISK_LEVELS} 之一(收到 {risk_level!r})"])
+    window_ranges = validate_windows(windows)  # 窗口非法时整体拒绝, 不落任何数据
     # 步骤未显式给 max_retries 时继承计划级默认
     for s in steps:
         s.setdefault("max_retries", max_retries)
     built = validate_plan_graph(session, steps)  # 失败即聚合拒绝, 不写任何数据
     plan_id = "P" + uuid.uuid4().hex[:10]
+    # 高风险计划创建即进入待审批, 必须由另一名管理员审批通过后才能启动
+    approval = "PENDING" if risk_level == "HIGH" else "NOT_REQUIRED"
     plan = MigrationPlan(
         id=plan_id, name=name.strip(), status="DRAFT", max_retries=max_retries,
+        risk_level=risk_level, approval_status=approval,
         created_by=operator, updated_by=operator)
     session.add(plan)
     session.flush()
@@ -278,12 +349,30 @@ def do_create_plan(session: Session, _plan, operator: str, name: str,
         for d in st.deps:
             d.plan_id = plan_id
         session.add(st)
+    for s, e in window_ranges:
+        session.add(PlanWindow(plan_id=plan_id, starts_at=s, ends_at=e,
+                               created_by=operator))
     session.flush()
+    plan.window_open = None if not window_ranges else in_any_window(
+        windows_of(session, plan_id))
+    session.flush()
+    risk_desc = "高风险(启动前须由另一名管理员审批)" if risk_level == "HIGH" else "低风险(可直接启动)"
     plan_audit(session, plan, operator=operator, action="plan.create",
                reason=f"创建计划 {name.strip()}, {len(built)} 个步骤, "
-                      f"每步默认额外重试 {max_retries} 次")
-    return {"ok": True, "plan_id": plan_id,
-            "detail": f"计划 {plan_id} 已保存(DRAFT), 共 {len(built)} 个步骤, 校验通过"}
+                      f"每步默认额外重试 {max_retries} 次, 风险等级 {risk_level}, "
+                      f"审批 {approval}, 执行窗口: {_window_desc(windows_of(session, plan_id))}")
+    detail = f"计划 {plan_id} 已保存(DRAFT), 共 {len(built)} 个步骤, 校验通过, {risk_desc}"
+    if window_ranges:
+        detail += f", {len(window_ranges)} 个执行窗口"
+    return {"ok": True, "plan_id": plan_id, "risk_level": risk_level,
+            "approval_status": approval, "detail": detail}
+
+
+def _require_pre_launch(plan: MigrationPlan, action: str) -> None:
+    """审批/窗口类操作只允许启动前(DRAFT): 启动后状态锁定。"""
+    if plan.status != "DRAFT":
+        raise PlanStateError(
+            f"计划 {plan.id} 当前状态 {plan.status}, {action} 只能在启动前(DRAFT)进行")
 
 
 def _require_status(plan: MigrationPlan, action: str) -> None:
@@ -296,6 +385,19 @@ def _require_status(plan: MigrationPlan, action: str) -> None:
 
 def do_start(session: Session, plan: MigrationPlan, operator: str) -> dict:
     _require_status(plan, "start")
+    # 审批闸门: 高风险计划必须审批通过; 被拒绝/待审批都阻止启动
+    if plan.risk_level == "HIGH":
+        if plan.approval_status == "PENDING":
+            raise PlanStateError(
+                f"高风险计划 {plan.id} 尚未经另一名管理员审批, 不能启动")
+        if plan.approval_status == "REJECTED":
+            raise PlanStateError(
+                f"高风险计划 {plan.id} 的审批已被拒绝"
+                + (f": {plan.reject_reason}" if plan.reject_reason else "")
+                + ", 不能启动(需重新审批通过)")
+        if plan.approval_status != "APPROVED":
+            raise PlanStateError(
+                f"高风险计划 {plan.id} 审批状态 {plan.approval_status} 异常, 不能启动")
     plan.status = "RUNNING"
     plan.started_by = operator
     plan.updated_by = operator
@@ -308,9 +410,141 @@ def do_start(session: Session, plan: MigrationPlan, operator: str) -> dict:
         if st.status == "BLOCKED" and not deps_of(session, plan.id).get(st.id):
             st.status = "PENDING"
             ready += 1
+    # 执行窗口闸门: 无窗口不限制; 有窗口则按当前时刻初始化运行态,
+    # 窗口外保持 RUNNING 但不推进(等重新进入窗口自动继续), 状态变化落审计
+    wins = windows_of(session, plan.id)
+    within = in_any_window(wins)
+    plan.window_open = None if not wins else within
+    if wins and not within:
+        plan_audit(session, plan, operator=operator, action="plan.window_pause",
+                   reason=f"启动时不在允许执行窗口内, 保持暂停等待重新进入窗口(窗口: {_window_desc(wins)})")
+    elif wins:
+        plan_audit(session, plan, operator=operator, action="plan.window_resume",
+                   reason=f"启动时处于允许执行窗口内(窗口: {_window_desc(wins)})")
+    approval_desc = f", 审批人 {plan.approved_by}" if plan.approved_by else ""
     plan_audit(session, plan, operator=operator, action="plan.start",
-               reason=f"启动计划, {ready} 个无依赖步骤进入待执行")
+               reason=f"启动计划, {ready} 个无依赖步骤进入待执行"
+                      f", 风险等级 {plan.risk_level}{approval_desc}")
+    if wins and not within:
+        return {"ok": True,
+                "detail": f"计划已启动, {ready} 个无依赖步骤待执行; 当前不在执行窗口内, 将保持暂停至重新进入窗口"}
     return {"ok": True, "detail": f"计划已启动, {ready} 个无依赖步骤待执行"}
+
+
+# ---------- 审批: 通过 / 拒绝(带原因) / 撤销(启动前) ----------
+# 所有审批请求幂等: 重复的通过/拒绝/撤销不产生第二次状态变化与第二条审计,
+# 返回当前审批状态与 already_in_state 标记。
+
+def do_approve(session: Session, plan: MigrationPlan, operator: str) -> dict:
+    _require_pre_launch(plan, "审批")
+    if plan.risk_level != "HIGH":
+        raise PlanStateError(f"计划 {plan.id} 是低风险计划, 无需审批, 可直接启动")
+    if operator == plan.created_by:
+        raise PlanStateError(
+            f"高风险计划必须由不同于创建者({plan.created_by})的另一名管理员审批, "
+            f"操作者 {operator} 不能审批自己创建的计划")
+    if plan.approval_status == "APPROVED":
+        # 幂等: 重复审批(无论是否同一人)直接回显, 无副作用
+        return {"ok": True, "already_in_state": True,
+                "approval_status": "APPROVED",
+                "detail": f"计划已处于审批通过状态(审批人 {plan.approved_by}), 重复审批无副作用"}
+    if plan.approval_status not in ("PENDING", "REJECTED"):
+        raise PlanStateError(f"计划 {plan.id} 审批状态 {plan.approval_status} 不允许审批")
+    from_status = plan.approval_status
+    plan.approval_status = "APPROVED"
+    plan.approved_by = operator
+    plan.approved_at = now_utc_naive()
+    plan.reject_reason = None
+    plan.updated_by = operator
+    session.flush()
+    plan_audit(session, plan, operator=operator, action="plan.approve",
+               reason=f"高风险计划审批通过(此前 {from_status}, 创建者 {plan.created_by}), 允许启动")
+    return {"ok": True, "approval_status": "APPROVED",
+            "detail": f"计划已审批通过(操作者 {operator}), 可以启动"}
+
+
+def do_reject(session: Session, plan: MigrationPlan, operator: str,
+              reason: str) -> dict:
+    _require_pre_launch(plan, "拒绝审批")
+    if plan.risk_level != "HIGH":
+        raise PlanStateError(f"计划 {plan.id} 是低风险计划, 无需审批")
+    if plan.approval_status == "REJECTED":
+        # 幂等: 重复拒绝回显已有原因
+        return {"ok": True, "already_in_state": True,
+                "approval_status": "REJECTED",
+                "detail": f"计划已处于审批拒绝状态(原因: {plan.reject_reason}), 重复请求无副作用"}
+    if plan.approval_status != "PENDING":
+        raise PlanStateError(
+            f"计划 {plan.id} 当前审批状态 {plan.approval_status} 不允许拒绝"
+            "(已通过的审批请使用撤销)")
+    plan.approval_status = "REJECTED"
+    plan.approved_by = None
+    plan.approved_at = None
+    plan.reject_reason = reason[:500]
+    plan.updated_by = operator
+    session.flush()
+    plan_audit(session, plan, operator=operator, action="plan.reject",
+               reason=("高风险计划审批被拒绝, 阻止启动, 原因: " + reason)[:500])
+    return {"ok": True, "approval_status": "REJECTED",
+            "detail": "审批已拒绝并记录原因, 计划不能启动"}
+
+
+def do_revoke_approval(session: Session, plan: MigrationPlan,
+                       operator: str) -> dict:
+    """启动前撤销审批: APPROVED -> PENDING, 启动闸门重新关闭。幂等。"""
+    _require_pre_launch(plan, "撤销审批")
+    if plan.risk_level != "HIGH":
+        raise PlanStateError(f"计划 {plan.id} 是低风险计划, 没有审批可撤销")
+    if plan.approval_status in ("PENDING", "REJECTED"):
+        # 幂等: 审批本就未通过, 撤销无副作用(REJECTED 保留拒绝原因)
+        return {"ok": True, "already_in_state": True,
+                "approval_status": plan.approval_status,
+                "detail": f"计划审批状态已是 {plan.approval_status}, 撤销请求无副作用"}
+    if plan.approval_status != "APPROVED":
+        raise PlanStateError(f"计划 {plan.id} 审批状态 {plan.approval_status} 不允许撤销")
+    prev_by = plan.approved_by
+    plan.approval_status = "PENDING"
+    plan.approved_by = None
+    plan.approved_at = None
+    plan.updated_by = operator
+    session.flush()
+    plan_audit(session, plan, operator=operator, action="plan.revoke_approval",
+               reason=f"启动前撤销审批(原审批人 {prev_by}), 计划需重新审批通过才能启动")
+    return {"ok": True, "approval_status": "PENDING",
+            "detail": "审批已撤销, 计划在重新审批通过前不能启动"}
+
+
+def do_update_window(session: Session, plan: MigrationPlan, operator: str,
+                     windows: list[dict] | None) -> dict:
+    """启动前整体替换执行窗口; 传空列表/空值即清空窗口限制。幂等:
+    与当前窗口完全相同的请求回显无副作用, 不写第二条审计。"""
+    _require_pre_launch(plan, "修改执行窗口")
+    new_ranges = validate_windows(windows)
+    old = windows_of(session, plan.id)
+    same = (len(old) == len(new_ranges)
+            and all((o.starts_at, o.ends_at) == (s, e)
+                    for o, (s, e) in zip(old, new_ranges)))
+    if same:
+        return {"ok": True, "already_in_state": True,
+                "window_open": plan.window_open,
+                "detail": "执行窗口与当前完全一致, 修改请求无副作用"}
+    for w in old:
+        session.delete(w)
+    session.flush()
+    for s, e in new_ranges:
+        session.add(PlanWindow(plan_id=plan.id, starts_at=s, ends_at=e,
+                               created_by=operator))
+    plan.window_open = None if not new_ranges else in_any_range(new_ranges)
+    plan.updated_by = operator
+    session.flush()
+    desc = _window_desc(windows_of(session, plan.id))
+    plan_audit(session, plan, operator=operator, action="plan.window_update",
+               reason=f"启动前修改执行窗口: {desc}")
+    if not new_ranges:
+        return {"ok": True, "window_open": None,
+                "detail": "已清空执行窗口, 计划不再受时间窗口限制"}
+    return {"ok": True, "window_open": plan.window_open,
+            "detail": f"执行窗口已更新为 {len(new_ranges)} 个区间: {desc}"}
 
 
 def do_pause(session: Session, plan: MigrationPlan, operator: str) -> dict:
@@ -582,11 +816,41 @@ def run_plan_tick(session: Session, plan_id: str) -> bool:
 
     仅 RUNNING 计划可推进; 暂停/取消在步骤边界检查。FAILED 步骤(仍有重试额度)
     会被再次取走 —— 每次 tick 只重试一步, 与 worker 的轮询节奏一致。
+    执行窗口: 有窗口的 RUNNING 计划只在窗口内推进; 离开窗口在步骤边界暂停
+    (状态仍为 RUNNING, window_open=False), 重新进入窗口后自动继续;
+    两种状态变化都落计划审计。
     """
     plan = lock_plan(session, plan_id)
     if plan.status != "RUNNING":
         session.rollback()
         return False
+    wins = windows_of(session, plan_id)
+    if wins:
+        within = in_any_window(wins)
+        if not within:
+            if plan.window_open is not False:
+                # 刚离开窗口: 在步骤边界停住, 不取下一个步骤
+                plan.window_open = False
+                plan.updated_by = "system"
+                plan_audit(session, plan, operator="system",
+                           action="plan.window_pause",
+                           reason=f"已离开允许执行窗口, 计划在步骤边界暂停, "
+                                  f"重新进入窗口后自动继续(窗口: {_window_desc(wins)})")
+                session.commit()
+            else:
+                session.rollback()
+            return False
+        if plan.window_open is False:
+            # 重新进入窗口: 落审计后本 tick 即继续推进
+            plan.window_open = True
+            plan.updated_by = "system"
+            plan_audit(session, plan, operator="system",
+                       action="plan.window_resume",
+                       reason="重新进入允许执行窗口, 计划自动继续推进")
+            session.commit()
+        else:
+            plan.window_open = True
+            session.flush()
     steps = steps_of(session, plan_id)
     dep_map = deps_of(session, plan_id)
     by_seq = {st.seq: st for st in steps}
@@ -641,6 +905,26 @@ def boot_recover_plans(session: Session) -> None:
                     st.status = "PENDING"
                     dirty = True
         if plan.status == "RUNNING":
+            # 窗口闸门对账: 窗口边界持久化在 plan_windows 表, 重启后按当前时刻
+            # 重新判定, 审批状态/窗口边界均不丢失; 跨重启边界的窗口进出落审计
+            wins = windows_of(session, plan.id)
+            if wins:
+                within = in_any_window(wins)
+                if plan.window_open is not False and not within:
+                    plan.window_open = False
+                    plan_audit(session, plan, operator="system",
+                               action="plan.window_pause",
+                               reason="服务重启对账: 当前不在执行窗口内, 保持暂停, 重新进入窗口后续跑")
+                    dirty = True
+                elif plan.window_open is False and within:
+                    plan.window_open = True
+                    plan_audit(session, plan, operator="system",
+                               action="plan.window_resume",
+                               reason="服务重启对账: 已重新进入执行窗口, worker 将自动继续")
+                    dirty = True
+                elif plan.window_open is None:
+                    plan.window_open = within
+                    dirty = True
             plan_audit(session, plan, operator="system", action="boot",
                        reason=f"服务重启, 计划 {plan.id} 为 RUNNING, worker 将从安全停止点续跑")
             dirty = True
@@ -751,6 +1035,15 @@ def plan_to_dict(session: Session, plan: MigrationPlan, *, with_events: bool = T
     step_dicts = [step_to_dict(session, plan, s, dep_map, recent_events) for s in steps]
     total = len(step_dicts)
     succeeded = sum(1 for s in step_dicts if s["status"] == "SUCCESS")
+    windows = windows_of(session, plan.id)
+    window_dicts = [{
+        "starts_at": w.starts_at.isoformat() + "Z",
+        "ends_at": w.ends_at.isoformat() + "Z",
+        "created_by": w.created_by,
+        "created_at": w.created_at.isoformat() if w.created_at else None,
+    } for w in windows]
+    # 页面实时窗口状态: 无窗口恒为 True; 有窗口每次按当前时刻判定
+    in_window = in_any_window(windows)
     return {
         "id": plan.id,
         "name": plan.name,
@@ -758,6 +1051,15 @@ def plan_to_dict(session: Session, plan: MigrationPlan, *, with_events: bool = T
         "max_retries": plan.max_retries,
         "last_error": plan.last_error,
         "failed_step_id": plan.failed_step_id,
+        "risk_level": plan.risk_level,
+        "approval_status": plan.approval_status,
+        "approved_by": plan.approved_by,
+        "approved_at": plan.approved_at.isoformat() if plan.approved_at else None,
+        "reject_reason": plan.reject_reason,
+        "windows": window_dicts,
+        "has_windows": bool(windows),
+        "window_open": (None if not windows else plan.window_open),
+        "in_window": in_window,
         "created_by": plan.created_by,
         "started_by": plan.started_by,
         "updated_by": plan.updated_by,

@@ -1,5 +1,6 @@
 from sqlalchemy import (
-    JSON, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint, func,
+    JSON, Boolean, Column, DateTime, ForeignKey, Integer, String,
+    UniqueConstraint, func,
 )
 from sqlalchemy.orm import relationship
 
@@ -89,6 +90,12 @@ class AuditLog(Base):
 #      |                |
 #      +--cancel--------+--cancel--> CANCELED(终态)
 #   RUNNING --全部步骤成功--> COMPLETED(终态)
+# 计划风险等级: 高风险计划启动前必须经"不同于创建者"的另一名管理员审批通过。
+RISK_LEVELS = ("LOW", "HIGH")
+# 审批状态机(仅高风险计划使用; 低风险计划恒为 NOT_REQUIRED, 可直接启动):
+#   PENDING --approve--> APPROVED --revoke--> PENDING(启动前可撤销审批)
+#   PENDING --reject----> REJECTED --approve--> APPROVED(拒绝后可重新审批通过)
+APPROVAL_STATUSES = ("NOT_REQUIRED", "PENDING", "APPROVED", "REJECTED")
 PLAN_STATUSES = ("DRAFT", "RUNNING", "PAUSED", "HALTED", "COMPLETED", "CANCELED")
 # 步骤状态: BLOCKED 依赖未满足; PENDING 等待执行; RUNNING 执行中; SUCCESS 成功;
 #           FAILED 一次尝试失败(仍有重试额度, 下一 tick 自动重试); HALTED 重试耗尽, 计划停住
@@ -110,11 +117,43 @@ class MigrationPlan(Base):
     max_retries = Column(Integer, nullable=False, default=0)  # 每步首次失败后的额外重试次数
     last_error = Column(String(500), nullable=True)    # 最近一次错误(页面"最近错误")
     failed_step_id = Column(Integer, nullable=True)    # 当前卡住的步骤
+    # 风险与审批
+    risk_level = Column(String(8), nullable=False, default="LOW")
+    approval_status = Column(String(16), nullable=False, default="NOT_REQUIRED")
+    approved_by = Column(String(128), nullable=True)
+    approved_at = Column(DateTime, nullable=True)
+    reject_reason = Column(String(500), nullable=True)  # 最近一次拒绝原因(拒绝时阻止启动)
+    # 执行窗口运行态闸门: None=计划无窗口限制; True/False=最近一次判定在窗口内/外。
+    # 只是持久化的"最近判定": 窗口边界本身在 plan_windows 表, 每次 tick 重新判定,
+    # 重启不会丢失窗口外暂停状态, 重新进入窗口也能自动继续。
+    window_open = Column(Boolean, nullable=True)
     created_by = Column(String(128), nullable=False)
     started_by = Column(String(128), nullable=True)
     updated_by = Column(String(128), nullable=True)
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    windows = relationship("PlanWindow", cascade="all, delete-orphan",
+                           order_by="PlanWindow.starts_at")
+
+
+class PlanWindow(Base):
+    """允许执行的时间窗口(闭区间 [starts_at, ends_at], UTC 存储):
+    计划只在任一窗口内推进; 窗口外在步骤边界暂停, 重新进入窗口后由 worker 自动继续。
+    启动前管理员可以整体替换/清空窗口。无窗口行的计划不受时间限制。"""
+
+    __tablename__ = "plan_windows"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "starts_at", "ends_at", name="uq_plan_window"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"),
+                     nullable=False, index=True)
+    starts_at = Column(DateTime, nullable=False)
+    ends_at = Column(DateTime, nullable=False)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, server_default=func.now())
 
 
 class PlanStep(Base):

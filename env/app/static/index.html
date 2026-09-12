@@ -15,6 +15,13 @@
   .DRAFT { background: #78909c; } .RUNNING { background: #1565c0; }
   .PAUSED { background: #ef6c00; } .HALTED { background: #c62828; }
   .COMPLETED { background: #2e7d32; } .CANCELED { background: #546e7a; }
+  .LOW { background: #2e7d32; } .HIGH { background: #c62828; }
+  .NOT_REQUIRED { background: #546e7a; } .PENDING { background: #ef6c00; }
+  .APPROVED { background: #2e7d32; } .REJECTED { background: #c62828; }
+  .WOUT { background: #fff3e0; border: 1px solid #ef6c00; color: #e65100;
+          padding: 2px 8px; border-radius: 4px; font-size: 12px; display: inline-block; }
+  .WIN { background: #e8f5e9; border: 1px solid #2e7d32; color: #1b5e20;
+         padding: 2px 8px; border-radius: 4px; font-size: 12px; display: inline-block; }
   .BLOCKED { background: #9e9e9e; } .PENDING { background: #1565c0; }
   .FAILED { background: #ef6c00; } .SKIPPED { background: #546e7a; }
   .SUCCESS { background: #2e7d32; }
@@ -73,14 +80,27 @@
   <b>迁移计划编排</b>（多批次按顺序与依赖编排; 依赖步骤成功后才推进; 失败自动重试, 超限停住）
   <div style="margin:8px 0">
     计划名 <input id="planName" value="灰度计划" size="12">
+    风险等级
+    <select id="planRisk">
+      <option value="LOW" selected>低风险(可直接启动)</option>
+      <option value="HIGH">高风险(须另一名管理员审批)</option>
+    </select>
     每步额外重试 <input id="planRetry" type="number" value="0" min="0" max="10" style="width:60px"> 次
     <button onclick="addPlanStepRow()">+ 步骤</button>
-    <button onclick="createPlan()">创建计划</button>
   </div>
   <table>
     <thead><tr><th>顺序 seq</th><th>批次</th><th>依赖(seq, 逗号分隔)</th><th>本步额外重试</th><th></th></tr></thead>
     <tbody id="planStepRows"></tbody>
   </table>
+  <div style="margin:8px 0">
+    <b>允许执行窗口</b> <span class="muted">(留空=不限制; 仅在窗口内推进, 窗口外暂停、重新进入后继续; UTC 时间)</span>
+    <table>
+      <thead><tr><th>窗口开始(UTC)</th><th>窗口结束(UTC)</th><th></th></tr></thead>
+      <tbody id="planWindowRows"></tbody>
+    </table>
+    <button class="plain" onclick="addWindowRow()">+ 窗口</button>
+    <button onclick="createPlan()">创建计划</button>
+  </div>
   <div id="planMsg" class="msg"></div>
   <div id="plans" style="margin-top:12px"></div>
 </div>
@@ -192,6 +212,33 @@ function showPlanMsg(ok, text) {
   el.textContent = text;
 }
 
+// ---------- 执行窗口 ----------
+
+let winRowSeq = 0;
+
+// datetime-local 输入框 <-> ISO 字符串(UTC)
+function isoToLocalInput(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  if (isNaN(d)) return '';
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function localInputToIso(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d) ? null : d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+function addWindowRow(start, end) {
+  const i = ++winRowSeq;
+  const tr = document.createElement('tr');
+  tr.id = 'wrow-' + i;
+  tr.innerHTML = `<td><input class="w-start" type="datetime-local" step="60" value="${isoToLocalInput(start)}" style="width:200px"></td>
+    <td><input class="w-end" type="datetime-local" step="60" value="${isoToLocalInput(end)}" style="width:200px"></td>
+    <td><button class="danger" onclick="document.getElementById('wrow-${i}').remove()">删</button></td>`;
+  document.getElementById('planWindowRows').appendChild(tr);
+}
+
 async function createPlan() {
   const steps = [];
   for (const tr of document.querySelectorAll('#planStepRows tr')) {
@@ -205,14 +252,24 @@ async function createPlan() {
     steps.push(st);
   }
   if (!steps.length) { showPlanMsg(false, '请至少添加一个步骤'); return; }
+  const windows = [];
+  for (const tr of document.querySelectorAll('#planWindowRows tr')) {
+    const s = localInputToIso(tr.querySelector('.w-start').value);
+    const e = localInputToIso(tr.querySelector('.w-end').value);
+    if (!s || !e) { showPlanMsg(false, '执行窗口的开始/结束时间都必须填写'); return; }
+    if (new Date(s) >= new Date(e)) { showPlanMsg(false, '执行窗口开始时间必须早于结束时间'); return; }
+    windows.push({ starts_at: s, ends_at: e });
+  }
   const body = { operator: operator(), idempotency_key: idemKey(),
     name: document.getElementById('planName').value,
+    risk_level: document.getElementById('planRisk').value,
     max_retries: parseInt(document.getElementById('planRetry').value) || 0,
-    steps };
+    steps, windows };
   const { status, j } = await post('/api/admin/plans', body);
   if (status === 201) {
     showPlanMsg(true, (j.replayed ? '[幂等重放] ' : '') + j.detail);
     document.getElementById('planStepRows').innerHTML = '';
+    document.getElementById('planWindowRows').innerHTML = '';
   } else {
     const reasons = (j.detail && j.detail.reasons) || [];
     showPlanMsg(false, '保存被拒绝:\n - ' + (reasons.join('\n - ')
@@ -231,13 +288,91 @@ async function planAct(pid, name) {
   refresh();
 }
 
+async function planApprove(pid) {
+  const { status, j } = await post(`/api/admin/plans/${pid}/approve`,
+    { operator: operator(), idempotency_key: idemKey() });
+  if (status === 200) showPlanMsg(true, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showPlanMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function planReject(pid) {
+  const reason = prompt('请输入拒绝原因(必填, 将写入审计并阻止启动):');
+  if (!reason) return;
+  const { status, j } = await post(`/api/admin/plans/${pid}/reject`,
+    { operator: operator(), idempotency_key: idemKey(), reason });
+  if (status === 200) showPlanMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showPlanMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function planRevokeApproval(pid) {
+  const { status, j } = await post(`/api/admin/plans/${pid}/revoke-approval`,
+    { operator: operator(), idempotency_key: idemKey() });
+  if (status === 200) showPlanMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showPlanMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function savePlanWindow(pid) {
+  const windows = [];
+  document.querySelectorAll(`#wedit-${CSS.escape(pid)} tr`).forEach(tr => {
+    const s = localInputToIso(tr.querySelector('.we-start').value);
+    const e = localInputToIso(tr.querySelector('.we-end').value);
+    if (s && e) windows.push({ starts_at: s, ends_at: e });
+  });
+  const { status, j } = await post(`/api/admin/plans/${pid}/window`,
+    { operator: operator(), idempotency_key: idemKey(), windows });
+  if (status === 200) showPlanMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showPlanMsg(false, '被拒绝: ' + ((j.detail && (j.detail.reason
+    || (j.detail.reasons || []).join('; '))) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
 function renderPlans(plans) {
   document.getElementById('plans').innerHTML = plans.map(p => {
     const pct = p.progress.total ? Math.round(100 * p.progress.done / p.progress.total) : 0;
-    const canStart = p.status === 'DRAFT';
+    const canStart = p.status === 'DRAFT'
+      && (p.risk_level === 'LOW' || p.approval_status === 'APPROVED');
     const canPause = p.status === 'RUNNING';
     const canResume = ['PAUSED','HALTED'].includes(p.status);
     const canCancel = ['DRAFT','RUNNING','PAUSED','HALTED'].includes(p.status);
+    const isDraft = p.status === 'DRAFT';
+    const isHigh = p.risk_level === 'HIGH';
+    const approvalLine = isHigh ? `
+      <div style="margin:4px 0">
+        审批: <span class="badge ${p.approval_status}">${p.approval_status}</span>
+        <span class="muted">${p.approved_by ? '审批人 ' + p.approved_by + (p.approved_at ? ' · ' + p.approved_at : '') : '等待另一名管理员审批(不能是创建者 ' + p.created_by + ')'}</span>
+        ${p.reject_reason ? `<div class="err"><b>拒绝原因:</b> ${escapeHtml(p.reject_reason)}</div>` : ''}
+        ${isDraft ? `
+          <button ${p.approval_status === 'APPROVED' ? 'disabled' : ''} onclick="planApprove('${p.id}')">审批通过</button>
+          <button class="danger" ${p.approval_status === 'REJECTED' ? 'disabled' : ''} onclick="planReject('${p.id}')">拒绝</button>
+          <button class="plain" ${p.approval_status === 'APPROVED' ? '' : 'disabled'} onclick="planRevokeApproval('${p.id}')">撤销审批</button>` : ''}
+      </div>` : `<div class="muted" style="margin:4px 0">风险: <span class="badge LOW">LOW</span> 低风险, 可直接启动</div>`;
+    const winState = p.has_windows
+      ? (p.in_window
+          ? '<span class="WIN">窗口内: 允许推进</span>'
+          : '<span class="WOUT">窗口外: 暂停中, 重新进入窗口后自动继续</span>')
+      : '<span class="muted">无窗口限制</span>';
+    const winList = (p.windows || []).map(w =>
+      `<li>${w.starts_at} ~ ${w.ends_at} <span class="muted">(by ${w.created_by})</span></li>`).join('');
+    const winEditor = isDraft ? `
+      <div style="margin:4px 0">
+        <div>${winState}</div>
+        <ul class="muted" style="margin:2px 0">${winList || '<li>无</li>'}</ul>
+        <table id="wedit-${p.id}" style="width:auto">
+          <tbody>${(p.windows || []).map(w => `<tr>
+            <td><input class="we-start" type="datetime-local" step="60" value="${isoToLocalInput(w.starts_at)}" style="width:190px"></td>
+            <td><input class="we-end" type="datetime-local" step="60" value="${isoToLocalInput(w.ends_at)}" style="width:190px"></td></tr>`).join('')}
+          <tr><td><input class="we-start" type="datetime-local" step="60" style="width:190px"></td>
+              <td><input class="we-end" type="datetime-local" step="60" style="width:190px"></td></tr></tbody>
+        </table>
+        <button class="plain" onclick="savePlanWindow('${p.id}')">保存窗口(整体替换; 留空=清除限制)</button>
+      </div>` : `<div style="margin:4px 0">${winState}<ul class="muted" style="margin:2px 0">${winList || ''}</ul></div>`;
     const steps = p.steps.map(st => {
       const dep = st.depends_on.length ? ' ←依赖 [' + st.depends_on.join(',') + ']' : '';
       const err = st.last_error ? `<div class="err">${escapeHtml(st.last_error)}</div>` : '';
@@ -256,13 +391,16 @@ function renderPlans(plans) {
       .map(e => `<div class="err">[seq=${e.seq} #${e.attempt} ${e.event}] ${escapeHtml(e.reason)}</div>`).join('');
     return `<div class="card" style="background:#fafcff">
       <span class="badge ${p.status}">${p.status}</span>
+      <span class="badge ${p.risk_level}">${p.risk_level === 'HIGH' ? '高风险' : '低风险'}</span>
       <b>${escapeHtml(p.name)}</b> <span class="muted">${p.id}</span>
       <span style="margin-left:12px">
-        <button ${canStart?'':'disabled'} onclick="planAct('${p.id}','start')">启动</button>
+        <button ${canStart?'':'disabled'} title="${p.status === 'DRAFT' && p.risk_level === 'HIGH' && p.approval_status !== 'APPROVED' ? '高风险计划须先由另一名管理员审批通过' : ''}" onclick="planAct('${p.id}','start')">启动</button>
         <button class="plain" ${canPause?'':'disabled'} onclick="planAct('${p.id}','pause')">暂停</button>
         <button ${canResume?'':'disabled'} onclick="planAct('${p.id}','resume')">恢复</button>
         <button class="danger" ${canCancel?'':'disabled'} onclick="planAct('${p.id}','cancel')">取消</button>
       </span>
+      ${approvalLine}
+      ${winEditor}
       <div style="margin:6px 0">
         <div class="bar" style="display:inline-block;width:240px;vertical-align:middle">
           <div style="width:${pct}%"></div></div>

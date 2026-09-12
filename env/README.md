@@ -65,6 +65,37 @@ NORMAL ──freeze──▶ FROZEN ──validate──▶ VALIDATING ──通
 - 后台单实例 worker(0.5s 轮询，可用 `PLAN_WORKER_POLL_INTERVAL` 调整；`PLAN_WORKER_ENABLED=0` 关闭)，
   每个 tick 每个计划至多推进一步；Postgres 行锁 / SQLite 写锁串行化 worker 与管理操作。
 
+## 风险审批与执行窗口
+
+创建计划时可声明**风险等级**与**允许执行的时间窗口**，两者都持久化在库中，服务重启不丢失。
+
+### 风险审批
+
+- `risk_level=LOW`(默认)：无需审批，创建后可直接启动。
+- `risk_level=HIGH`：计划创建即 `PENDING`，**必须由不同于创建者的另一名管理员** `approve`
+  审批通过后才能启动；创建者审批自己的高风险计划会被 409 拒绝。
+- `reject` 拒绝审批**必须带原因**，原因落计划审计、在计划详情中可见，并在启动闸门处阻止启动；
+  被拒绝的计划可由另一名管理员重新 `approve` 通过(拒绝原因随之清除)。
+- 启动前可 `revoke-approval` 撤销已通过的审批(APPROVED → PENDING)，启动闸门重新关闭。
+- 审批 / 拒绝 / 撤销都**只允许在启动前(DRAFT)**操作，计划启动(以及之后的暂停/停住)时状态锁定。
+- 重复审批、重复拒绝、重复撤销**幂等**：状态已在目标态时返回 `already_in_state: true`，
+  不产生第二次状态变化、不写第二条审计；同键重放走 `replayed: true`。
+  审批字段：`approval_status`(NOT_REQUIRED/PENDING/APPROVED/REJECTED)、`approved_by/at`、`reject_reason`。
+
+### 执行窗口
+
+- 创建计划时可给一组闭区间窗口 `windows:[{starts_at, ends_at}]`(ISO 8601，建议 UTC 如
+  `2026-09-12T22:00:00Z`)；留空表示**不限制**。窗口开始必须早于结束，非法窗口聚合拒绝、不落数据。
+- 计划只在**任一窗口内**推进：worker tick 在步骤边界检查窗口，离开窗口时计划保持 `RUNNING`
+  但暂停推进(`window_open=false`，页面显示"窗口外暂停中")，**重新进入窗口后自动继续**，
+  进出窗口都写 `plan.window_pause / plan.window_resume` 审计。正在执行的单步会跑完，不会被切到一半。
+- 启动时落在窗口外也允许把计划置为 RUNNING，但不推进，窗口到达后自动开跑。
+- 启动前(DRAFT)管理员可用 `PUT /api/admin/plans/{id}/window` **整体替换**窗口，传空列表即清空限制；
+  与当前完全相同的窗口请求幂等无副作用。启动后窗口锁定不可修改。
+- 计划详情实时返回 `windows`、`has_windows`、`in_window`(按当前时刻重新判定)与持久化的
+  `window_open`(最近一次运行判定)；重启时 boot 对账按窗口边界重新判定运行态并对跨边界情况补审计。
+- 高风险 + 窗口两道闸门叠加：审批决定"能不能启动"，窗口决定"启动后什么时候推进"。
+
 ### 计划与步骤状态
 
 ```
@@ -101,11 +132,17 @@ POST /api/admin/batches/{id}/freeze   {operator, idempotency_key}
 POST /api/admin/batches/{id}/validate {operator, idempotency_key}
 POST /api/admin/batches/{id}/cutover  {operator, idempotency_key, expected_epoch?}
 POST /api/admin/batches/{id}/recover  {operator, idempotency_key, reason}
-POST /api/admin/plans   {operator, idempotency_key, name, max_retries,
-                         steps:[{seq, batch_id, depends_on:[seq...], max_retries?}]}
-GET  /api/admin/plans                              计划列表(含步骤/依赖/事件流水)
+POST /api/admin/plans   {operator, idempotency_key, name, risk_level?, max_retries,
+                         steps:[{seq, batch_id, depends_on:[seq...], max_retries?}],
+                         windows?:[{starts_at, ends_at}]}
+GET  /api/admin/plans                              计划列表(含步骤/依赖/事件流水/审批/窗口)
 GET  /api/admin/plans/{id}                         计划详情
 POST /api/admin/plans/{id}/start|pause|resume|cancel   {operator, idempotency_key}
+POST /api/admin/plans/{id}/approve                 {operator, idempotency_key} 高风险审批通过(不得为创建者)
+POST /api/admin/plans/{id}/reject                  {operator, idempotency_key, reason} 拒绝并阻止启动
+POST /api/admin/plans/{id}/revoke-approval         {operator, idempotency_key} 启动前撤销审批
+PUT  /api/admin/plans/{id}/window                  {operator, idempotency_key, windows:[{starts_at,ends_at}]}
+                                                    (启动前整体替换; 空列表清空限制; POST 同义)
 GET  /api/admin/audit?batch_id=&plan_id=           审计日志(可按批次或计划过滤)
 POST /api/records                                  旧结构写入(批次冻结期 423 / 批次切换后 410)
 POST /api/v2/records                               新结构写入(仅所属批次 DONE)
@@ -120,11 +157,15 @@ GET  /api/records/{id}/compare                     批次冻结窗内双读比�
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 28 个用例:
+python3 -m pytest tests/ -q   # 42 个用例:
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
-# 计划(12): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
+# 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
 #           依赖顺序推进/上游失败下游保持 BLOCKED/重试耗尽 HALTED/恢复换轮重试成功/
 #           暂停在步骤边界/取消跳过未开始步骤/计划动作幂等/重启 RUNNING 步骤复位并自动续跑/
 #           HALTED 重启不偷跑/状态与审计接口
+# 审批与窗口(13): 低风险免审批直启/高风险须他人审批(创建者自审被拒)/拒绝带原因阻止启动且可重审/
+#           启动前撤销审批/重复审批拒绝撤销幂等(同键重放+跨键无副作用, 审计不重复)/
+#           低风险审批操作被拒/启动后审批锁定/窗口外暂停窗口内继续(审计)/启动时窗口外等待/
+#           窗口仅启动前可改且幂等/非法窗口原子拒绝/高风险+窗口双闸门叠加/重启保持审批与窗口边界
 ```

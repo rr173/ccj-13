@@ -9,7 +9,8 @@ from .db import Base, SessionLocal, engine
 from .models import AuditLog, MigrationBatch, MigrationPlan, RecordNew, RecordOld
 from .plans import PlanWorker
 from .schemas import (
-    AdminAction, BatchCreate, PlanAction, PlanCreate, RecordIn, RecoverAction,
+    AdminAction, BatchCreate, PlanAction, PlanCreate, PlanRejectAction,
+    PlanWindowAction, RecordIn, RecoverAction,
 )
 from . import plans, service
 
@@ -33,9 +34,31 @@ def get_db():
         db.close()
 
 
+def _backfill_plan_columns():
+    """旧库(无迁移框架)补齐审批/窗口列与窗口表: 已存在的计划按低风险、
+    无需审批处理。幂等, 可重复执行。"""
+    from sqlalchemy import inspect, text as _text
+    inspector = inspect(engine)
+    existing = {c["name"] for c in inspector.get_columns("migration_plans")}
+    defaults = {
+        "risk_level": "VARCHAR(8) NOT NULL DEFAULT 'LOW'",
+        "approval_status": "VARCHAR(16) NOT NULL DEFAULT 'NOT_REQUIRED'",
+        "approved_by": "VARCHAR(128)",
+        "approved_at": "TIMESTAMP",
+        "reject_reason": "VARCHAR(500)",
+        "window_open": "BOOLEAN",
+    }
+    with engine.begin() as conn:
+        for col, ddl in defaults.items():
+            if col not in existing:
+                conn.execute(_text(
+                    f"ALTER TABLE migration_plans ADD COLUMN {col} {ddl}"))
+
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
+    _backfill_plan_columns()
     db = SessionLocal()
     try:
         service.boot_check(db)
@@ -202,13 +225,15 @@ def _run_plan(db: Session, action: str, body: PlanAction, fn, plan_id: str | Non
 @app.post("/api/admin/plans", status_code=201)
 def create_plan(body: PlanCreate, db: Session = Depends(get_db)):
     steps = [s.model_dump(exclude_none=True) for s in body.steps]
+    windows = [w.model_dump() for w in body.windows]
     try:
         result, replayed = plans.run_plan_action(
             db, action="create", operator=body.operator,
             idempotency_key=body.idempotency_key, payload=body.model_dump(),
             plan_id=None,
             fn=lambda s, _p: plans.do_create_plan(
-                s, _p, body.operator, body.name, steps, body.max_retries))
+                s, _p, body.operator, body.name, steps, body.max_retries,
+                body.risk_level, windows))
     except plans.PlanValidationError as e:
         db.rollback()
         _plan_conflict(e, e.reasons)
@@ -254,6 +279,44 @@ def resume_plan(plan_id: str, body: PlanAction, db: Session = Depends(get_db)):
 def cancel_plan(plan_id: str, body: PlanAction, db: Session = Depends(get_db)):
     return _run_plan(db, "cancel", body,
                      lambda s, p: plans.do_cancel(s, p, body.operator), plan_id)
+
+
+# ---------- 风险审批(通过 / 拒绝 / 启动前撤销, 均幂等) ----------
+
+@app.post("/api/admin/plans/{plan_id}/approve")
+def approve_plan(plan_id: str, body: PlanAction, db: Session = Depends(get_db)):
+    """高风险计划审批通过: 操作者必须不是计划创建者。重复审批幂等。"""
+    return _run_plan(db, "approve", body,
+                     lambda s, p: plans.do_approve(s, p, body.operator), plan_id)
+
+
+@app.post("/api/admin/plans/{plan_id}/reject")
+def reject_plan(plan_id: str, body: PlanRejectAction, db: Session = Depends(get_db)):
+    """拒绝高风险计划: 原因必填, 落审计并阻止启动。重复拒绝幂等。"""
+    return _run_plan(db, "reject", body,
+                     lambda s, p: plans.do_reject(s, p, body.operator, body.reason),
+                     plan_id)
+
+
+@app.post("/api/admin/plans/{plan_id}/revoke-approval")
+def revoke_plan_approval(plan_id: str, body: PlanAction, db: Session = Depends(get_db)):
+    """启动前撤销已通过的审批, 启动闸门重新关闭。重复撤销幂等。"""
+    return _run_plan(db, "revoke-approval", body,
+                     lambda s, p: plans.do_revoke_approval(s, p, body.operator),
+                     plan_id)
+
+
+# ---------- 执行窗口(仅启动前可整体替换/清空, 幂等) ----------
+
+@app.put("/api/admin/plans/{plan_id}/window")
+@app.post("/api/admin/plans/{plan_id}/window")
+def update_plan_window(plan_id: str, body: PlanWindowAction,
+                       db: Session = Depends(get_db)):
+    """整体替换允许执行的时间窗口; 传空列表即清空窗口限制。"""
+    windows = [w.model_dump() for w in body.windows]
+    return _run_plan(db, "window", body,
+                     lambda s, p: plans.do_update_window(s, p, body.operator, windows),
+                     plan_id)
 
 
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------
