@@ -41,10 +41,11 @@ from sqlalchemy.orm import Session
 from . import plans, service
 from .models import (
     IdempotencyKey, MigrationBatch, MigrationPlan, PlanStep, QualityEvent,
-    QualityExemption, QualityFixBatch, QualityIssue, QualityRuleSet,
-    QualityRuleVersion, QualityScan, QualityScanBatch, RecordOld,
+    QualityExemption, QualityFixBatch, QualityGateHold, QualityIssue,
+    QualityRuleSet, QualityRuleVersion, QualityScan, QualityScanBatch, RecordOld,
     QUALITY_RULE_TYPES, QUALITY_SCAN_ACTIVE_STATUSES,
     QUALITY_SCAN_STATUSES, QUALITY_SCAN_TERMINAL_STATUSES, QUALITY_SEVERITIES,
+    RESCAN_TRIGGERS,
 )
 
 # 扫描状态 -> 允许的管理动作(FAILED 可 resume, 与清理计划语义一致)
@@ -175,9 +176,16 @@ def _lock_scheduling(session: Session) -> None:
 
 
 def _lock_creation(session: Session) -> None:
-    """串行化同计划扫描创建的去重判定。"""
+    """串行化同计划扫描创建的去重判定(手动扫描 + 自动重扫共用)。"""
     if session.bind.dialect.name == "postgresql":
         session.execute(text("SELECT pg_advisory_xact_lock(20260921)"))
+
+
+# SQLite 没有事务级咨询锁: 用进程内互斥锁串行化扫描创建判定,
+# 语义与 Postgres 的 pg_advisory_xact_lock(20260921) 对应 ——
+# 重复/并发触发(写入通知、规则版本、过期兜底、执行器门禁)在同一计划上
+# 必须合并成唯一任务。多副本部署时以 Postgres 咨询锁为准。
+_rescan_creation_lock = threading.RLock()
 
 
 # ---------- 规则定义规范化与校验 ----------
@@ -319,13 +327,26 @@ def get_ruleset(session: Session, plan_id: str) -> QualityRuleSet:
     return rs
 
 
-def current_rules(session: Session, plan_id: str) -> QualityRuleVersion | None:
-    rs = session.query(QualityRuleSet).filter(QualityRuleSet.plan_id == plan_id).first()
+def current_rules(session: Session, plan_id: str, *,
+                  fresh: bool = False) -> QualityRuleVersion | None:
+    """计划当前规则版本(按规则集内最大版本号取)。
+
+    不经过 rs.current_version 属性: 同事务内规则集行可能已在身份映射中
+    (autoflush 关闭时是提升版本号前的旧值)。fresh=True 时先 flush 待提交的
+    版本变更并强制从数据库刷新规则集, 保证规则保存事务内编排的重扫基于新版本。"""
+    if fresh:
+        session.flush()
+    rs = (session.query(QualityRuleSet)
+          .populate_existing()
+          .filter(QualityRuleSet.plan_id == plan_id).first())
     if rs is None:
         return None
+    if fresh:
+        session.refresh(rs)
     return (session.query(QualityRuleVersion)
-            .filter(QualityRuleVersion.ruleset_id == rs.id,
-                    QualityRuleVersion.version == rs.current_version)
+            .populate_existing()
+            .filter(QualityRuleVersion.ruleset_id == rs.id)
+            .order_by(QualityRuleVersion.version.desc())
             .first())
 
 
@@ -364,12 +385,16 @@ def do_save_rules(session: Session, _ignored, operator: str, plan_id: str,
     session.add(rv)
     rs.current_version = version
     rs.updated_by = operator
-    add_event(session, plan_id=plan_id, event="rules.version_create",
+    add_event(session, plan_id=plan_id, scan_id=None, event="rules.version_create",
               operator=operator,
               reason=(f"创建规则版本 v{version}: {len(rules)} 条规则"
                       + (f"({note})" if note else "")),
               detail={"version": version, "rule_count": len(rules),
                       "content_digest": digest})
+    # 规则版本变化即时失效: 执行态(RUNNING/HALTED)计划立即编排基于新版本的
+    # 唯一自动重扫; DRAFT 计划由门禁实时判定 STALE(管理员手动重扫的既有流程)。
+    notify_rule_version_changed(session, plan_id, new_version=version,
+                                operator=operator, commit=False)
     session.flush()
     return {"ok": True, "ruleset_id": rs.id, "version": version,
             "rule_count": len(rules), "content_digest": digest,
@@ -529,65 +554,83 @@ def _active_scan_for(session: Session, plan_id: str) -> QualityScan | None:
             .first())
 
 
-def do_create_scan(session: Session, _ignored, operator: str, plan_id: str) -> dict:
-    """基于计划当前规则版本创建质量扫描任务并排队。
+def _latest_scan(session: Session, plan_id: str) -> QualityScan | None:
+    return (session.query(QualityScan)
+            .filter(QualityScan.plan_id == plan_id)
+            .order_by(QualityScan.created_at.desc(), QualityScan.id.desc())
+            .first())
 
-    计划不存在 -> 404; 未绑定规则集/计划已启动 -> 409;
-    已有活动(QUEUED/RUNNING/PAUSED)扫描时重复创建幂等返回已有任务。
+
+def _build_scan_rows(session: Session, scan_id: str, plan_id: str,
+                     steps: list[PlanStep]) -> None:
+    for st in steps:
+        batch = session.get(MigrationBatch, st.batch_id)
+        session.add(QualityScanBatch(
+            scan_id=scan_id, batch_id=st.batch_id, seq=st.seq,
+            biz=batch.biz if batch else None, status="PENDING"))
+
+
+def do_create_scan(session: Session, _ignored, operator: str, plan_id: str) -> dict:
+    """基于计划当前规则版本创建质量扫描任务并排队(管理员手动发起)。
+
+    计划不存在 -> 404; 未绑定规则集 -> 409;
+    计划 DRAFT 时可手动扫描; 计划 RUNNING 但处于质量门禁暂停(quality hold)时
+    也允许手动发起(作为自动重扫之外的人工补救, 扫描通过门禁后暂停同样自动解除);
+    其他状态拒绝; 已有活动(QUEUED/RUNNING/PAUSED)扫描时重复创建幂等返回已有任务。
     """
     plan = get_plan(session, plan_id)
     rv = current_rules(session, plan_id)
     if rv is None:
         raise QualityStateError(
             f"计划 {plan_id} 尚未绑定数据质量规则集, 请先保存规则后再发起扫描")
-    if plan.status != "DRAFT":
+    held = bool(plan.quality_hold)
+    if not (plan.status == "DRAFT" or (plan.status == "RUNNING" and held)):
         raise QualityStateError(
-            f"计划 {plan_id} 当前状态 {plan.status}, 质量扫描只能在启动前(DRAFT)发起")
+            f"计划 {plan_id} 当前状态 {plan.status}"
+            + ("(未处于质量门禁暂停)" if plan.status != "DRAFT" else "")
+            + ", 质量扫描只能在启动前(DRAFT)或执行中门禁暂停时手动发起")
     steps = plans.steps_of(session, plan_id)
     if not steps:
         raise QualityStateError(f"计划 {plan_id} 没有任何步骤(批次), 无可扫描内容")
 
-    _lock_creation(session)
-    existing = _active_scan_for(session, plan_id)
-    if existing is not None:
-        add_event(session, plan_id=plan_id, scan_id=existing.id,
-                  event="scan.create.idempotent", operator=operator,
-                  reason=f"重复扫描请求幂等返回已有{existing.status}任务 {existing.id}")
-        session.flush()
-        return {"ok": True, "scan_id": existing.id, "status": existing.status,
-                "already_active": True,
-                "detail": f"该计划已有 {existing.status} 的质量扫描 {existing.id}, "
-                          f"重复请求无副作用"}
+    with _rescan_creation_lock:
+        _lock_creation(session)
+        existing = _active_scan_for(session, plan_id)
+        if existing is not None:
+            add_event(session, plan_id=plan_id, scan_id=existing.id,
+                      event="scan.create.idempotent", operator=operator,
+                      reason=f"重复扫描请求幂等返回已有{existing.status}任务 {existing.id}")
+            session.flush()
+            return {"ok": True, "scan_id": existing.id, "status": existing.status,
+                    "already_active": True,
+                    "detail": f"该计划已有 {existing.status} 的质量扫描 {existing.id}, "
+                              f"重复请求无副作用"}
 
-    scan_id = "QS" + uuid.uuid4().hex[:10]
-    ttl = default_ttl_seconds()
-    scan = QualityScan(
-        id=scan_id, plan_id=plan_id, ruleset_id=rv.ruleset_id,
-        rule_version=rv.version, rule_digest=rv.content_digest,
-        rules_snapshot=rv.rules, status="QUEUED",
-        total_batches=len(steps), ttl_seconds=ttl,
-        created_by=operator, updated_by=operator)
-    session.add(scan)
-    session.flush()
-    for i, st in enumerate(steps, start=1):
-        batch = session.get(MigrationBatch, st.batch_id)
-        session.add(QualityScanBatch(
-            scan_id=scan_id, batch_id=st.batch_id, seq=st.seq,
-            biz=batch.biz if batch else None, status="PENDING"))
-    add_event(session, plan_id=plan_id, scan_id=scan_id, event="scan.create",
-              operator=operator,
-              detail={"rule_version": rv.version, "total_batches": len(steps),
-                      "ttl_seconds": ttl})
-    add_event(session, plan_id=plan_id, scan_id=scan_id, event="scan.queue",
-              operator=operator,
-              reason=f"质量扫描已排队(规则 v{rv.version}, 共 {len(steps)} 个批次, "
-                     f"并发上限 {max_concurrency()}, 结果 {ttl}s 后过期)")
-    session.flush()
-    return {"ok": True, "scan_id": scan_id, "status": "QUEUED",
-            "rule_version": rv.version, "total_batches": len(steps),
-            "already_active": False,
-            "detail": f"质量扫描 {scan_id} 已创建并排队: 计划 {plan.name}({plan_id}), "
-                      f"规则 v{rv.version}, {len(steps)} 个批次"}
+        scan_id = "QS" + uuid.uuid4().hex[:10]
+        ttl = default_ttl_seconds()
+        scan = QualityScan(
+            id=scan_id, plan_id=plan_id, ruleset_id=rv.ruleset_id,
+            rule_version=rv.version, rule_digest=rv.content_digest,
+            rules_snapshot=rv.rules, status="QUEUED",
+            total_batches=len(steps), ttl_seconds=ttl, scan_source="manual",
+            created_by=operator, updated_by=operator)
+        session.add(scan)
+        session.flush()
+        _build_scan_rows(session, scan_id, plan_id, steps)
+        add_event(session, plan_id=plan_id, scan_id=scan_id, event="scan.create",
+                  operator=operator,
+                  detail={"rule_version": rv.version, "total_batches": len(steps),
+                          "ttl_seconds": ttl, "scan_source": "manual"})
+        add_event(session, plan_id=plan_id, scan_id=scan_id, event="scan.queue",
+                  operator=operator,
+                  reason=f"质量扫描已排队(规则 v{rv.version}, 共 {len(steps)} 个批次, "
+                         f"并发上限 {max_concurrency()}, 结果 {ttl}s 后过期)")
+        session.flush()
+        return {"ok": True, "scan_id": scan_id, "status": "QUEUED",
+                "rule_version": rv.version, "total_batches": len(steps),
+                "already_active": False,
+                "detail": f"质量扫描 {scan_id} 已创建并排队: 计划 {plan.name}({plan_id}), "
+                          f"规则 v{rv.version}, {len(steps)} 个批次"}
 
 
 # ---------- 暂停 / 恢复 / 取消(均幂等) ----------
@@ -649,11 +692,12 @@ def do_resume_scan(session: Session, scan: QualityScan, operator: str) -> dict:
                        else "质量扫描已恢复, 已重新排队等待执行")}
 
 
-def do_cancel_scan(session: Session, scan: QualityScan, operator: str) -> dict:
+def _apply_cancel_scan(session: Session, scan: QualityScan, operator: str,
+                       reason: str, *, event: str = "scan.cancel") -> int:
+    """取消扫描的状态收尾(不提交, 供外层事务内联复用): 未开始批次 SKIPPED。
+    返回跳过批次数。幂等: 已 CANCELED 直接返回 0。"""
     if scan.status == "CANCELED":
-        return {"ok": True, "already_in_state": True,
-                "detail": "质量扫描已取消, 重复取消无副作用"}
-    _require_status(scan, "cancel")
+        return 0
     skipped = 0
     for sb in scan.batches:
         if sb.status == "PENDING":
@@ -664,11 +708,480 @@ def do_cancel_scan(session: Session, scan: QualityScan, operator: str) -> dict:
     scan.updated_by = operator
     scan.current_batch_id = None
     scan.finished_at = now_utc_naive()
-    add_event(session, plan_id=scan.plan_id, scan_id=scan.id, event="scan.cancel",
-              operator=operator,
-              reason=f"取消质量扫描: {skipped} 个未开始批次跳过",
-              detail={"skipped": skipped})
+    add_event(session, plan_id=scan.plan_id, scan_id=scan.id, event=event,
+              operator=operator, reason=reason, detail={"skipped": skipped})
+    return skipped
+
+
+def do_cancel_scan(session: Session, scan: QualityScan, operator: str) -> dict:
+    if scan.status == "CANCELED":
+        return {"ok": True, "already_in_state": True,
+                "detail": "质量扫描已取消, 重复取消无副作用"}
+    _require_status(scan, "cancel")
+    skipped = _apply_cancel_scan(
+        session, scan, operator, "取消质量扫描: 未开始批次跳过")
     return {"ok": True, "detail": f"质量扫描已取消, {skipped} 个未开始批次跳过, 已有问题保留"}
+
+
+# ---------- 质量结果失效后的自动重扫编排 ----------
+#
+# 触发 -> 唯一重扫 -> 计划暂停 -> 完成评估 -> 自动恢复 的闭环:
+#
+#   批次数据写入 / 规则新版本 / 扫描过期(worker 轮询)
+#        │  enqueue_rescan(): 计划同时至多一个活动(自动或手动)扫描;
+#        ▼                    重复触发合并进同一任务并追加触发原因
+#   唯一 QualityScan(scan_source=auto_rescan, 覆盖计划全部批次)
+#        │  计划执行器 tick 在步骤边界 assert_executor_gate():
+#        ▼  门禁不通过 -> quality_hold 置位 + QualityGateHold(ACTIVE),
+#   计划停在原步骤(PENDING/FAILED 不复位, 尝试计数/轮次保留), worker 每 tick 复评
+#        │  重扫 COMPLETED 且阻断问题全部 FIXED/EXEMPTED(门禁 PASS)
+#        ▼  QualityGateHold -> RESUMED, quality_hold 清除, 计划从原步骤继续
+#   重扫 FAILED/CANCELED 或仍有 OPEN 阻断 -> 保持暂停(可 resume 扫描自愈)
+#   计划取消 -> hold CANCELED, 活动重扫随计划取消, 永不自动恢复
+
+# 失效来源 -> 人类可读说明
+TRIGGER_TEXT = {
+    "batch_data_write": "批次数据写入",
+    "rule_version_change": "规则版本变化",
+    "scan_expired": "扫描结果过期",
+    "gate_blocked": "执行器门禁复核未通过",
+    "scan_failed_retry": "重扫失败后的恢复重试",
+}
+
+
+def _trigger_entry(source: str, *, reason: str, batch_ids: list[str] | None = None,
+                   operator: str = "system") -> dict:
+    return {"source": source, "reason": reason[:500],
+            "batch_ids": sorted(set(batch_ids or [])),
+            "operator": operator, "at": now_utc_naive().isoformat()}
+
+
+def _merge_trigger(existing: list | None, entry: dict) -> tuple[list, bool]:
+    """把触发原因合并进任务的触发历史(按 source+批次集合去重), 返回(新列表, 是否新增)。"""
+    out = list(existing or [])
+    key = (entry["source"], tuple(entry["batch_ids"]))
+    for t in out:
+        if (t.get("source"), tuple(t.get("batch_ids") or [])) == key:
+            return out, False
+    out.append(entry)
+    return out, True
+
+
+def active_hold(session: Session, plan_id: str) -> QualityGateHold | None:
+    return (session.query(QualityGateHold)
+            .filter(QualityGateHold.plan_id == plan_id,
+                    QualityGateHold.status == "ACTIVE")
+            .order_by(QualityGateHold.id.desc()).first())
+
+
+def enqueue_rescan(session: Session, plan_id: str, *, trigger: str,
+                   reason: str, operator: str = "system",
+                   affected_batch_ids: list[str] | None = None,
+                   commit: bool = True) -> dict:
+    """为受影响计划编排唯一的自动重扫任务(核心入口)。
+
+    - 计划不存在/已取消/未绑定规则集/无步骤 -> 不编排, 返回 {enqueued: False, why};
+    - 已有活动扫描(QUEUED/RUNNING/PAUSED): 不产生重复任务, 把本次触发原因
+      去重合并进该任务的 triggers 与关联 hold, 返回已有 scan_id(merged:true);
+    - 否则基于当前规则版本创建 auto_rescan 扫描(覆盖计划全部批次, 受影响范围
+      记录在 affected_batch_ids), 取代最近一次扫描。
+
+    并发安全: 创建判定段持有 Postgres 咨询锁(与手动扫描创建同一把锁),
+    SQLite 由写事务串行; 任何时刻一个计划至多一个活动扫描, 重复触发无重复任务。
+    """
+    if trigger not in RESCAN_TRIGGERS:
+        raise ValueError(f"未知重扫触发来源: {trigger}")
+    plan = session.get(MigrationPlan, plan_id)
+    if plan is None:
+        return {"enqueued": False, "why": "plan_missing"}
+    if plan.status == "CANCELED":
+        return {"enqueued": False, "why": "plan_canceled"}
+    # fresh=True: 规则保存事务在提升版本号后同事务调用本函数, 必须读到
+    # 刚 flush 的新版本(autoflush 关闭时身份映射可能保留旧的规则集版本号)。
+    rv = current_rules(session, plan_id, fresh=True)
+    if rv is None:
+        return {"enqueued": False, "why": "ruleset_not_configured"}
+    steps = plans.steps_of(session, plan_id)
+    if not steps:
+        return {"enqueued": False, "why": "no_steps"}
+    affected = sorted(set(b for b in (affected_batch_ids or []) if b))
+    entry = _trigger_entry(trigger, reason=reason, batch_ids=affected,
+                           operator=operator)
+
+    with _rescan_creation_lock:
+        _lock_creation(session)
+        active = _active_scan_for(session, plan_id)
+        if active is not None:
+            triggers, added = _merge_trigger(active.triggers, entry)
+            if added:
+                active.triggers = triggers
+                active.updated_by = operator
+                add_event(
+                    session, plan_id=plan_id, scan_id=active.id,
+                    event=("rescan.trigger_merged"
+                           if active.scan_source == "auto_rescan"
+                           else "rescan.trigger_attached"),
+                    operator=operator,
+                    reason=f"质量结果失效({TRIGGER_TEXT.get(trigger, trigger)}): "
+                           f"复用进行中扫描 {active.id}({active.status}), 不创建重复任务",
+                    detail={"trigger": trigger, "affected_batch_ids": affected,
+                            "trigger_count": len(triggers)})
+            hold = active_hold(session, plan_id)
+            if hold is not None:
+                h_triggers, h_added = _merge_trigger(hold.triggers, entry)
+                if h_added:
+                    hold.triggers = h_triggers
+            if commit:
+                session.commit()
+            return {"enqueued": True, "created": False, "merged": True,
+                    "scan_id": active.id, "status": active.status,
+                    "trigger_added": added}
+
+        latest = _latest_scan(session, plan_id)
+        scan_id = "QS" + uuid.uuid4().hex[:10]
+        ttl = default_ttl_seconds()
+        scan = QualityScan(
+            id=scan_id, plan_id=plan_id, ruleset_id=rv.ruleset_id,
+            rule_version=rv.version, rule_digest=rv.content_digest,
+            rules_snapshot=rv.rules, status="QUEUED",
+            total_batches=len(steps), ttl_seconds=ttl,
+            scan_source="auto_rescan", trigger_source=trigger,
+            triggers=[entry], supersedes_scan_id=latest.id if latest else None,
+            affected_batch_ids=affected,
+            created_by=f"system:{operator}", updated_by=operator)
+        session.add(scan)
+        session.flush()
+        _build_scan_rows(session, scan_id, plan_id, steps)
+        add_event(session, plan_id=plan_id, scan_id=scan_id,
+                  event="rescan.enqueue", operator=operator,
+                  reason=f"质量结果失效({TRIGGER_TEXT.get(trigger, trigger)}), "
+                         f"为计划自动编排重扫 {scan_id}(规则 v{rv.version}, "
+                         f"{len(steps)} 个批次, 取代 {latest.id if latest else '无'})"
+                         + (f", 受影响批次 {affected}" if affected else ""),
+                  detail={"trigger": trigger, "rule_version": rv.version,
+                          "total_batches": len(steps),
+                          "affected_batch_ids": affected,
+                          "supersedes_scan_id": latest.id if latest else None,
+                          "ttl_seconds": ttl})
+        add_event(session, plan_id=plan_id, scan_id=scan_id, event="scan.queue",
+                  operator=operator,
+                  reason=f"自动重扫已排队(并发上限 {max_concurrency()})")
+        if commit:
+            session.commit()
+        return {"enqueued": True, "created": True, "merged": False,
+                "scan_id": scan_id, "status": "QUEUED", "trigger": trigger}
+
+
+def _current_step(session: Session, plan: MigrationPlan):
+    """计划暂停时停留的步骤: 优先 failed_step_id, 否则第一个未完成步骤。"""
+    steps = plans.steps_of(session, plan.id)
+    if plan.failed_step_id is not None:
+        st = next((s for s in steps if s.id == plan.failed_step_id), None)
+        if st is not None:
+            return st
+    return next((s for s in steps
+                 if s.status in ("PENDING", "FAILED", "RUNNING", "BLOCKED", "HALTED")),
+                None)
+
+
+def open_or_update_hold(session: Session, plan: MigrationPlan, *, trigger: str,
+                        gate: dict, rescan_scan_id: str | None,
+                        operator: str = "system") -> QualityGateHold:
+    """执行器门禁失效时打开(或复用)质量暂停, 同步保证存在关联重扫。
+
+    同一计划同时至多一段 ACTIVE hold; 门禁状态/关联重扫变化时更新暂停原因
+    (如 STALE 等待重扫 -> 重扫完成仍有 BLOCKER), 原因历史只追加。
+    暂停的首次触发来源优先取关联重扫记录的来源(数据写入/规则版本/过期),
+    没有关联扫描时才是执行器兜底来源 gate_blocked。"""
+    reason = "; ".join(gate.get("reasons") or []) or f"门禁状态 {gate.get('status')}"
+    entry = _trigger_entry(trigger, reason=reason, batch_ids=[], operator=operator)
+    # 首次触发来源以关联重扫为准(展示"为什么暂停")
+    origin = trigger
+    if rescan_scan_id:
+        linked = session.get(QualityScan, rescan_scan_id)
+        if linked is not None and linked.trigger_source:
+            origin = linked.trigger_source
+    hold = active_hold(session, plan.id)
+    if hold is None:
+        step = _current_step(session, plan)
+        hold = QualityGateHold(
+            id="QH" + uuid.uuid4().hex[:10], plan_id=plan.id,
+            status="ACTIVE", trigger_source=origin,
+            reason=reason[:500], reason_code=gate.get("status"),
+            paused_at_step_id=step.id if step else None,
+            paused_at_seq=step.seq if step else None,
+            rescan_scan_id=rescan_scan_id, triggers=[entry],
+            created_by=operator)
+        session.add(hold)
+        plan.quality_hold = True
+        plans.plan_audit(
+            session, plan, operator=operator, action="plan.quality_hold",
+            step_id=step.id if step else None,
+            reason=(f"质量门禁失效({gate.get('status')}), 计划在步骤边界暂停, "
+                    f"等待自动重扫 {rescan_scan_id or '(编排中)'} 完成且阻断问题处理: "
+                    + reason)[:500])
+        add_event(session, plan_id=plan.id, scan_id=rescan_scan_id,
+                  event="hold.open", operator=operator,
+                  reason=f"计划因质量门禁 {gate.get('status')} 暂停于"
+                         f"步骤 seq={step.seq if step else '-'}, "
+                         f"关联重扫 {rescan_scan_id or '(无)'}",
+                  detail={"gate_status": gate.get("status"),
+                          "rescan_scan_id": rescan_scan_id,
+                          "paused_at_seq": step.seq if step else None})
+    else:
+        changed = (hold.rescan_scan_id != rescan_scan_id
+                   or hold.reason_code != gate.get("status"))
+        hold.triggers, trig_added = _merge_trigger(hold.triggers, entry)
+        if rescan_scan_id and hold.rescan_scan_id != rescan_scan_id:
+            hold.rescan_scan_id = rescan_scan_id
+        hold.reason_code = gate.get("status")
+        hold.reason = reason[:500]
+        if changed or trig_added:
+            plans.plan_audit(
+                session, plan, operator=operator, action="plan.quality_hold_update",
+                step_id=hold.paused_at_step_id,
+                reason=(f"质量暂停原因更新({gate.get('status')}), 关联重扫 "
+                        f"{hold.rescan_scan_id or '(无)'}: {reason}")[:500])
+            add_event(session, plan_id=plan.id, scan_id=hold.rescan_scan_id,
+                      event="hold.update", operator=operator,
+                      reason=f"质量暂停保持, 最新门禁状态 {gate.get('status')}",
+                      detail={"gate_status": gate.get("status"),
+                              "rescan_scan_id": hold.rescan_scan_id})
+    session.flush()
+    return hold
+
+
+def _reconcile_hold(session: Session, plan: MigrationPlan,
+                    operator: str = "system") -> bool:
+    """复评 ACTIVE hold: 门禁重新 PASS -> 自动恢复(终态化 hold, 清标记);
+    否则按最新门禁状态更新暂停原因。返回是否已恢复。"""
+    hold = active_hold(session, plan.id)
+    if hold is None:
+        return False
+    gate = evaluate_gate(session, plan.id)
+    if gate_allows_execution(gate):
+        at = now_utc_naive()
+        hold.status = "RESUMED"
+        hold.resume_mode = "auto_gate_pass"
+        hold.resume_scan_id = gate.get("scan_id") or gate.get("latest_scan_id")
+        hold.resumed_by = operator
+        hold.resumed_at = at
+        plan.quality_hold = False
+        plans.plan_audit(
+            session, plan, operator=operator, action="plan.quality_resume",
+            step_id=hold.paused_at_step_id,
+            reason=(f"自动重扫 {hold.resume_scan_id} 完成且阻断问题已处理"
+                    f"(门禁 PASS), 计划从暂停时步骤 "
+                    f"seq={hold.paused_at_seq or '-'} 自动继续")[:500])
+        add_event(session, plan_id=plan.id, scan_id=hold.resume_scan_id,
+                  event="hold.resume", operator=operator,
+                  reason=f"门禁重新通过(依据扫描 {hold.resume_scan_id}), "
+                         f"计划从步骤 seq={hold.paused_at_seq or '-'} 继续",
+                  detail={"resume_scan_id": hold.resume_scan_id,
+                          "paused_at_seq": hold.paused_at_seq})
+        session.flush()
+        return True
+    # 未通过: 刷新暂停原因与关联(活动扫描可能是新的自动重扫)
+    active = _active_scan_for(session, plan.id)
+    open_or_update_hold(session, plan, trigger="gate_blocked", gate=gate,
+                        rescan_scan_id=active.id if active else hold.rescan_scan_id,
+                        operator=operator)
+    return False
+
+
+def dismiss_holds_on_cancel(session: Session, plan: MigrationPlan,
+                            operator: str) -> dict:
+    """计划取消(或进入其他终态)时: ACTIVE hold 置 CANCELED(不再自动恢复),
+    活动(自动/手动)扫描随计划取消。须在计划状态已置 CANCELED 后、同一事务内调用,
+    本函数不提交(由外层 do_cancel 的事务统一提交)。"""
+    canceled_scans: list[str] = []
+    hold = active_hold(session, plan.id)
+    if hold is not None:
+        hold.status = "CANCELED"
+        hold.canceled_by = operator
+        hold.canceled_at = now_utc_naive()
+        plan.quality_hold = False
+        add_event(session, plan_id=plan.id, scan_id=hold.rescan_scan_id,
+                  event="hold.cancel", operator=operator,
+                  reason="计划被取消, 质量门禁暂停终止, 不再自动恢复",
+                  detail={"rescan_scan_id": hold.rescan_scan_id})
+    for sc in (session.query(QualityScan)
+               .filter(QualityScan.plan_id == plan.id,
+                       QualityScan.status.in_(QUALITY_SCAN_ACTIVE_STATUSES)).all()):
+        # 与计划取消同一事务, 不单独提交; RUNNING 批次扫描在批次边界自然收尾
+        _apply_cancel_scan(
+            session, sc, operator,
+            f"计划 {plan.id} 被取消, 活动扫描 {sc.id} 随计划取消, 不再自动恢复",
+            event="rescan.cancel_with_plan")
+        canceled_scans.append(sc.id)
+    if canceled_scans:
+        add_event(session, plan_id=plan.id,
+                  event="rescan.canceled_with_plan", operator=operator,
+                  reason=f"计划取消, {len(canceled_scans)} 个活动扫描终止: "
+                         + ", ".join(canceled_scans),
+                  detail={"scan_ids": canceled_scans})
+    return {"holds_canceled": 1 if hold is not None else 0,
+            "scans_canceled": canceled_scans}
+
+
+def gate_allows_execution(gate: dict) -> bool:
+    """执行期放行: 门禁 PASS, 或计划未配置规则(NOT_CONFIGURED, 与启动前一致)。"""
+    return bool(gate.get("passed")) and gate.get("status") in ("PASS", "NOT_CONFIGURED")
+
+
+def assert_executor_gate(session: Session, plan: MigrationPlan) -> dict:
+    """计划执行器在步骤边界(tick 取到候选步骤后)调用的运行时门禁。
+
+    门禁 PASS/未配置规则: 若存在 ACTIVE hold 则自动恢复(清标记/落历史), 放行本 tick;
+    门禁不通过: 保证存在唯一关联自动重扫(没有活动扫描时立即编排),
+    打开/更新质量暂停(quality_hold), 计划本 tick 不推进(步骤保持原状)。
+    返回 {blocked, gate, rescan_scan_id}。
+    """
+    gate = evaluate_gate(session, plan.id)
+    if gate_allows_execution(gate):
+        resumed = _reconcile_hold(session, plan)
+        session.commit()
+        return {"blocked": False, "gate": gate, "resumed": resumed}
+    # 门禁未通过: 复用活动扫描, 否则编排一次自动重扫(执行器兜底来源)
+    active = _active_scan_for(session, plan.id)
+    if active is not None:
+        rescan_id = active.id
+    else:
+        res = enqueue_rescan(
+            session, plan.id, trigger="gate_blocked",
+            reason="执行器在步骤边界复核质量门禁未通过: "
+                   + "; ".join(gate.get("reasons") or [gate.get("status", "")]),
+            operator="system", commit=False)
+        rescan_id = res.get("scan_id")
+        session.flush()
+    open_or_update_hold(session, plan, trigger="gate_blocked", gate=gate,
+                        rescan_scan_id=rescan_id, operator="system")
+    session.commit()
+    return {"blocked": True, "gate": gate, "rescan_scan_id": rescan_id}
+
+
+def sweep_due_rescans(session: Session) -> list[dict]:
+    """worker 轮询: 为"已绑定规则且处于执行态(RUNNING/HALTED)、质量结果需要
+    重新扫描"的计划自动编排重扫。主要兜底扫描过期(TTL)场景 —— 数据写入与
+    规则版本变化由对应操作即时触发, 这里按门禁实时状态补漏。
+
+    同时复评所有 ACTIVE hold(重扫完成/失败/阻断处理后自动恢复或更新原因)。
+    返回每个受影响计划的编排结果(测试可直接断言)。
+    """
+    results: list[dict] = []
+    plans_rows = (session.query(MigrationPlan)
+                  .filter(MigrationPlan.status.in_(("RUNNING", "HALTED")))
+                  .order_by(MigrationPlan.id).all())
+    for plan in plans_rows:
+        rs = session.query(QualityRuleSet).filter(
+            QualityRuleSet.plan_id == plan.id).first()
+        if rs is None:
+            continue
+        gate = evaluate_gate(session, plan.id)
+        hold = active_hold(session, plan.id)
+        if gate_allows_execution(gate):
+            if hold is not None:
+                if _reconcile_hold(session, plan):
+                    session.commit()
+                    results.append({"plan_id": plan.id, "action": "hold_resumed",
+                                    "scan_id": gate.get("scan_id")})
+            continue
+        active = _active_scan_for(session, plan.id)
+        if active is not None:
+            # 扫描在途(排队/执行/暂停): hold 原因随最新门禁刷新, 不重复创建
+            if hold is not None:
+                open_or_update_hold(session, plan, trigger="gate_blocked",
+                                    gate=gate, rescan_scan_id=active.id,
+                                    operator="system")
+                session.commit()
+            continue
+        # 无在途扫描且门禁未通过: 判定触发来源并编排唯一重扫
+        if gate["status"] in ("STALE", "NOT_SCANNED"):
+            reasons = gate.get("reasons") or []
+            if any("过期" in r for r in reasons):
+                trigger, text = "scan_expired", "扫描结果超过有效期(TTL)"
+            elif any("规则版本" in r for r in reasons):
+                trigger, text = "rule_version_change", "规则版本已更新"
+            elif any("数据" in r or "不存在" in r for r in reasons):
+                trigger, text = "batch_data_write", "批次数据发生变化"
+            else:
+                trigger, text = "gate_blocked", "质量结果失效"
+        elif gate["status"] in ("FAILED", "CANCELED"):
+            trigger, text = "scan_failed_retry", f"最近扫描 {gate['status'].lower()}"
+        else:
+            # BLOCKED / RUNNING / NOT_CONFIGURED 等: BLOCKED 靠修复/豁免解决,
+            # RUNNING 等扫描自然完成; 不额外编排(避免无意义重扫)
+            if hold is not None and gate["status"] != "RUNNING":
+                open_or_update_hold(session, plan, trigger="gate_blocked",
+                                    gate=gate,
+                                    rescan_scan_id=hold.rescan_scan_id,
+                                    operator="system")
+                session.commit()
+            continue
+        res = enqueue_rescan(session, plan.id, trigger=trigger, reason=text,
+                             operator="system", commit=False)
+        session.flush()
+        if hold is not None:
+            open_or_update_hold(session, plan, trigger=trigger, gate=gate,
+                                rescan_scan_id=res.get("scan_id"),
+                                operator="system")
+        session.commit()
+        results.append({"plan_id": plan.id, "action": "rescan_enqueued",
+                        "trigger": trigger, **{k: v for k, v in res.items()
+                                               if k in ("scan_id", "created", "merged")}})
+    return results
+
+
+# ---------- 失效来源即时通知 ----------
+
+def plans_using_batch(session: Session, batch_id: str) -> list[MigrationPlan]:
+    """把批次纳入步骤、且计划未终结(CANCELED/COMPLETED)的计划。"""
+    return (session.query(MigrationPlan)
+            .join(PlanStep, PlanStep.plan_id == MigrationPlan.id)
+            .filter(PlanStep.batch_id == batch_id,
+                    MigrationPlan.status.notin_(plans.TERMINAL_PLAN_STATUSES))
+            .order_by(MigrationPlan.id).all())
+
+
+def notify_batch_data_written(session: Session, batch_id: str, *,
+                              record_id: int | None = None,
+                              operator: str = "api") -> list[dict]:
+    """批次范围内旧表发生写入后调用: 为把该批次纳入步骤的执行态计划自动编排
+    重扫(跨批次影响: 重扫覆盖计划全部批次, 触发原因记录受影响批次)。
+
+    DRAFT 计划沿用既有"门禁实时判定 STALE + 管理员手动扫描"流程, 不自动排队;
+    PAUSED 是用户主动暂停, 同样不自动排队(恢复时执行器门禁会兜底编排)。
+    """
+    out: list[dict] = []
+    for plan in plans_using_batch(session, batch_id):
+        if plan.status not in ("RUNNING", "HALTED"):
+            continue
+        rs = session.query(QualityRuleSet).filter(
+            QualityRuleSet.plan_id == plan.id).first()
+        if rs is None:
+            continue
+        reason = (f"批次 {batch_id} 范围内记录"
+                  + (f" {record_id} " if record_id is not None else " ")
+                  + "发生写入, 扫描数据指纹将漂移/已漂移")
+        res = enqueue_rescan(session, plan.id, trigger="batch_data_write",
+                             reason=reason, operator=operator,
+                             affected_batch_ids=[batch_id], commit=True)
+        out.append({"plan_id": plan.id, **res})
+    return out
+
+
+def notify_rule_version_changed(session: Session, plan_id: str, *,
+                                new_version: int, operator: str = "system",
+                                commit: bool = True) -> dict:
+    """规则新版本发布后调用: 执行态计划立即编排基于新版本的重扫;
+    DRAFT 计划由门禁实时判定 STALE, 保持管理员手动发起的既有流程。"""
+    plan = session.get(MigrationPlan, plan_id)
+    if plan is None or plan.status not in ("RUNNING", "HALTED"):
+        return {"enqueued": False, "why": "plan_not_active"}
+    return enqueue_rescan(
+        session, plan_id, trigger="rule_version_change",
+        reason=f"规则集发布新版本 v{new_version}, 旧扫描结果不再放行",
+        operator=operator, commit=commit)
 
 
 # ---------- 修复批次(逐项重跑规则核验, 历史只追加) ----------
@@ -784,6 +1297,18 @@ def do_create_fix(session: Session, _ignored, operator: str, plan_id: str,
               detail={"fix_batch_id": fix_id, "resolved": n_resolved,
                       "still_open": n_still, "not_found": n_missing,
                       "rejected": n_rejected, "rule_version": scan.rule_version})
+    # 修复会改变批次数据指纹: 执行态计划即时编排重扫(数据写入类失效),
+    # DRAFT 计划保持"门禁 STALE -> 手动重扫"的既有流程。
+    plan = session.get(MigrationPlan, plan_id)
+    if plan is not None and plan.status in ("RUNNING", "HALTED"):
+        affected = sorted({
+            (session.get(QualityIssue, r["issue_id"]).batch_id)
+            for r in results if r.get("verdict") == "RESOLVED"
+            and session.get(QualityIssue, r.get("issue_id")) is not None})
+        enqueue_rescan(
+            session, plan_id, trigger="batch_data_write",
+            reason=f"修复批次 {fix_id} 改变了批次数据, 指纹将漂移, 需重新扫描",
+            operator=operator, affected_batch_ids=affected, commit=False)
     session.flush()
     return {"ok": n_rejected == 0, "fix_batch_id": fix_id, "scan_id": scan.id,
             "rule_version": scan.rule_version,
@@ -858,6 +1383,11 @@ def do_create_exemption(session: Session, _ignored, operator: str, plan_id: str,
             f"问题所属扫描 {scan.id} 当前状态 {scan.status}, 只有 COMPLETED 扫描的问题可豁免")
     ex = _do_exempt(session, plan_id, issue, scan, operator, reason)
     _refresh_scan_counters(session, scan)
+    # 豁免不改数据、不产生新扫描: 若执行器正因门禁暂停, 立即复评 —— 全部阻断
+    # 问题处理完时计划可凭当前有效扫描自动恢复
+    plan = session.get(MigrationPlan, plan_id)
+    if plan is not None and active_hold(session, plan_id) is not None:
+        _reconcile_hold(session, plan)
     session.flush()
     return {"ok": True, "exemption_id": ex.id, "issue_id": issue.id,
             "status": "APPROVED", "rule_version": scan.rule_version,
@@ -892,6 +1422,11 @@ def do_revoke_exemption(session: Session, _ignored, operator: str, plan_id: str,
         scan = session.get(QualityScan, ex.scan_id)
         if scan is not None:
             _refresh_scan_counters(session, scan)
+    # 撤销豁免后阻断问题重新 OPEN: 刷新执行器暂停原因(门禁回到 BLOCKED),
+    # 不自动创建重扫(数据未变, 管理员修复或重新豁免即可继续)
+    plan = session.get(MigrationPlan, plan_id)
+    if plan is not None and active_hold(session, plan_id) is not None:
+        _reconcile_hold(session, plan)
     add_event(session, plan_id=plan_id, scan_id=ex.scan_id,
               event="issue.exempt_revoke", operator=operator,
               reason=f"撤销豁免 {exemption_id}(问题 {ex.issue_id}): {reason}",
@@ -987,7 +1522,15 @@ def _fail_scan(session: Session, scan: QualityScan, sb: QualityScanBatch | None,
     scan.updated_by = operator
     add_event(session, plan_id=scan.plan_id, scan_id=scan.id, event="scan.failed",
               operator=operator, reason=scan.failure_reason,
-              detail={"code": code, "skipped_batches": skipped})
+              detail={"code": code, "skipped_batches": skipped,
+                      "scan_source": scan.scan_source})
+    # 自动重扫失败: 关联的质量暂停不解除, 刷新原因为扫描失败(可 resume 扫描自愈,
+    # 恢复成功且门禁通过后计划自动继续)
+    plan = session.get(MigrationPlan, scan.plan_id)
+    if plan is not None and active_hold(session, scan.plan_id) is not None:
+        gate = evaluate_gate(session, scan.plan_id)
+        open_or_update_hold(session, plan, trigger="gate_blocked", gate=gate,
+                            rescan_scan_id=scan.id, operator="system")
     session.commit()
 
 
@@ -1148,12 +1691,21 @@ def _complete_scan(session: Session, scan: QualityScan,
                      f"{scan.total_issues} 个问题(阻断 {scan.blocker_issues}, "
                      f"待处理阻断 {scan.open_blocker_issues}"
                      + (f", 继承历史豁免 {inherited} 项" if inherited else "")
+                     + (f", 自动重扫(首次来源 {scan.trigger_source})"
+                        if scan.scan_source == "auto_rescan" else "")
                      + f"), 门禁初判 {gate}, 结果有效期至 {scan.expires_at.isoformat()}Z",
               detail={"total_issues": scan.total_issues,
                       "blockers": scan.blocker_issues,
                       "open_blockers": scan.open_blocker_issues,
                       "inherited_exemptions": inherited,
+                      "scan_source": scan.scan_source,
+                      "trigger_source": scan.trigger_source,
                       "gate": gate, "expires_at": scan.expires_at.isoformat()})
+    # 自动重扫完成后立即复评质量暂停: 门禁 PASS 则计划自动从原步骤恢复,
+    # 否则刷新暂停原因(仍有阻断/结果再次失效)。由外层统一提交, 这里不 commit。
+    plan = session.get(MigrationPlan, scan.plan_id)
+    if plan is not None and active_hold(session, scan.plan_id) is not None:
+        _reconcile_hold(session, plan)
 
 
 def run_scan_tick(session: Session, scan_id: str) -> bool:
@@ -1186,7 +1738,10 @@ def boot_recover_scans(session: Session) -> None:
     """服务重启时:
     1. 遗留 RUNNING 扫描(执行线程已死)回到 QUEUED 重新参与并发排队;
        其遗留 RUNNING 批次复位为 PENDING(问题尚未提交, 安全重扫), SUCCESS 批次不丢;
-    2. QUEUED/PAUSED/终态扫描保持不变(排队/暂停是持久化的用户态)。"""
+    2. QUEUED/PAUSED/终态扫描保持不变(排队/暂停是持久化的用户态);
+    3. 质量暂停标记(plan.quality_hold)与 quality_gate_holds 的 ACTIVE 行对账:
+       待处理重扫(QUEUED/PAUSED/FAILED)与暂停状态跨重启继续保留, worker 续跑;
+       计划已取消/完成但标记残留时收敛, 无 ACTIVE hold 的标记清除。"""
     scans = session.query(QualityScan).order_by(QualityScan.id).all()
     for scan in scans:
         if scan.status != "RUNNING":
@@ -1206,6 +1761,29 @@ def boot_recover_scans(session: Session) -> None:
                   event="scan.boot", operator="system",
                   reason="服务重启: RUNNING 质量扫描回到排队位置, 已完成批次问题保留, worker 将续跑")
         session.commit()
+    # 暂停标记对账: 待处理重扫与 ACTIVE hold 跨重启保留; 残留标记收敛
+    for plan in session.query(MigrationPlan).order_by(MigrationPlan.id).all():
+        hold = active_hold(session, plan.id)
+        if hold is not None:
+            if plan.status in plans.TERMINAL_PLAN_STATUSES:
+                # 计划已终结但 hold 残留(理论上取消路径已收敛): 终止 hold
+                hold.status = "CANCELED"
+                hold.canceled_by = "system"
+                hold.canceled_at = now_utc_naive()
+                plan.quality_hold = False
+                add_event(session, plan_id=plan.id, scan_id=hold.rescan_scan_id,
+                          event="hold.boot_cancel", operator="system",
+                          reason=f"重启对账: 计划已 {plan.status}, 残留质量暂停终止")
+                session.commit()
+            elif not plan.quality_hold:
+                plan.quality_hold = True
+                add_event(session, plan_id=plan.id, scan_id=hold.rescan_scan_id,
+                          event="hold.boot_restore", operator="system",
+                          reason="重启对账: 恢复质量门禁暂停标记, 待处理重扫继续保留")
+                session.commit()
+        elif plan.quality_hold:
+            plan.quality_hold = False
+            session.commit()
 
 
 # ---------- 后台 worker ----------
@@ -1236,8 +1814,16 @@ class QualityWorker:
             self._thread = None
 
     def tick_once(self) -> int:
-        """认领到期扫描并给每个 RUNNING 扫描(含刚认领的)推进一个批次, 返回执行批次数。"""
+        """认领到期扫描并给每个 RUNNING 扫描(含刚认领的)推进一个批次, 返回执行批次数。
+        先做失效兜底: 过期/版本变化的执行态计划编排唯一重扫、复评质量暂停。"""
         from .db import SessionLocal
+        db = SessionLocal()
+        try:
+            sweep_due_rescans(db)  # 过期(TTL)等兜底场景, 内部自行提交
+        except Exception:
+            db.rollback()
+        finally:
+            db.close()
         db = SessionLocal()
         try:
             claimed = claim_due_scans(db)
@@ -1304,7 +1890,8 @@ def evaluate_gate(session: Session, plan_id: str) -> dict:
     - 无 COMPLETED 扫描/扫描活动中/失败取消: NOT_SCANNED/RUNNING/FAILED, 阻止;
     - COMPLETED 但规则版本变化/数据漂移/过期: STALE, 阻止;
     - 最新有效扫描仍有 OPEN 的 BLOCKER: BLOCKED, 阻止;
-    - 全部阻断问题 FIXED/EXEMPTED: PASS, 允许计划进入启动流程。"""
+    - 全部阻断问题 FIXED/EXEMPTED: PASS, 允许计划进入启动流程。
+    返回额外携带自动重扫编排信息: quality_hold(暂停摘要)、active_rescan_id。"""
     plan = session.get(MigrationPlan, plan_id)
     if plan is None:
         raise QualityNotFound(f"迁移计划 {plan_id} 不存在")
@@ -1319,12 +1906,19 @@ def evaluate_gate(session: Session, plan_id: str) -> dict:
               .filter(QualityScan.plan_id == plan_id)
               .order_by(QualityScan.created_at.desc(), QualityScan.id.desc())
               .first())
+    active_scan = _active_scan_for(session, plan_id)
+    hold = active_hold(session, plan_id)
     base = {
         "plan_id": plan_id, "ruleset_id": rs.id,
         "current_rule_version": rs.current_version,
         "current_rule_digest": rv.content_digest if rv else None,
         "latest_scan_id": latest.id if latest else None,
         "latest_scan_status": latest.status if latest else None,
+        "latest_scan_source": latest.scan_source if latest else None,
+        "active_rescan_id": (active_scan.id if active_scan
+                             and active_scan.scan_source == "auto_rescan" else None),
+        "active_scan_id": active_scan.id if active_scan else None,
+        "quality_hold": hold_to_dict(hold) if hold is not None else None,
     }
     if latest is None:
         return {**base, "status": "NOT_SCANNED", "passed": False,
@@ -1386,6 +1980,55 @@ def assert_gate_allows_start(session: Session, plan_id: str) -> None:
         raise PlanStateError(
             f"计划 {plan_id} 未通过迁移前数据质量门禁({gate['status']}): "
             + "; ".join(gate["reasons"]))
+
+
+# ---------- 质量暂停(hold)与恢复历史 ----------
+
+def hold_to_dict(h: QualityGateHold) -> dict:
+    return {
+        "id": h.id, "plan_id": h.plan_id, "status": h.status,
+        "trigger_source": h.trigger_source,
+        "trigger_text": TRIGGER_TEXT.get(h.trigger_source, h.trigger_source),
+        "reason": h.reason, "reason_code": h.reason_code,
+        "paused_at_step_id": h.paused_at_step_id,
+        "paused_at_seq": h.paused_at_seq,
+        "rescan_scan_id": h.rescan_scan_id,
+        "triggers": list(h.triggers or []),
+        "resume_mode": h.resume_mode,
+        "resume_scan_id": h.resume_scan_id,
+        "resumed_by": h.resumed_by,
+        "resumed_at": _dt(h.resumed_at),
+        "canceled_by": h.canceled_by,
+        "canceled_at": _dt(h.canceled_at),
+        "created_by": h.created_by,
+        "created_at": _dt(h.created_at),
+        "updated_at": _dt(h.updated_at),
+    }
+
+
+def holds_view(session: Session, plan_id: str) -> dict:
+    """计划的质量门禁暂停/恢复历史: 当前 ACTIVE hold(含关联重扫) + 全量历史。"""
+    get_plan(session, plan_id)
+    rows = (session.query(QualityGateHold)
+            .filter(QualityGateHold.plan_id == plan_id)
+            .order_by(QualityGateHold.created_at.desc(), QualityGateHold.id.desc())
+            .all())
+    active = next((hold_to_dict(h) for h in rows if h.status == "ACTIVE"), None)
+    return {"plan_id": plan_id, "quality_hold": active is not None,
+            "active": active, "history": [hold_to_dict(h) for h in rows]}
+
+
+def plan_hold_summary(session: Session, plan_id: str) -> dict | None:
+    """计划视图用的轻量暂停摘要(无 ACTIVE hold 返回 None)。"""
+    h = active_hold(session, plan_id)
+    if h is None:
+        return None
+    return {"id": h.id, "status": h.status, "trigger_source": h.trigger_source,
+            "trigger_text": TRIGGER_TEXT.get(h.trigger_source, h.trigger_source),
+            "reason": h.reason, "reason_code": h.reason_code,
+            "paused_at_seq": h.paused_at_seq, "rescan_scan_id": h.rescan_scan_id,
+            "resume_scan_id": h.resume_scan_id,
+            "created_at": _dt(h.created_at), "triggers": list(h.triggers or [])}
 
 
 # ---------- 查询: 按计划查问题 / 修复豁免历史 / 门禁结果 ----------
@@ -1531,6 +2174,12 @@ def scan_to_dict(session: Session, scan: QualityScan, *,
         "id": scan.id, "plan_id": scan.plan_id, "ruleset_id": scan.ruleset_id,
         "rule_version": scan.rule_version, "rule_digest": scan.rule_digest,
         "status": scan.status,
+        "scan_source": scan.scan_source or "manual",
+        "is_auto_rescan": (scan.scan_source == "auto_rescan"),
+        "trigger_source": scan.trigger_source,
+        "triggers": list(scan.triggers or []),
+        "supersedes_scan_id": scan.supersedes_scan_id,
+        "affected_batch_ids": list(scan.affected_batch_ids or []),
         "progress": {"done": scan.completed_batches, "total": scan.total_batches},
         "total_batches": scan.total_batches,
         "completed_batches": scan.completed_batches,
@@ -1592,11 +2241,19 @@ def quality_status_overview(session: Session) -> dict:
     active = (session.query(QualityScan)
               .filter(QualityScan.status.in_(QUALITY_SCAN_ACTIVE_STATUSES))
               .order_by(QualityScan.created_at, QualityScan.id).all())
+    active_rescan_ids = [s.id for s in active if s.scan_source == "auto_rescan"]
+    held_ids = [p.id for p in plans_rows if p.quality_hold]
     return {
         "concurrency": max_concurrency(),
         "active_scan_count": len(active),
+        "active_rescan_count": len(active_rescan_ids),
+        "active_rescan_ids": active_rescan_ids,
+        "held_plan_count": len(held_ids),
+        "held_plan_ids": held_ids,
         "active_scans": [{"id": s.id, "plan_id": s.plan_id, "status": s.status,
                           "rule_version": s.rule_version,
+                          "scan_source": s.scan_source or "manual",
+                          "trigger_source": s.trigger_source,
                           "progress": {"done": s.completed_batches,
                                        "total": s.total_batches}}
                          for s in active],

@@ -408,6 +408,7 @@ def do_start(session: Session, plan: MigrationPlan, operator: str) -> dict:
     plan.updated_by = operator
     plan.last_error = None
     plan.failed_step_id = None
+    plan.quality_hold = False  # 启动门禁已通过, 不允许携带执行期暂停标记
     session.flush()
     # 无依赖的首步由 BLOCKED -> PENDING(可立即被 worker 取走)
     ready = 0
@@ -620,10 +621,17 @@ def do_cancel(session: Session, plan: MigrationPlan, operator: str) -> dict:
             skipped += 1
             add_event(session, plan_id=plan.id, step_id=st.id, attempt=st.attempts,
                       event="skip", operator=operator, reason="计划被取消, 步骤不再执行")
+    # 质量门禁暂停随取消终止: ACTIVE hold 置 CANCELED(不再自动恢复),
+    # 活动(自动)重扫随计划取消, 即使之后扫描完成/门禁通过也不会恢复本计划
+    from . import quality
+    dismissed = quality.dismiss_holds_on_cancel(session, plan, operator)
     session.flush()
     plan_audit(session, plan, operator=operator, action="plan.cancel",
-               reason=f"从 {from_status} 取消计划, {skipped} 个未开始步骤置为 SKIPPED")
-    return {"ok": True, "detail": f"计划已取消, {skipped} 个未开始步骤被跳过"}
+               reason=f"从 {from_status} 取消计划, {skipped} 个未开始步骤置为 SKIPPED"
+                      + (f", {len(dismissed['scans_canceled'])} 个质量扫描随计划取消"
+                         if dismissed["scans_canceled"] else ""))
+    return {"ok": True, "detail": f"计划已取消, {skipped} 个未开始步骤被跳过",
+            "quality": dismissed}
 
 
 # ---------- 步骤执行(复用批次流程) ----------
@@ -808,6 +816,7 @@ def _attempt_step(session: Session, plan: MigrationPlan, step: PlanStep) -> None
     if all(st.status in ("SUCCESS", "SKIPPED") for st in all_steps):
         plan.status = "COMPLETED"
         plan.failed_step_id = None
+        plan.quality_hold = False
         plan_audit(session, plan, operator=operator, action="plan.complete",
                    reason=f"全部 {len(all_steps)} 个步骤成功")
     else:
@@ -872,7 +881,20 @@ def run_plan_tick(session: Session, plan_id: str) -> bool:
     if candidate is None:
         session.rollback()
         return False
+    # 执行中质量门禁(在真正推进步骤前的步骤边界检查): 批次数据写入/规则版本
+    # 变化/扫描过期使门禁失效时, 计划暂停在原步骤(步骤状态与尝试计数不复位),
+    # 系统编排唯一自动重扫; 重扫完成且阻断问题处理完(门禁 PASS)后自动恢复。
+    from . import quality
+    gate_check = quality.assert_executor_gate(session, plan)
+    if gate_check["blocked"]:
+        return False
     _attempt_step(session, plan, candidate)
+    # 步骤完成后的步骤边界也复评一次: 本步执行期间质量结果可能已失效(如执行中
+    # 触发了重扫且发现阻断问题)。此时不回滚已成功步骤, 但在推进下一步前暂停,
+    # 等待重扫与问题处理 —— 后续步骤的批次不会在门禁失效期间被切换。
+    fresh = lock_plan(session, plan_id)
+    if fresh.status == "RUNNING" and not fresh.quality_hold:
+        quality.assert_executor_gate(session, fresh)
     return True
 
 
@@ -1049,10 +1071,17 @@ def plan_to_dict(session: Session, plan: MigrationPlan, *, with_events: bool = T
     } for w in windows]
     # 页面实时窗口状态: 无窗口恒为 True; 有窗口每次按当前时刻判定
     in_window = in_any_window(windows)
+    # 质量门禁暂停摘要(触发来源/暂停原因/关联重扫/恢复历史入口)
+    quality_hold = None
+    if plan.quality_hold:
+        from . import quality
+        quality_hold = quality.plan_hold_summary(session, plan.id)
     return {
         "id": plan.id,
         "name": plan.name,
         "status": plan.status,
+        "quality_hold_flag": bool(plan.quality_hold),
+        "quality_hold": quality_hold,
         "max_retries": plan.max_retries,
         "last_error": plan.last_error,
         "failed_step_id": plan.failed_step_id,

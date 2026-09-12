@@ -147,6 +147,8 @@
     <span class="muted">扫描按批次记录问题明细、严重级别与命中样本; 重复发起活动扫描幂等</span>
   </div>
   <div id="qgScans"></div>
+  <b style="display:block;margin:10px 0 4px">门禁暂停与自动恢复历史</b>
+  <div id="qgHolds" class="muted">选择计划后载入</div>
   <b style="display:block;margin:10px 0 4px">质量问题(按计划查询)</b>
   <div>
     严重级别
@@ -661,10 +663,15 @@ async function qgLoadOverview() {
     const active = ['QUEUED','RUNNING','PAUSED','FAILED'].includes(s.status);
     return `<div style="border-top:1px dashed #ddd;padding:6px 0">
       <span class="badge ${s.status}">${s.status}</span>
+      ${s.is_auto_rescan ? '<span class="badge RUNNING" title="质量结果失效后系统自动编排">自动重扫</span>' : '<span class="muted">手动扫描</span>'}
       <b>${s.id}</b> <span class="muted">规则 v${s.rule_version} · ${s.progress.done}/${s.progress.total} 批次
         · ${s.total_records} 条记录 · ${s.total_issues} 问题
         (阻断 ${bl.total||0}: 待处理 ${bl.OPEN||0}/修复 ${bl.FIXED||0}/豁免 ${bl.EXEMPTED||0})
         ${s.expires_at ? ' · 有效期至 ' + s.expires_at : ''}</span>
+      ${s.is_auto_rescan ? `<div style="margin:2px 0">触发来源: <b>${(window.QG_TRIGGER_TEXT||{})[s.trigger_source]||s.trigger_source||'-'}</b>
+        ${s.supersedes_scan_id ? ' · 取代扫描 <code>'+s.supersedes_scan_id+'</code>' : ''}
+        ${(s.affected_batch_ids||[]).length ? ' · 受影响批次 '+s.affected_batch_ids.join(', ') : ''}
+        ${(s.triggers||[]).length>1 ? ' · 合并触发 '+s.triggers.length+' 次' : ''}</div>` : ''}
       ${s.failure_reason ? `<div class="err">${escapeHtml(s.failure_reason)}</div>` : ''}
       ${(s.stale && s.stale.length) ? `<div class="err">结果失效: ${s.stale.slice(0,3).map(escapeHtml).join('; ')}</div>` : ''}
       <div class="bar" style="width:240px;display:inline-block;vertical-align:middle">
@@ -923,8 +930,20 @@ function renderPlans(plans) {
       ${gate ? `<div style="margin:4px 0">质量门禁:
         <span class="badge QG_${gate.status}" title="${(gate.reasons||[]).join('&#10;')}">${qgStatusText(gate.status)}</span>
         <button class="plain" onclick="document.getElementById('qgPlan').value='${p.id}';qgLoadOverview();qgLoadRules();">查看质量</button>
+        ${gate.active_rescan_id ? `<span class="badge RUNNING" title="自动重扫任务">自动重扫 ${gate.active_rescan_id}</span>` : ''}
         ${gate.reasons && gate.reasons.length ? `<div class="err">${gate.reasons.slice(0,3).map(escapeHtml).join('<br>')}</div>` : ''}
       </div>` : ''}
+      ${p.quality_hold ? (() => {
+        const h = p.quality_hold;
+        return `<div style="margin:6px 0;padding:6px 8px;border:1px solid #e0a800;background:#fff8e6;border-radius:4px">
+          <span class="badge PAUSED">质量门禁暂停</span>
+          <b>触发来源:</b> ${escapeHtml(h.trigger_text || h.trigger_source)}
+          <span class="muted">· 停在步骤 seq=${h.paused_at_seq ?? '-'} · ${(h.created_at||'').slice(0,19)}</span>
+          <div class="err">${escapeHtml(h.reason || '')}</div>
+          <div class="muted">关联重扫: <b>${h.rescan_scan_id || '(编排中)'}</b>
+            <button class="plain" onclick="qgShowHolds('${p.id}')">暂停/恢复历史</button></div>
+        </div>`;
+      })() : ''}
       ${approvalLine}
       ${winEditor}
       <div style="margin:6px 0">
@@ -1964,10 +1983,15 @@ async function qgLoadOverview() {
     const bl = d.BLOCKER || {};
     return `<div style="border-top:1px dashed #ddd;padding:6px 0">
       <span class="badge ${s.status}">${s.status}</span>
+      ${s.is_auto_rescan ? '<span class="badge RUNNING" title="质量结果失效后系统自动编排">自动重扫</span>' : '<span class="muted">手动扫描</span>'}
       <b>${s.id}</b> <span class="muted">规则 v${s.rule_version} · ${s.progress.done}/${s.progress.total} 批次
         · ${s.total_records} 条记录 · ${s.total_issues} 问题
         (阻断 ${bl.total||0}: 待处理 ${bl.OPEN||0}/修复 ${bl.FIXED||0}/豁免 ${bl.EXEMPTED||0})
         ${s.expires_at ? ' · 有效期至 ' + s.expires_at : ''}</span>
+      ${s.is_auto_rescan ? `<div style="margin:2px 0">触发来源: <b>${(window.QG_TRIGGER_TEXT||{})[s.trigger_source]||s.trigger_source||'-'}</b>
+        ${s.supersedes_scan_id ? ' · 取代扫描 <code>'+s.supersedes_scan_id+'</code>' : ''}
+        ${(s.affected_batch_ids||[]).length ? ' · 受影响批次 '+s.affected_batch_ids.join(', ') : ''}
+        ${(s.triggers||[]).length>1 ? ' · 合并触发 '+s.triggers.length+' 次' : ''}</div>` : ''}
       ${s.failure_reason ? `<div class="err">${escapeHtml(s.failure_reason)}</div>` : ''}
       ${(s.stale && s.stale.length) ? `<div class="err">结果失效: ${s.stale.slice(0,3).map(escapeHtml).join('; ')}</div>` : ''}
       <div class="bar" style="width:240px;display:inline-block;vertical-align:middle">
@@ -1980,7 +2004,47 @@ async function qgLoadOverview() {
     </div>`;
   }).join('') || '<span class="muted">尚无扫描任务</span>';
   qgLoadHistory();
+  qgLoadHolds();
   qgLoadIssues();
+}
+
+const QG_TRIGGER_TEXT = {batch_data_write:'批次数据写入', rule_version_change:'规则版本变化',
+  scan_expired:'扫描过期', gate_blocked:'门禁复核未通过', scan_failed_retry:'重扫失败重试'};
+
+async function qgLoadHolds() {
+  const pid = qgSelectedPlan();
+  const box = document.getElementById('qgHolds');
+  if (!pid || !box) return;
+  let j;
+  try { j = await (await fetch(`/api/admin/plans/${pid}/quality-holds`)).json(); }
+  catch { return; }
+  if (!j || !Array.isArray(j.history)) { box.textContent = '该计划未绑定规则或无暂停历史'; return; }
+  if (!j.history.length) { box.innerHTML = '<span class="muted">无门禁暂停记录</span>'; return; }
+  const trigText = t => QG_TRIGGER_TEXT[t] || t;
+  box.innerHTML = j.history.map(h => {
+    const state = h.status === 'ACTIVE' ? '<span class="badge PAUSED">暂停中</span>'
+      : h.status === 'RESUMED' ? '<span class="badge SUCCESS">已自动恢复</span>'
+      : '<span class="badge CANCELED">已取消</span>';
+    const trigs = (h.triggers||[]).map(t =>
+      `<span class="tag">${trigText(t.source)}</span>`).join('');
+    return `<div style="border-top:1px dashed #ddd;padding:4px 0">
+      ${state} <b>${h.id}</b>
+      <span class="muted">${(h.created_at||'').slice(0,19)}</span>
+      <div>触发来源: <b>${trigText(h.trigger_source)}</b> ${trigs}
+        · 停在步骤 seq=${h.paused_at_seq ?? '-'} · 关联重扫 <b>${h.rescan_scan_id||'-'}</b></div>
+      <div class="${h.status==='ACTIVE'?'err':'muted'}">${escapeHtml(h.reason||'')}</div>
+      ${h.status==='RESUMED' ? `<div class="ok">自动恢复(依据扫描 ${h.resume_scan_id||'-'}, by ${escapeHtml(h.resumed_by||'')} @ ${(h.resumed_at||'').slice(0,19)})</div>` : ''}
+      ${h.status==='CANCELED' ? `<div class="muted">计划取消, 不再自动恢复(by ${escapeHtml(h.canceled_by||'')})</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+async function qgShowHolds(pid) {
+  const sel = document.getElementById('qgPlan');
+  sel.value = pid;
+  await qgLoadOverview();
+  const el = document.getElementById('qgHolds');
+  if (el) el.scrollIntoView({behavior:'smooth', block:'center'});
 }
 
 async function qgViewScan(sid) {

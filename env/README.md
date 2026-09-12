@@ -409,6 +409,55 @@ QUEUED ─claim(单 RUNNING 串行)─▶ RUNNING ─全部项处理完─▶ CO
   worker 随 `PLAN_WORKER_ENABLED=0` 一并关闭, 测试手动 `claim_due_scans` +
   `run_scan_tick` 驱动。
 
+## 质量结果失效后的自动重扫编排
+
+计划启动后进入执行期, 质量门禁继续作为**叠加闸门**存在: 批次数据写入、规则版本
+变化或扫描结果过期时, 系统为受影响计划**自动编排唯一的重扫任务**并记录触发
+原因; 计划执行器在**步骤边界**(取到候选步骤前后)遇到门禁失效即暂停推进,
+重扫完成且阻断问题处理完后计划**从原步骤自动继续**。全部状态落库, 服务重启后
+待处理重扫与暂停状态继续保留。
+
+### 触发来源与唯一重扫
+
+- 三类失效来源即时触发: **批次数据写入**(`POST /api/records` 命中执行态计划
+  涉及的批次且内容实际变化, 受影响批次记入范围)、**规则版本变化**(执行态计划
+  保存新规则版本, 重扫基于新版本)、**扫描过期**(worker 每 tick 兜底, TTL 到期)。
+- 每次编排产生且仅产生一个 `scan_source=auto_rescan` 的扫描: 记录首次触发来源
+  (`trigger_source`: `batch_data_write`/`rule_version_change`/`scan_expired`/
+  `gate_blocked`/`scan_failed_retry`)、触发原因列表(`triggers`, 重复触发**去重
+  合并**)、`supersedes_scan_id`(取代的旧扫描)与 `affected_batch_ids`(受影响
+  批次); 重扫仍覆盖计划**全部批次**(跨批次影响范围可追溯)。
+- **重复触发不生成重复任务**: 计划同时至多一个活动(QUEUED/RUNNING/PAUSED)
+  扫描(数据库部分唯一索引兜底, Postgres 咨询锁 / SQLite 进程互斥锁串行化);
+  新触发只把原因合并进在途任务。执行态计划在门禁暂停中也允许管理员**手动发起**
+  扫描(幂等复用在途任务), 普通 RUNNING 计划不允许手动扫描。
+- DRAFT/PAUSED 计划不自动排队: DRAFT 沿用"门禁实时 STALE + 手动扫描"流程;
+  用户主动暂停的计划恢复后由执行器门禁兜底编排。
+
+### 计划暂停与自动恢复(quality hold)
+
+- 执行器在步骤边界调用门禁: 不通过即把计划置为**质量暂停**(`quality_hold=true`,
+  计划状态仍为 RUNNING/HALTED), 落一条只追加的 `quality_gate_holds`(ACTIVE):
+  记录触发来源、暂停原因(机器可读 `reason_code` 为门禁状态 STALE/BLOCKED/
+  RUNNING/FAILED/...)、**停留的步骤**(步骤保持 PENDING/FAILED, 尝试计数与轮次
+  不复位)、关联的唯一重扫与合并触发历史, 并写 `plan.quality_hold` 计划审计。
+- worker 每 tick 复评: 重扫 COMPLETED 且阻断问题全部 FIXED/EXEMPTED(门禁 PASS)
+  时 hold 自动置 RESUMED(`resume_mode=auto_gate_pass`, 记录依据扫描/时间),
+  写 `plan.quality_resume` 审计, 计划**从暂停时的原步骤**继续; 重扫发现新阻断
+  问题则保持暂停并把原因刷新为 BLOCKED(修复批次本身为执行态计划再次编排重扫,
+  豁免不重扫、凭当前有效扫描直接恢复)。
+- **重扫失败可恢复**: 重扫 FAILED 时暂停不解除(原因反映失败码), 管理员对扫描
+  `resume`(失败批次重试)后自愈, 成功且门禁通过即继续; 重扫被暂停则计划等待。
+- **计划取消后不再自动恢复**: `cancel` 把 ACTIVE hold 置 CANCELED、活动重扫
+  (自动/手动)随计划取消; 此后即使扫描完成、门禁通过或再发生写入, 计划也不复活,
+  不会有新的自动重扫。计划 COMPLETED 同理(批次 DONE, 旧路径写入 410)。
+- 暂停/恢复历史接口: `GET /api/admin/plans/{id}/quality-holds`
+  (当前 ACTIVE + 全量 RESUMED/CANCELED 历史); `POST /api/admin/quality-rescan/sweep`
+  可手动触发一次与 worker 等价的兜底编排(关闭后台线程的测试/运维用)。
+- 页面: 计划卡片显示"质量门禁暂停"横幅(触发来源/停留步骤/暂停原因/关联重扫/
+  历史按钮), 质量门禁区显示每个扫描的"自动重扫/手动扫描"标记、触发来源、
+  取代扫描、受影响批次、合并触发次数, 以及暂停与自动恢复历史。
+
 ## 运行
 
 ```bash
@@ -454,6 +503,8 @@ GET  /api/admin/plans/{id}/quality-overview          规则版本+扫描列表(�
 GET  /api/admin/plans/{id}/quality-issues?scan_id=&batch_id=&severity=&status_filter=&rule_type=
                                                       按计划查询质量问题(含可追踪样本)
 GET  /api/admin/plans/{id}/quality-history           修复批次与豁免全量历史(绑定规则版本)
+GET  /api/admin/plans/{id}/quality-holds             质量门禁暂停/自动恢复历史(触发来源/关联重扫/暂停原因)
+POST /api/admin/quality-rescan/sweep                 手动触发一次失效兜底编排(过期/版本变化; 与 worker tick 等价)
 GET  /api/admin/quality-scans?plan_id=&status_filter= 质量扫描任务列表
 GET  /api/admin/quality-scans/{id}                   扫描详情(批次进度/问题分布/过期原因/事件流水)
 GET  /api/admin/quality-scans/{id}/issues?severity=&status_filter=  扫描问题明细(含样本)
@@ -506,7 +557,7 @@ GET  /api/admin/archive-cleanups                     清理计划列表(进度�
 GET  /api/admin/archive-cleanups/{id}                清理计划详情(逐项 CLEANED/SKIPPED/失败原因 + 事件)
 POST /api/admin/archive-cleanups/{id}/pause|resume|cancel  {operator, idempotency_key}
 GET  /api/admin/audit?batch_id=&plan_id=           审计日志(可按批次或计划过滤)
-POST /api/records                                  旧结构写入(批次冻结期 423 / 批次切换后 410)
+POST /api/records                                  旧结构写入(批次冻结期 423 / 批次切换后 410; 执行态计划涉及批次写入自动编排重扫)
 POST /api/v2/records                               新结构写入(仅所属批次 DONE)
 GET  /api/records/{id}                             按所属批次阶段返回 旧/新/双读+diff
 GET  /api/records/{id}/compare                     批次冻结窗内双读比对
@@ -519,7 +570,7 @@ GET  /api/records/{id}/compare                     批次冻结窗内双读比�
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 165 个用例:
+python3 -m pytest tests/ -q   # 190 个用例:
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
 # 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
@@ -573,4 +624,16 @@ python3 -m pytest tests/ -q   # 165 个用例:
 #           扫描控制幂等与状态冲突/同键跨动作复用 409/重启 RUNNING 复位排队与 RUNNING 批次复位/
 #           重启后规则·扫描·豁免·门禁状态保留/按计划多维查询问题与门禁结果/总览与扫描列表/
 #           门禁与高风险审批叠加
+# 质量结果失效自动重扫(25): 批次写入执行态计划自动编排唯一重扫(触发来源/取代关联/受影响
+#           批次)/重复写入合并不重复/DRAFT 与批次外写入不触发/同值写入不触发/
+#           规则版本变化即时重扫(基于新版本)/DRAFT 版本变化不自动/过期 sweep 兜底编排且不重复/
+#           执行器步骤边界暂停停原步骤(计数不复位)→干净重扫完成后从原步骤自动恢复/
+#           重扫发现阻断问题保持暂停(BLOCKED)/修复后重扫恢复/豁免不重扫直接恢复/
+#           多触发来源合并唯一任务/并发双会话只落一个重扫/重扫 FAILED→resume 自愈恢复/
+#           计划取消终止 hold 与重扫且永不复活/COMPLETED 后写入 410 不编排/
+#           重扫覆盖计划全部批次且记录受影响范围/DONE 批次不影响其他执行态计划/
+#           重启保留待处理重扫与暂停(跑一半的重扫续跑)/重启后过期补编排/
+#           接口与 status 展示触发来源/重扫关联/暂停/多轮暂停恢复历史/
+#           hold 中允许手动扫描且通过后解除/普通 RUNNING 拒绝手动扫描/
+#           用户暂停叠加后取消/重扫被暂停不恢复/步骤完成后的边界也复评门禁
 ```

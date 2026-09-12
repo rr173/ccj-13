@@ -61,12 +61,42 @@ def _backfill_plan_columns():
         "approved_at": "TIMESTAMP",
         "reject_reason": "VARCHAR(500)",
         "window_open": "BOOLEAN",
+        "quality_hold": "BOOLEAN NOT NULL DEFAULT 0",
     }
     with engine.begin() as conn:
         for col, ddl in defaults.items():
             if col not in existing:
                 conn.execute(_text(
                     f"ALTER TABLE migration_plans ADD COLUMN {col} {ddl}"))
+
+
+def _backfill_quality_rescan_columns():
+    """旧库补齐自动重扫编排列(quality_scans)与质量暂停表:
+    已有扫描按手动扫描、无触发来源处理。幂等, 可重复执行。"""
+    from sqlalchemy import inspect, text as _text
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "quality_scans" in tables:
+        existing = {c["name"] for c in inspector.get_columns("quality_scans")}
+        defaults = {
+            "scan_source": "VARCHAR(16) NOT NULL DEFAULT 'manual'",
+            "trigger_source": "VARCHAR(32)",
+            "triggers": "JSON",
+            "supersedes_scan_id": "VARCHAR(32)",
+            "affected_batch_ids": "JSON",
+        }
+        with engine.begin() as conn:
+            for col, ddl in defaults.items():
+                if col not in existing:
+                    conn.execute(_text(
+                        f"ALTER TABLE quality_scans ADD COLUMN {col} {ddl}"))
+        # 活动扫描按计划唯一的部分唯一索引(数据库层兜底, 重复/并发触发不产生重复任务;
+        # Postgres/SQLite 均支持 WHERE 条件的唯一索引)
+        with engine.begin() as conn:
+            conn.execute(_text(
+                "CREATE UNIQUE INDEX IF NOT EXISTS uq_quality_scan_active_plan "
+                "ON quality_scans(plan_id) "
+                "WHERE status IN ('QUEUED','RUNNING','PAUSED')"))
 
 
 def _backfill_replay_columns():
@@ -123,6 +153,7 @@ def startup():
     _backfill_plan_columns()
     _backfill_replay_columns()
     _backfill_archive_columns()
+    _backfill_quality_rescan_columns()
     db = SessionLocal()
     try:
         service.boot_check(db)
@@ -520,6 +551,24 @@ def get_plan_quality_overview(plan_id: str, db: Session = Depends(get_db)):
         return quality.plan_quality_view(db, plan_id)
     except quality.QualityNotFound as e:
         _quality_not_found(e)
+
+
+@app.get("/api/admin/plans/{plan_id}/quality-holds")
+def get_quality_holds(plan_id: str, db: Session = Depends(get_db)):
+    """质量门禁暂停与自动恢复历史: 当前 ACTIVE 暂停(触发来源/暂停原因/
+    关联的唯一自动重扫) + 全量恢复/取消历史。"""
+    try:
+        return quality.holds_view(db, plan_id)
+    except quality.QualityNotFound as e:
+        _quality_not_found(e)
+
+
+@app.post("/api/admin/quality-rescan/sweep")
+def run_quality_rescan_sweep(db: Session = Depends(get_db)):
+    """手动触发一次失效兜底扫描(与 worker 每 tick 的动作一致):
+    为结果过期/版本变化等执行态计划编排重扫并复评暂停, 返回每个计划的编排结果。
+    主要用于运维/测试在关闭后台 worker 时确定性驱动。"""
+    return {"results": quality.sweep_due_rescans(db)}
 
 
 @app.get("/api/admin/plans/{plan_id}/quality-issues")
@@ -1162,7 +1211,11 @@ def _reject_writes(batch: MigrationBatch):
 @app.post("/api/records", status_code=201)
 def create_old(rec: RecordIn, db: Session = Depends(get_db)):
     """旧结构写入路径。所属批次冻结期拒绝并说明原因; 批次切换后明确失败。
-    批次外记录不受影响, 正常写入。"""
+    批次外记录不受影响, 正常写入。
+
+    写入提交后触发自动重扫编排: 若该批次属于执行中(RUNNING/HALTED)且绑定了
+    质量规则的计划, 立即为受影响计划编排唯一重扫(数据指纹将漂移), 重复写入
+    不产生重复任务(合并触发原因)。"""
     batch = service.batch_for_record(db, rec.id)
     if batch is not None:
         if batch.phase == "DONE":
@@ -1173,11 +1226,23 @@ def create_old(rec: RecordIn, db: Session = Depends(get_db)):
             })
         if batch.phase != "NORMAL":
             _reject_writes(batch)
+    old = db.get(RecordOld, rec.id)
+    changed = (old is None or old.name != rec.name or old.email != rec.email
+               or old.tags_csv != rec.tags_csv)
     row = RecordOld(id=rec.id, name=rec.name, email=rec.email, tags_csv=rec.tags_csv)
     db.merge(row)
     db.commit()
+    rescans = []
+    if changed and batch is not None:
+        # 自动重扫编排(独立提交, 不影响写入主流程; DRAFT/PAUSED 计划不自动排队)
+        try:
+            rescans = quality.notify_batch_data_written(
+                db, batch.id, record_id=rec.id, operator="api")
+        except Exception:  # noqa: BLE001 - 编排失败不得阻断业务写入
+            db.rollback()
     return {"ok": True, "structure": "old", "id": rec.id,
-            "batch_id": batch.id if batch else None}
+            "batch_id": batch.id if batch else None,
+            "rescans": rescans}
 
 
 @app.post("/api/v2/records", status_code=201)

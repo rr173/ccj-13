@@ -1,5 +1,5 @@
 from sqlalchemy import (
-    JSON, Boolean, Column, DateTime, ForeignKey, Integer, String,
+    JSON, Boolean, Column, DateTime, ForeignKey, Index, Integer, String,
     UniqueConstraint, func,
 )
 from sqlalchemy.orm import relationship
@@ -134,6 +134,12 @@ class MigrationPlan(Base):
     # 执行窗口运行态闸门: None=计划无窗口限制; True/False=最近一次判定在窗口内/外。
     # 只是持久化的"最近判定": 窗口边界本身在 plan_windows 表, 每次 tick 重新判定,
     # 重启不会丢失窗口外暂停状态, 重新进入窗口也能自动继续。
+    # 质量门禁失效后的自动暂停(quality hold): True 表示执行器在步骤边界因门禁
+    # 失效(数据写入/规则版本变化/扫描过期/重扫发现阻断问题)暂停推进, 等待自动
+    # 重扫完成且门禁重新通过。暂停历史在 quality_gate_holds 表(只追加)。
+    # 与用户手动 PAUSED 独立: quality_hold 期间计划状态仍为 RUNNING/HALTED,
+    # worker 每个 tick 重新评估门禁, 通过后自动从原步骤继续。
+    quality_hold = Column(Boolean, nullable=False, default=False)
     window_open = Column(Boolean, nullable=True)
     created_by = Column(String(128), nullable=False)
     started_by = Column(String(128), nullable=True)
@@ -745,6 +751,14 @@ class QualityScan(Base):
     门禁判定为 STALE, 旧结果不能放行。"""
 
     __tablename__ = "quality_scans"
+    __table_args__ = (
+        # 数据库层兜底: 同一计划同时至多一个活动(QUEUED/RUNNING/PAUSED)扫描。
+        # 手动扫描与自动重扫共用该不变量, 重复/并发触发在唯一约束上合并,
+        # 绝不落第二个活动任务(Postgres/SQLite 均支持部分索引)。
+        Index("uq_quality_scan_active_plan", "plan_id", unique=True,
+              postgresql_where=Column("status").in_(QUALITY_SCAN_ACTIVE_STATUSES),
+              sqlite_where=Column("status").in_(QUALITY_SCAN_ACTIVE_STATUSES)),
+    )
 
     id = Column(String(32), primary_key=True)          # "QS" + 随机串
     plan_id = Column(String(32), ForeignKey("migration_plans.id"),
@@ -755,6 +769,22 @@ class QualityScan(Base):
     rule_digest = Column(String(64), nullable=False)
     rules_snapshot = Column(JSON, nullable=False, default=list)  # 自包含规则快照(修复核验用)
     status = Column(String(16), nullable=False, default="QUEUED", index=True)
+    # ---------- 自动重扫编排 ----------
+    # scan_source: manual=管理员在计划启动前手动发起; auto_rescan=质量结果失效后
+    # 系统为受影响计划自动编排的重扫。自动重扫同样覆盖计划涉及的全部批次,
+    # 但创建不受"计划必须 DRAFT"限制(计划可能正在执行/已停住)。
+    scan_source = Column(String(16), nullable=False, default="manual")
+    # 首次触发来源(RESCAN_TRIGGERS 之一): batch_data_write/rule_version_change/
+    # scan_expired/gate_blocked; 重复触发不产生重复任务, 而是合并进同一活动任务。
+    trigger_source = Column(String(32), nullable=True, index=True)
+    # 触发原因列表(去重合并, 只追加): [{source, reason, batch_id?, at, operator}],
+    # 页面/接口展示"为什么会有这个重扫"。
+    triggers = Column(JSON, nullable=True, default=list)
+    # 本重扫所取代的上一次扫描(结果失效的那次); 手动扫描为 None。
+    supersedes_scan_id = Column(String(32), nullable=True, index=True)
+    # 受影响范围: 触发时涉及的批次 id 列表(跨批次影响范围可查);
+    # 实际扫描仍逐批覆盖计划全部步骤批次。
+    affected_batch_ids = Column(JSON, nullable=True, default=list)
     total_batches = Column(Integer, nullable=False, default=0)
     completed_batches = Column(Integer, nullable=False, default=0)
     total_records = Column(Integer, nullable=False, default=0)
@@ -897,7 +927,8 @@ class QualityExemption(Base):
 
 class QualityEvent(Base):
     """质量门禁事件流水(只追加): 规则版本创建、扫描创建/排队/认领/暂停/恢复/
-    取消/完成/失败/重启对账、修复批次、豁免提交/撤销。质量模块不写业务审计表。"""
+    取消/完成/失败/重启对账、修复批次、豁免提交/撤销、自动重扫编排、
+    计划门禁暂停/恢复。质量模块不写业务审计表(暂停/恢复同步落 plan 审计)。"""
 
     __tablename__ = "quality_events"
 
@@ -909,3 +940,60 @@ class QualityEvent(Base):
     operator = Column(String(128), nullable=False)
     reason = Column(String(500), nullable=True)
     detail = Column(JSON, nullable=True)
+
+
+# ---------- 质量结果失效后的自动重扫编排 ----------
+# 自动重扫触发来源:
+#   batch_data_write   批次范围内旧结构数据写入(指纹将漂移/已漂移)
+#   rule_version_change 规则新版本发布, 旧扫描绑定的规则版本不再是当前版本
+#   scan_expired       最近一次完成扫描超过 TTL(expires_at)
+#   gate_blocked       执行器在步骤边界发现门禁失效(兜底来源)
+#   scan_failed_retry  上一次(自动)扫描 FAILED 后的恢复重试
+RESCAN_TRIGGERS = (
+    "batch_data_write", "rule_version_change", "scan_expired",
+    "gate_blocked", "scan_failed_retry",
+)
+# 门禁暂停(QualityGateHold)状态机:
+#   ACTIVE  计划执行器因门禁失效暂停推进, 等待自动重扫与阻断问题处理;
+#   RESUMED 重扫完成且门禁重新 PASS, 计划从原步骤自动恢复;
+#   CANCELED 计划在暂停期间被管理员取消, 不再自动恢复(终态)。
+GATE_HOLD_STATUSES = ("ACTIVE", "RESUMED", "CANCELED")
+# 恢复方式: auto=worker 检测到门禁 PASS 自动恢复; manual_cancel=计划取消。
+GATE_HOLD_RESUME_AUTO = "auto_gate_pass"
+
+
+class QualityGateHold(Base):
+    """计划因质量门禁失效而暂停的一次留痕(只追加, 恢复不改写而是终态化)。
+
+    每次执行器在步骤边界发现门禁失效都会开一段 hold(同一计划同时至多一段
+    ACTIVE); hold 关联系统编排的唯一自动重扫任务(rescan_scan_id), 记录首次
+    触发来源、暂停原因(计划步骤停在原步骤不复位)与全部触发原因的合并历史;
+    重扫完成、阻断问题处理完且门禁重新通过后自动 RESUMED(记录恢复时扫描),
+    计划从暂停时的原步骤继续推进; 计划取消则 CANCELED, 不再自动恢复。"""
+
+    __tablename__ = "quality_gate_holds"
+
+    id = Column(String(32), primary_key=True)          # "QH" + 随机串
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"),
+                     nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="ACTIVE", index=True)
+    trigger_source = Column(String(32), nullable=False)   # RESCAN_TRIGGERS 之一
+    reason = Column(String(500), nullable=False)          # 暂停原因(人类可读)
+    reason_code = Column(String(32), nullable=True)       # 机器可读门禁状态(STALE/BLOCKED/...)
+    # 暂停时计划停留的步骤(从原步骤继续, 不重置尝试计数/轮次)
+    paused_at_step_id = Column(Integer, nullable=True)
+    paused_at_seq = Column(Integer, nullable=True)
+    # 关联的自动重扫(唯一): 创建 hold 时同步编排, 重复触发合并到该任务
+    rescan_scan_id = Column(String(32), nullable=True, index=True)
+    # 触发原因合并历史(只追加): 与扫描 triggers 同源记录
+    triggers = Column(JSON, nullable=False, default=list)
+    # 恢复留痕
+    resume_mode = Column(String(32), nullable=True)       # auto_gate_pass
+    resume_scan_id = Column(String(32), nullable=True)    # 恢复时门禁依据的扫描
+    resumed_by = Column(String(128), nullable=True)
+    resumed_at = Column(DateTime, nullable=True)
+    canceled_by = Column(String(128), nullable=True)
+    canceled_at = Column(DateTime, nullable=True)
+    created_by = Column(String(128), nullable=False, default="system")
+    created_at = Column(DateTime, default=_utcnow, index=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
