@@ -12,6 +12,12 @@
   .NORMAL { background: #2e7d32; } .FROZEN { background: #ef6c00; }
   .VALIDATING { background: #1565c0; } .VALIDATED { background: #6a1b9a; }
   .DONE { background: #37474f; }
+  .DRAFT { background: #78909c; } .RUNNING { background: #1565c0; }
+  .PAUSED { background: #ef6c00; } .HALTED { background: #c62828; }
+  .COMPLETED { background: #2e7d32; } .CANCELED { background: #546e7a; }
+  .BLOCKED { background: #9e9e9e; } .PENDING { background: #1565c0; }
+  .FAILED { background: #ef6c00; } .SKIPPED { background: #546e7a; }
+  .SUCCESS { background: #2e7d32; }
   button { padding: 6px 12px; margin: 2px 4px 2px 0; border: 0; border-radius: 6px;
            background: #1565c0; color: #fff; cursor: pointer; font-size: 12px; }
   button.danger { background: #c62828; }
@@ -61,6 +67,22 @@
 <div class="card">
   <b>差异明细</b>（批次内不一致会阻止该批次切换; 范围外记录不参与比对）
   <div id="diffs"><span class="muted">点击批次行的"差异"查看</span></div>
+</div>
+
+<div class="card">
+  <b>迁移计划编排</b>（多批次按顺序与依赖编排; 依赖步骤成功后才推进; 失败自动重试, 超限停住）
+  <div style="margin:8px 0">
+    计划名 <input id="planName" value="灰度计划" size="12">
+    每步额外重试 <input id="planRetry" type="number" value="0" min="0" max="10" style="width:60px"> 次
+    <button onclick="addPlanStepRow()">+ 步骤</button>
+    <button onclick="createPlan()">创建计划</button>
+  </div>
+  <table>
+    <thead><tr><th>顺序 seq</th><th>批次</th><th>依赖(seq, 逗号分隔)</th><th>本步额外重试</th><th></th></tr></thead>
+    <tbody id="planStepRows"></tbody>
+  </table>
+  <div id="planMsg" class="msg"></div>
+  <div id="plans" style="margin-top:12px"></div>
 </div>
 
 <div class="card">
@@ -122,12 +144,144 @@ async function refresh() {
         <button class="plain" onclick="showDiffs('${b.id}')">差异</button>
       </td></tr>`;
   }).join('') || '<tr><td colspan="10" class="muted">尚无批次, 请先创建</td></tr>';
+  syncPlanStepRows(s.batches);
+  renderPlans(s.plans || []);
   const rows = await (await fetch('/api/admin/audit?limit=50')).json();
   document.getElementById('audit').innerHTML = rows.map(r =>
-    `<tr><td>${r.ts||''}</td><td>${r.batch_id||''}</td><td>${r.operator}</td><td>${r.action}</td>
+    `<tr><td>${r.ts||''}</td><td>${r.batch_id||r.plan_id||''}</td><td>${r.operator}</td><td>${r.action}</td>
      <td>${r.from_phase||''} → ${r.to_phase||''}</td><td>${r.epoch??''}</td>
      <td>${r.app_version||''}</td><td>${r.watermark??''}</td>
      <td>${r.reason||''}${r.diffs?(' 差异:'+r.diffs.length+'处'):''}</td></tr>`).join('');
+}
+
+// ---------- 迁移计划编排 ----------
+
+let planRowSeq = 0;
+
+function planBatchOptions(sel) {
+  const list = Object.values(batchCache);
+  return list.map(b => `<option value="${b.id}" ${b.id===sel?'selected':''}>${b.id} · ${b.biz} · ${b.phase}</option>`).join('')
+    || '<option value="">(请先创建批次)</option>';
+}
+
+function addPlanStepRow(seq, batchId, deps, retry) {
+  const i = ++planRowSeq;
+  const tr = document.createElement('tr');
+  tr.id = 'prow-' + i;
+  const nextSeq = document.querySelectorAll('#planStepRows tr').length + 1;
+  tr.innerHTML = `<td><input class="p-seq" type="number" value="${seq ?? nextSeq}" style="width:60px"></td>
+    <td><select class="p-batch" style="max-width:220px">${planBatchOptions(batchId)}</select></td>
+    <td><input class="p-deps" value="${deps ?? ''}" size="16" placeholder="如 1,2"></td>
+    <td><input class="p-retry" type="number" value="${retry ?? ''}" min="0" max="10" style="width:60px" placeholder="默认"></td>
+    <td><button class="danger" onclick="document.getElementById('prow-${i}').remove()">删</button></td>`;
+  document.getElementById('planStepRows').appendChild(tr);
+}
+
+function syncPlanStepRows(batches) {
+  // 批次列表变化时保持已选值并刷新下拉项
+  document.querySelectorAll('#planStepRows tr').forEach(tr => {
+    const sel = tr.querySelector('.p-batch');
+    const cur = sel.value;
+    sel.innerHTML = planBatchOptions(cur);
+  });
+}
+
+function showPlanMsg(ok, text) {
+  const el = document.getElementById('planMsg');
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+}
+
+async function createPlan() {
+  const steps = [];
+  for (const tr of document.querySelectorAll('#planStepRows tr')) {
+    const seq = parseInt(tr.querySelector('.p-seq').value);
+    const batch_id = tr.querySelector('.p-batch').value;
+    const deps = (tr.querySelector('.p-deps').value || '')
+      .split(',').map(x => parseInt(x.trim())).filter(x => Number.isInteger(x));
+    const rv = tr.querySelector('.p-retry').value;
+    const st = { seq, batch_id, depends_on: deps };
+    if (rv !== '') st.max_retries = parseInt(rv);
+    steps.push(st);
+  }
+  if (!steps.length) { showPlanMsg(false, '请至少添加一个步骤'); return; }
+  const body = { operator: operator(), idempotency_key: idemKey(),
+    name: document.getElementById('planName').value,
+    max_retries: parseInt(document.getElementById('planRetry').value) || 0,
+    steps };
+  const { status, j } = await post('/api/admin/plans', body);
+  if (status === 201) {
+    showPlanMsg(true, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+    document.getElementById('planStepRows').innerHTML = '';
+  } else {
+    const reasons = (j.detail && j.detail.reasons) || [];
+    showPlanMsg(false, '保存被拒绝:\n - ' + (reasons.join('\n - ')
+      || ((j.detail && j.detail.reason) || JSON.stringify(j))));
+  }
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function planAct(pid, name) {
+  const { status, j } = await post(`/api/admin/plans/${pid}/${name}`,
+    { operator: operator(), idempotency_key: idemKey() });
+  if (status === 200) showPlanMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showPlanMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+function renderPlans(plans) {
+  document.getElementById('plans').innerHTML = plans.map(p => {
+    const pct = p.progress.total ? Math.round(100 * p.progress.done / p.progress.total) : 0;
+    const canStart = p.status === 'DRAFT';
+    const canPause = p.status === 'RUNNING';
+    const canResume = ['PAUSED','HALTED'].includes(p.status);
+    const canCancel = ['DRAFT','RUNNING','PAUSED','HALTED'].includes(p.status);
+    const steps = p.steps.map(st => {
+      const dep = st.depends_on.length ? ' ←依赖 [' + st.depends_on.join(',') + ']' : '';
+      const err = st.last_error ? `<div class="err">${escapeHtml(st.last_error)}</div>` : '';
+      const ev = st.recent_event
+        ? `<div class="muted">最近: ${st.recent_event.event} #${st.recent_event.attempt} · ${st.recent_event.operator}</div>` : '';
+      return `<tr>
+        <td>${st.seq}</td>
+        <td>${st.batch_id}${st.batch_biz ? ' · '+st.batch_biz : ''}<div class="muted">批次阶段: ${st.batch_phase||'-'}</div></td>
+        <td><span class="badge ${st.status}">${st.status}</span></td>
+        <td>${st.attempts}/${st.max_retries + 1}<div class="muted">第 ${st.attempt_round} 轮</div></td>
+        <td>${st.executed_by || '-'}</td>
+        <td>${dep}${ev}${err}</td></tr>`;
+    }).join('');
+    const recentErrs = (p.events || []).filter(e => e.reason &&
+      ['fail','halted','reset','skip'].includes(e.event)).slice(0, 3)
+      .map(e => `<div class="err">[seq=${e.seq} #${e.attempt} ${e.event}] ${escapeHtml(e.reason)}</div>`).join('');
+    return `<div class="card" style="background:#fafcff">
+      <span class="badge ${p.status}">${p.status}</span>
+      <b>${escapeHtml(p.name)}</b> <span class="muted">${p.id}</span>
+      <span style="margin-left:12px">
+        <button ${canStart?'':'disabled'} onclick="planAct('${p.id}','start')">启动</button>
+        <button class="plain" ${canPause?'':'disabled'} onclick="planAct('${p.id}','pause')">暂停</button>
+        <button ${canResume?'':'disabled'} onclick="planAct('${p.id}','resume')">恢复</button>
+        <button class="danger" ${canCancel?'':'disabled'} onclick="planAct('${p.id}','cancel')">取消</button>
+      </span>
+      <div style="margin:6px 0">
+        <div class="bar" style="display:inline-block;width:240px;vertical-align:middle">
+          <div style="width:${pct}%"></div></div>
+        <span class="muted">${p.progress.done}/${p.progress.total} 步</span>
+        <span class="muted" style="margin-left:16px">创建: ${p.created_by} · 启动: ${p.started_by||'-'}</span>
+      </div>
+      ${p.last_error ? `<div class="err"><b>最近错误:</b> ${escapeHtml(p.last_error)}</div>` : ''}
+      ${recentErrs}
+      <table style="margin-top:6px">
+        <thead><tr><th>seq</th><th>批次</th><th>步骤状态</th><th>尝试/上限</th><th>操作者</th><th>依赖 / 最近事件 / 失败原因</th></tr></thead>
+        <tbody>${steps}</tbody>
+      </table>
+    </div>`;
+  }).join('') || '<div class="muted">尚无迁移计划</div>';
+}
+
+function escapeHtml(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
 function renderDiffs(title) {
@@ -222,6 +376,8 @@ async function dualRead() {
 }
 
 refresh();
+addPlanStepRow(1);
+addPlanStepRow(2);
 setInterval(refresh, 3000);
 </script>
 </body>

@@ -6,14 +6,23 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from .db import Base, SessionLocal, engine
-from .models import AuditLog, MigrationBatch, RecordNew, RecordOld
-from .schemas import AdminAction, BatchCreate, RecordIn, RecoverAction
-from . import service
+from .models import AuditLog, MigrationBatch, MigrationPlan, RecordNew, RecordOld
+from .plans import PlanWorker
+from .schemas import (
+    AdminAction, BatchCreate, PlanAction, PlanCreate, RecordIn, RecoverAction,
+)
+from . import plans, service
 
 APP_VERSION = service.APP_VERSION
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+# 测试可通过 PLAN_WORKER_ENABLED=0 关闭自动线程, 手动 run_plan_tick 做确定性验证。
+# 在 startup 时读取(而非 import 时), 便于测试进程内切换。
+def _worker_enabled() -> bool:
+    return os.getenv("PLAN_WORKER_ENABLED", "1") not in ("0", "false", "False")
+
 
 app = FastAPI(title="结构迁移切换服务(按业务分组批次)", version=APP_VERSION)
+worker = PlanWorker(poll_interval=float(os.getenv("PLAN_WORKER_POLL_INTERVAL", "0.5")))
 
 
 def get_db():
@@ -31,8 +40,18 @@ def startup():
     try:
         service.boot_check(db)
         db.commit()
+        # 计划重启对账必须先于 worker: 把遗留 RUNNING 步骤复位, 计划才不会"假运行"
+        plans.boot_recover_plans(db)
+        db.commit()
     finally:
         db.close()
+    if _worker_enabled():
+        worker.start()
+
+
+@app.on_event("shutdown")
+def shutdown():
+    worker.stop()
 
 
 # ---------- 错误映射 ----------
@@ -51,9 +70,12 @@ def _not_found(e: Exception):
 def status(db: Session = Depends(get_db)):
     batches = (db.query(MigrationBatch)
                .order_by(MigrationBatch.created_at, MigrationBatch.id).all())
+    plan_rows = (db.query(MigrationPlan)
+                 .order_by(MigrationPlan.created_at, MigrationPlan.id).all())
     return {
         "app_version": APP_VERSION,
         "batches": [service.batch_to_dict(db, b) for b in batches],
+        "plans": [plans.plan_to_dict(db, p) for p in plan_rows],
     }
 
 
@@ -74,15 +96,18 @@ def get_batch(batch_id: str, db: Session = Depends(get_db)):
 
 
 @app.get("/api/admin/audit")
-def audit_log(batch_id: str | None = None, limit: int = 100, db: Session = Depends(get_db)):
+def audit_log(batch_id: str | None = None, plan_id: str | None = None,
+              limit: int = 100, db: Session = Depends(get_db)):
     q = db.query(AuditLog)
     if batch_id:
         q = q.filter(AuditLog.batch_id == batch_id)
+    if plan_id:
+        q = q.filter(AuditLog.plan_id == plan_id)
     rows = q.order_by(AuditLog.id.desc()).limit(limit).all()
     return [
         {
             "id": r.id, "ts": r.ts.isoformat() if r.ts else None,
-            "batch_id": r.batch_id,
+            "batch_id": r.batch_id, "plan_id": r.plan_id, "step_id": r.step_id,
             "operator": r.operator, "action": r.action,
             "from_phase": r.from_phase, "to_phase": r.to_phase, "epoch": r.epoch,
             "app_version": r.app_version, "freeze_version": r.freeze_version,
@@ -144,6 +169,91 @@ def cutover(batch_id: str, body: AdminAction, db: Session = Depends(get_db)):
 def recover(batch_id: str, body: RecoverAction, db: Session = Depends(get_db)):
     return _run(db, "recover", body,
                 lambda s, b: service.do_recover(s, b, body.operator, body.reason), batch_id)
+
+
+# ---------- 迁移计划编排(创建校验 / 启动 / 暂停 / 恢复 / 取消) ----------
+
+def _plan_not_found(e: Exception):
+    raise HTTPException(status_code=404, detail={"error": "plan_not_found", "reason": str(e)})
+
+
+def _plan_conflict(e: Exception, reasons=None):
+    raise HTTPException(status_code=409, detail={
+        "error": "plan_conflict", "reason": str(e), "reasons": reasons or []})
+
+
+def _run_plan(db: Session, action: str, body: PlanAction, fn, plan_id: str | None = None):
+    payload = body.model_dump()
+    try:
+        result, replayed = plans.run_plan_action(
+            db, action=action, operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=payload,
+            plan_id=plan_id, fn=fn)
+    except plans.PlanNotFound as e:
+        db.rollback()
+        _plan_not_found(e)
+    except (plans.PlanStateError, plans.PlanValidationError) as e:
+        db.rollback()
+        _plan_conflict(e, getattr(e, "reasons", None))
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/plans", status_code=201)
+def create_plan(body: PlanCreate, db: Session = Depends(get_db)):
+    steps = [s.model_dump(exclude_none=True) for s in body.steps]
+    try:
+        result, replayed = plans.run_plan_action(
+            db, action="create", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            plan_id=None,
+            fn=lambda s, _p: plans.do_create_plan(
+                s, _p, body.operator, body.name, steps, body.max_retries))
+    except plans.PlanValidationError as e:
+        db.rollback()
+        _plan_conflict(e, e.reasons)
+    result["replayed"] = replayed
+    return result
+
+
+@app.get("/api/admin/plans")
+def list_plans(db: Session = Depends(get_db)):
+    rows = (db.query(MigrationPlan)
+            .order_by(MigrationPlan.created_at, MigrationPlan.id).all())
+    return [plans.plan_to_dict(db, p) for p in rows]
+
+
+@app.get("/api/admin/plans/{plan_id}")
+def get_plan(plan_id: str, db: Session = Depends(get_db)):
+    try:
+        plan = plans.get_plan(db, plan_id)
+    except plans.PlanNotFound as e:
+        _plan_not_found(e)
+    return plans.plan_to_dict(db, plan)
+
+
+@app.post("/api/admin/plans/{plan_id}/start")
+def start_plan(plan_id: str, body: PlanAction, db: Session = Depends(get_db)):
+    return _run_plan(db, "start", body,
+                     lambda s, p: plans.do_start(s, p, body.operator), plan_id)
+
+
+@app.post("/api/admin/plans/{plan_id}/pause")
+def pause_plan(plan_id: str, body: PlanAction, db: Session = Depends(get_db)):
+    return _run_plan(db, "pause", body,
+                     lambda s, p: plans.do_pause(s, p, body.operator), plan_id)
+
+
+@app.post("/api/admin/plans/{plan_id}/resume")
+def resume_plan(plan_id: str, body: PlanAction, db: Session = Depends(get_db)):
+    return _run_plan(db, "resume", body,
+                     lambda s, p: plans.do_resume(s, p, body.operator), plan_id)
+
+
+@app.post("/api/admin/plans/{plan_id}/cancel")
+def cancel_plan(plan_id: str, body: PlanAction, db: Session = Depends(get_db)):
+    return _run_plan(db, "cancel", body,
+                     lambda s, p: plans.do_cancel(s, p, body.operator), plan_id)
 
 
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------

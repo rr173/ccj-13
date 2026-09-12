@@ -1,4 +1,7 @@
-from sqlalchemy import JSON, Column, DateTime, Integer, String, func
+from sqlalchemy import (
+    JSON, Column, DateTime, ForeignKey, Integer, String, UniqueConstraint, func,
+)
+from sqlalchemy.orm import relationship
 
 from .db import Base
 
@@ -65,8 +68,10 @@ class AuditLog(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     ts = Column(DateTime, server_default=func.now())
     batch_id = Column(String(32), nullable=True, index=True)  # 所属批次
+    plan_id = Column(String(32), nullable=True, index=True)   # 所属迁移计划(计划级审计)
+    step_id = Column(Integer, nullable=True)                  # 所属计划步骤
     operator = Column(String(128), nullable=False)
-    action = Column(String(32), nullable=False)       # create/freeze/validate/cutover/recover/boot
+    action = Column(String(32), nullable=False)       # create/freeze/validate/cutover/recover/boot/plan.*
     from_phase = Column(String(32), nullable=True)
     to_phase = Column(String(32), nullable=True)
     epoch = Column(Integer, nullable=True)
@@ -75,6 +80,100 @@ class AuditLog(Base):
     watermark = Column(Integer, nullable=True)
     diffs = Column(JSON, nullable=True)               # 校验差异明细
     reason = Column(String(500), nullable=True)       # 恢复/失败原因
+
+
+# 迁移计划状态机:
+#   DRAFT --start--> RUNNING --pause--> PAUSED --resume--> RUNNING
+#      |                |                   |
+#      |                +--某步重试耗尽--> HALTED --resume--> RUNNING
+#      |                |
+#      +--cancel--------+--cancel--> CANCELED(终态)
+#   RUNNING --全部步骤成功--> COMPLETED(终态)
+PLAN_STATUSES = ("DRAFT", "RUNNING", "PAUSED", "HALTED", "COMPLETED", "CANCELED")
+# 步骤状态: BLOCKED 依赖未满足; PENDING 等待执行; RUNNING 执行中; SUCCESS 成功;
+#           FAILED 一次尝试失败(仍有重试额度, 下一 tick 自动重试); HALTED 重试耗尽, 计划停住
+STEP_STATUSES = ("BLOCKED", "PENDING", "RUNNING", "SUCCESS", "FAILED", "HALTED", "SKIPPED")
+
+
+class MigrationPlan(Base):
+    """迁移计划: 把多个已有迁移批次组织成带唯一顺序与依赖的步骤图。
+
+    只能在依赖步骤成功后推进下一步; 每步执行现有批次流程(freeze->validate->cutover)。
+    失败按 max_retries 自动重试, 超过次数进入 HALTED 并阻止后续步骤。
+    批次在同一计划内、以及在未终结的计划之间都不允许被重复占用。"""
+
+    __tablename__ = "migration_plans"
+
+    id = Column(String(32), primary_key=True)          # "P" + 随机串
+    name = Column(String(200), nullable=False)
+    status = Column(String(16), nullable=False, default="DRAFT", index=True)
+    max_retries = Column(Integer, nullable=False, default=0)  # 每步首次失败后的额外重试次数
+    last_error = Column(String(500), nullable=True)    # 最近一次错误(页面"最近错误")
+    failed_step_id = Column(Integer, nullable=True)    # 当前卡住的步骤
+    created_by = Column(String(128), nullable=False)
+    started_by = Column(String(128), nullable=True)
+    updated_by = Column(String(128), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+
+class PlanStep(Base):
+    """计划步骤: 绑定一个已有批次, seq 在计划内唯一, 依赖通过 PlanStepDependency 表达。
+
+    attempts 记录已执行的尝试次数(首次执行即 +1); 每次尝试另落一条 PlanStepEvent,
+    记录状态、操作者(启动/恢复计划的管理员)、失败原因与批次动作结果。"""
+
+    __tablename__ = "plan_steps"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "seq", name="uq_plan_step_seq"),
+        UniqueConstraint("plan_id", "batch_id", name="uq_plan_step_batch"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"), nullable=False, index=True)
+    seq = Column(Integer, nullable=False)              # 计划内唯一顺序
+    batch_id = Column(String(32), ForeignKey("migration_batches.id"), nullable=False)
+    status = Column(String(16), nullable=False, default="BLOCKED")
+    attempts = Column(Integer, nullable=False, default=0)
+    # 尝试轮次: 每次从 HALTED 恢复 +1。批次动作幂等键带轮次,
+    # 保证同一轮内崩溃重放走旧结果, 恢复后修复数据是全新尝试而非重放旧失败
+    attempt_round = Column(Integer, nullable=False, default=1)
+    max_retries = Column(Integer, nullable=False, default=0)
+    last_error = Column(String(500), nullable=True)
+    executed_by = Column(String(128), nullable=True)   # 实际推进该步骤的操作者(计划启动者)
+    updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
+
+    deps = relationship("PlanStepDependency", cascade="all, delete-orphan")
+
+
+class PlanStepDependency(Base):
+    """步骤依赖边: step_id 必须等 depends_on_seq 对应步骤成功后才能执行。"""
+
+    __tablename__ = "plan_step_dependencies"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "step_id", "depends_on_seq", name="uq_plan_dep"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"), nullable=False, index=True)
+    step_id = Column(Integer, ForeignKey("plan_steps.id"), nullable=False, index=True)
+    depends_on_seq = Column(Integer, nullable=False)
+
+
+class PlanStepEvent(Base):
+    """步骤执行流水(只追加): 每次尝试的状态、操作者、失败原因、批次动作结果快照。"""
+
+    __tablename__ = "plan_step_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, server_default=func.now())
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"), nullable=False, index=True)
+    step_id = Column(Integer, nullable=False, index=True)
+    attempt = Column(Integer, nullable=False)
+    event = Column(String(32), nullable=False)         # start/retry/success/fail/halted/reset/skip
+    operator = Column(String(128), nullable=False)
+    reason = Column(String(500), nullable=True)
+    detail = Column(JSON, nullable=True)               # 批次动作返回 / 差异等
 
 
 class IdempotencyKey(Base):

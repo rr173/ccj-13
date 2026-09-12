@@ -5,6 +5,8 @@ import tempfile
 _tmp = tempfile.mkdtemp(prefix="migration-test-")
 os.environ["DATABASE_URL"] = f"sqlite:///{_tmp}/test.db"
 os.environ["APP_VERSION"] = "1.0.0-test"
+# 计划后台 worker 由 conftest 统一关闭, 测试中手动驱动 tick
+os.environ["PLAN_WORKER_ENABLED"] = "0"
 
 import pytest
 from fastapi.testclient import TestClient

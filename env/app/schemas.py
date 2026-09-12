@@ -52,3 +52,25 @@ class ActionResult(BaseModel):
     replayed: bool = False
     diffs: list[dict[str, Any]] = []
     detail: str = ""
+
+
+# ---------- 迁移计划编排 ----------
+
+class PlanStepIn(BaseModel):
+    seq: int = Field(ge=1)                       # 计划内唯一顺序
+    batch_id: str = Field(min_length=1)          # 必须是已存在的批次
+    depends_on: list[int] = []                   # 依赖步骤的 seq(必须全部成功后才执行)
+    max_retries: Optional[int] = Field(default=None, ge=0, le=10)
+
+
+class PlanCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    max_retries: int = Field(default=0, ge=0, le=10)  # 每步首次失败后的额外重试次数
+    steps: list[PlanStepIn]
+
+
+class PlanAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
