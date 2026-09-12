@@ -385,6 +385,11 @@ def _require_status(plan: MigrationPlan, action: str) -> None:
 
 def do_start(session: Session, plan: MigrationPlan, operator: str) -> dict:
     _require_status(plan, "start")
+    # 迁移前数据质量门禁: 绑定了规则集的计划必须存在"当前规则版本 + 数据未漂移 +
+    # 未过期"的完成扫描, 且全部阻断级问题已修复或豁免, 才允许进入启动流程;
+    # 未绑定规则集的计划不受约束(保持历史行为)。延迟导入避免模块循环依赖。
+    from . import quality
+    quality.assert_gate_allows_start(session, plan.id)
     # 审批闸门: 高风险计划必须审批通过; 被拒绝/待审批都阻止启动
     if plan.risk_level == "HIGH":
         if plan.approval_status == "PENDING":

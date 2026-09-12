@@ -8,18 +8,20 @@ from sqlalchemy.orm import Session
 from .db import Base, SessionLocal, engine
 from .models import (
     REVIEW_STATUSES, ArchiveCleanupPlan, AuditLog, MigrationBatch, MigrationPlan,
-    RecordNew, RecordOld, ReplayArchive, ReplayBatchOp, ReplayCheckpoint,
-    ReplayTask,
+    QUALITY_ISSUE_STATUSES, QUALITY_SCAN_STATUSES, QualityScan, RecordNew,
+    RecordOld, ReplayArchive, ReplayBatchOp, ReplayCheckpoint, ReplayTask,
 )
 from .plans import PlanWorker
+from .quality import QualityWorker
 from .replay import ReplayWorker
-from . import archives, cleanup, plans, replay, service
+from . import archives, cleanup, plans, quality, replay, service
 from .schemas import (
     AdminAction, ArchiveAction, ArchiveCreate, ArchiveRetention, BatchCreate,
     CheckpointCreate, CleanupAction, CleanupCreate, PlanAction, PlanCreate,
-    PlanRejectAction, PlanWindowAction, RecordIn, RecoverAction, ReplayAction,
-    ReplayCreate, ReviewBatchAssign, ReviewBatchReview, ReviewConfirm,
-    ReviewReopen, ReviewSubmit,
+    PlanRejectAction, PlanWindowAction, QualityExemptionCreate,
+    QualityExemptionRevoke, QualityFixCreate, QualityRulesSave, QualityScanAction,
+    QualityScanCreate, RecordIn, RecoverAction, ReplayAction, ReplayCreate,
+    ReviewBatchAssign, ReviewBatchReview, ReviewConfirm, ReviewReopen, ReviewSubmit,
 )
 
 APP_VERSION = service.APP_VERSION
@@ -35,6 +37,7 @@ worker = PlanWorker(poll_interval=float(os.getenv("PLAN_WORKER_POLL_INTERVAL", "
 replay_worker = ReplayWorker()
 archive_worker = archives.ArchiveWorker()
 cleanup_worker = cleanup.CleanupWorker()
+quality_worker = QualityWorker()
 
 
 def get_db():
@@ -137,6 +140,9 @@ def startup():
         # 清理计划重启对账: 遗留 RUNNING 计划回到排队, 逐项进度与跳过原因保留
         cleanup.boot_recover_cleanup_plans(db)
         db.commit()
+        # 质量扫描重启对账: 遗留 RUNNING 扫描回到排队, RUNNING 批次复位 PENDING
+        quality.boot_recover_scans(db)
+        db.commit()
         archives.ensure_store_dir()
     finally:
         db.close()
@@ -145,6 +151,7 @@ def startup():
         replay_worker.start()
         archive_worker.start()
         cleanup_worker.start()
+        quality_worker.start()
 
 
 @app.on_event("shutdown")
@@ -153,6 +160,7 @@ def shutdown():
     replay_worker.stop()
     archive_worker.stop()
     cleanup_worker.stop()
+    quality_worker.stop()
 
 
 # ---------- 错误映射 ----------
@@ -194,8 +202,10 @@ def status(db: Session = Depends(get_db)):
                      for a in archive_rows if a.cleaned_at is None],
         "cleanup_plans": [cleanup.plan_to_dict(db, p, with_items=False)
                           for p in cleanup_rows],
+        "quality": quality.quality_status_overview(db),
         "replay_concurrency": replay.max_concurrency(),
         "archive_concurrency": archives.max_concurrency(),
+        "quality_concurrency": quality.max_concurrency(),
     }
 
 
@@ -414,6 +424,249 @@ def update_plan_window(plan_id: str, body: PlanWindowAction,
     return _run_plan(db, "window", body,
                      lambda s, p: plans.do_update_window(s, p, body.operator, windows),
                      plan_id)
+
+
+# ---------- 迁移前数据质量门禁(规则版本化 / 扫描任务 / 修复豁免 / 启动门禁) ----------
+
+def _quality_not_found(e: Exception):
+    raise HTTPException(status_code=404, detail={
+        "error": "quality_not_found", "reason": str(e)})
+
+
+def _quality_conflict(e: Exception, reasons=None):
+    raise HTTPException(status_code=409, detail={
+        "error": "quality_conflict", "reason": str(e), "reasons": reasons or []})
+
+
+def _run_quality(db: Session, action: str, body, fn, plan_id: str | None = None,
+                 scan_id: str | None = None):
+    try:
+        result, replayed = quality.run_quality_action(
+            db, action=action, operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            plan_id=plan_id, scan_id=scan_id, fn=fn)
+    except quality.QualityNotFound as e:
+        db.rollback()
+        _quality_not_found(e)
+    except quality.QualityStateError as e:
+        db.rollback()
+        _quality_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.put("/api/admin/plans/{plan_id}/quality-rules")
+@app.post("/api/admin/plans/{plan_id}/quality-rules")
+def save_quality_rules(plan_id: str, body: QualityRulesSave,
+                       db: Session = Depends(get_db)):
+    """为计划绑定/更新可版本化数据质量规则。内容摘要变化才产生新版本,
+    相同内容重复保存幂等无副作用; 规则非法时聚合返回全部原因, 不落任何数据。"""
+    rules = [r.model_dump(exclude_none=True) for r in body.rules]
+    try:
+        result, replayed = quality.run_quality_action(
+            db, action="rules.save", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            plan_id=plan_id,
+            fn=lambda s: quality.do_save_rules(
+                s, None, body.operator, plan_id, rules, body.note))
+    except quality.QualityNotFound as e:
+        db.rollback()
+        _quality_not_found(e)
+    except quality.QualityValidationError as e:
+        db.rollback()
+        _quality_conflict(e, e.reasons)
+    except quality.QualityStateError as e:
+        db.rollback()
+        _quality_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.get("/api/admin/plans/{plan_id}/quality-rules")
+def get_quality_rules(plan_id: str, db: Session = Depends(get_db)):
+    """计划的规则集: 当前版本规则 + 全部历史版本(只追加, 永不修改)。"""
+    try:
+        quality.get_plan(db, plan_id)
+        rs = quality.get_ruleset(db, plan_id)
+    except quality.QualityNotFound as e:
+        _quality_not_found(e)
+    return quality.ruleset_to_dict(db, rs)
+
+
+@app.post("/api/admin/plans/{plan_id}/quality-scans", status_code=201)
+def create_quality_scan(plan_id: str, body: QualityScanCreate,
+                        db: Session = Depends(get_db)):
+    """对计划涉及批次生成质量扫描任务并排队(基于当前规则版本)。
+    未绑定规则/计划已启动 -> 409; 已有活动扫描时重复创建幂等返回已有任务。"""
+    return _run_quality(db, "scan.create", body,
+                        lambda s: quality.do_create_scan(
+                            s, None, body.operator, plan_id),
+                        plan_id=plan_id)
+
+
+@app.get("/api/admin/plans/{plan_id}/quality-gate")
+def get_quality_gate(plan_id: str, db: Session = Depends(get_db)):
+    """质量门禁结果: 规则版本、最新扫描、过期/漂移原因、问题计数与是否放行。"""
+    try:
+        return quality.evaluate_gate(db, plan_id)
+    except quality.QualityNotFound as e:
+        _quality_not_found(e)
+
+
+@app.get("/api/admin/plans/{plan_id}/quality-overview")
+def get_plan_quality_overview(plan_id: str, db: Session = Depends(get_db)):
+    """计划质量总览: 规则版本、扫描列表(进度/问题分布)、门禁状态。"""
+    try:
+        return quality.plan_quality_view(db, plan_id)
+    except quality.QualityNotFound as e:
+        _quality_not_found(e)
+
+
+@app.get("/api/admin/plans/{plan_id}/quality-issues")
+def list_quality_issues(plan_id: str, scan_id: str | None = None,
+                        batch_id: str | None = None, severity: str | None = None,
+                        status_filter: str | None = None,
+                        rule_type: str | None = None,
+                        db: Session = Depends(get_db)):
+    """按计划查询质量问题(可按扫描/批次/严重级别/处理状态/规则类型过滤)。"""
+    if severity is not None and severity not in quality.QUALITY_SEVERITIES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_severity",
+            "reason": f"严重级别必须是 {list(quality.QUALITY_SEVERITIES)} 之一"})
+    if status_filter is not None and status_filter not in QUALITY_ISSUE_STATUSES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_issue_status",
+            "reason": f"问题状态必须是 {list(QUALITY_ISSUE_STATUSES)} 之一"})
+    if rule_type is not None and rule_type not in quality.QUALITY_RULE_TYPES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_rule_type",
+            "reason": f"规则类型必须是 {list(quality.QUALITY_RULE_TYPES)} 之一"})
+    try:
+        quality.get_plan(db, plan_id)
+    except quality.QualityNotFound as e:
+        _quality_not_found(e)
+    return quality.issues_view(
+        db, plan_id, scan_id=scan_id, batch_id=batch_id, severity=severity,
+        status=status_filter, rule_type=rule_type)
+
+
+@app.get("/api/admin/plans/{plan_id}/quality-history")
+def get_quality_history(plan_id: str, db: Session = Depends(get_db)):
+    """修复批次与豁免的全量历史(只追加, 均绑定规则版本)。"""
+    try:
+        quality.get_plan(db, plan_id)
+    except quality.QualityNotFound as e:
+        _quality_not_found(e)
+    return quality.history_view(db, plan_id)
+
+
+@app.get("/api/admin/quality-scans")
+def list_quality_scans(plan_id: str | None = None,
+                       status_filter: str | None = None,
+                       db: Session = Depends(get_db)):
+    """质量扫描任务列表(可按计划/状态过滤)。"""
+    q = db.query(QualityScan)
+    if plan_id:
+        q = q.filter(QualityScan.plan_id == plan_id)
+    if status_filter:
+        if status_filter not in QUALITY_SCAN_STATUSES:
+            raise HTTPException(status_code=422, detail={
+                "error": "invalid_scan_status",
+                "reason": f"扫描状态必须是 {list(QUALITY_SCAN_STATUSES)} 之一"})
+        q = q.filter(QualityScan.status == status_filter)
+    rows = q.order_by(QualityScan.created_at.desc(), QualityScan.id).limit(200).all()
+    return [quality.scan_to_dict(db, s, with_issues=False, with_events=False)
+            for s in rows]
+
+
+@app.get("/api/admin/quality-scans/{scan_id}")
+def get_quality_scan(scan_id: str, db: Session = Depends(get_db)):
+    """扫描详情: 批次进度、问题分布(按严重级别×状态)、过期原因与事件流水。"""
+    scan = db.get(QualityScan, scan_id)
+    if scan is None:
+        _quality_not_found(Exception(f"质量扫描任务 {scan_id} 不存在"))
+    return quality.scan_to_dict(db, scan)
+
+
+@app.get("/api/admin/quality-scans/{scan_id}/issues")
+def get_quality_scan_issues(scan_id: str, severity: str | None = None,
+                            status_filter: str | None = None,
+                            db: Session = Depends(get_db)):
+    """扫描问题明细(含可追踪样本快照)。"""
+    scan = db.get(QualityScan, scan_id)
+    if scan is None:
+        _quality_not_found(Exception(f"质量扫描任务 {scan_id} 不存在"))
+    return quality.issues_view(
+        db, scan.plan_id, scan_id=scan_id, severity=severity,
+        status=status_filter)
+
+
+@app.post("/api/admin/quality-scans/{scan_id}/pause")
+def pause_quality_scan(scan_id: str, body: QualityScanAction,
+                       db: Session = Depends(get_db)):
+    """暂停扫描: 在当前批次边界停住(已完成批次问题保留); 重复暂停幂等。"""
+    scan = db.get(QualityScan, scan_id)
+    if scan is None:
+        _quality_not_found(Exception(f"质量扫描任务 {scan_id} 不存在"))
+    return _run_quality(db, "scan.pause", body,
+                        lambda s: quality.do_pause_scan(s, scan, body.operator),
+                        plan_id=scan.plan_id, scan_id=scan_id)
+
+
+@app.post("/api/admin/quality-scans/{scan_id}/resume")
+def resume_quality_scan(scan_id: str, body: QualityScanAction,
+                        db: Session = Depends(get_db)):
+    """恢复扫描: 重新排队(再次受并发闸门约束); FAILED 可恢复, 失败批次重试。"""
+    scan = db.get(QualityScan, scan_id)
+    if scan is None:
+        _quality_not_found(Exception(f"质量扫描任务 {scan_id} 不存在"))
+    return _run_quality(db, "scan.resume", body,
+                        lambda s: quality.do_resume_scan(s, scan, body.operator),
+                        plan_id=scan.plan_id, scan_id=scan_id)
+
+
+@app.post("/api/admin/quality-scans/{scan_id}/cancel")
+def cancel_quality_scan(scan_id: str, body: QualityScanAction,
+                        db: Session = Depends(get_db)):
+    """取消扫描: 未开始批次跳过, 已完成批次问题保留; 重复取消幂等。"""
+    scan = db.get(QualityScan, scan_id)
+    if scan is None:
+        _quality_not_found(Exception(f"质量扫描任务 {scan_id} 不存在"))
+    return _run_quality(db, "scan.cancel", body,
+                        lambda s: quality.do_cancel_scan(s, scan, body.operator),
+                        plan_id=scan.plan_id, scan_id=scan_id)
+
+
+@app.post("/api/admin/plans/{plan_id}/quality-fixes", status_code=201)
+def create_quality_fix(plan_id: str, body: QualityFixCreate,
+                       db: Session = Depends(get_db)):
+    """创建修复批次: 逐项在当前数据上重跑规则核验, 违规消失才置问题 FIXED。
+    逐项给结论(RESOLVED/STILL_OPEN/NOT_FOUND/REJECTED), 修复批次只追加并绑定规则版本。"""
+    return _run_quality(db, "fix.create", body,
+                        lambda s: quality.do_create_fix(
+                            s, None, body.operator, plan_id, body.issue_ids,
+                            body.note), plan_id=plan_id)
+
+
+@app.post("/api/admin/plans/{plan_id}/quality-exemptions", status_code=201)
+def create_quality_exemption(plan_id: str, body: QualityExemptionCreate,
+                             db: Session = Depends(get_db)):
+    """为阻断问题提交带原因的豁免申请(提交即批准), 绑定规则版本; 重复豁免幂等。"""
+    return _run_quality(db, "exemption.create", body,
+                        lambda s: quality.do_create_exemption(
+                            s, None, body.operator, plan_id, body.issue_id,
+                            body.reason), plan_id=plan_id)
+
+
+@app.post("/api/admin/plans/{plan_id}/quality-exemptions/{exemption_id}/revoke")
+def revoke_quality_exemption(plan_id: str, exemption_id: str,
+                             body: QualityExemptionRevoke,
+                             db: Session = Depends(get_db)):
+    """撤销豁免(历史保留): 对应阻断问题重新打开, 门禁重新要求处理。"""
+    return _run_quality(db, "exemption.revoke", body,
+                        lambda s: quality.do_revoke_exemption(
+                            s, None, body.operator, plan_id, exemption_id,
+                            body.reason), plan_id=plan_id)
 
 
 # ---------- 迁移回放与报告(只读重放: 不改批次/计划/业务记录) ----------

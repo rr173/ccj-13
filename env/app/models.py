@@ -666,3 +666,246 @@ class ArchiveCleanupItem(Base):
     reason = Column(String(500), nullable=True)        # 人类可读跳过/失败说明
     processed_by = Column(String(128), nullable=True)
     processed_at = Column(DateTime, nullable=True)
+
+
+# ---------- 迁移前数据质量门禁 ----------
+# 规则类型: required=必填, format=格式(正则), cross_field=跨字段一致性, range=范围约束
+QUALITY_RULE_TYPES = ("required", "format", "cross_field", "range")
+# 严重级别: BLOCKER=阻断(必须修复或豁免才能通过门禁), WARNING/INFO 只提示不阻断
+QUALITY_SEVERITIES = ("BLOCKER", "WARNING", "INFO")
+# 质量扫描任务状态机(与回放任务同构):
+#   QUEUED(排队, 等待并发额度) --claim--> RUNNING --pause(批次边界)--> PAUSED --resume--> QUEUED
+#      |                                     |
+#      +--cancel--> CANCELED(终态)           +--全部批次扫描完成--> COMPLETED(终态)
+#                                            +--规则缺失/执行异常--> FAILED(终态)
+QUALITY_SCAN_STATUSES = ("QUEUED", "RUNNING", "PAUSED", "CANCELED", "COMPLETED", "FAILED")
+QUALITY_SCAN_TERMINAL_STATUSES = ("CANCELED", "COMPLETED", "FAILED")
+QUALITY_SCAN_ACTIVE_STATUSES = ("QUEUED", "RUNNING", "PAUSED")
+QUALITY_SCAN_BATCH_STATUSES = ("PENDING", "RUNNING", "SUCCESS", "FAILED", "SKIPPED")
+# 问题处理状态: OPEN=待处理; FIXED=修复批次核验已解决; EXEMPTED=已豁免(含新一轮扫描继承)
+QUALITY_ISSUE_STATUSES = ("OPEN", "FIXED", "EXEMPTED")
+# 豁免申请状态(管理员带原因提交即批准, 可撤销; 全程只追加保留历史)
+QUALITY_EXEMPTION_STATUSES = ("APPROVED", "REVOKED")
+# 修复批次逐项核验结论: RESOLVED=违规已消失; STILL_OPEN=仍违规; NOT_FOUND=记录已不存在
+QUALITY_FIX_VERDICTS = ("RESOLVED", "STILL_OPEN", "NOT_FOUND", "ALREADY_RESOLVED", "REJECTED")
+
+
+class QualityRuleSet(Base):
+    """计划级数据质量规则集: 一个迁移计划至多一个规则集, 规则整体版本化。
+
+    每次修改规则(内容摘要变化)新增一个 QualityRuleVersion, 旧版本永不修改;
+    扫描任务与问题/修复/豁免都绑定生成时的规则版本, 规则版本变化后旧扫描
+    结果不能放行, 必须基于新版本重新扫描。"""
+
+    __tablename__ = "quality_rule_sets"
+
+    id = Column(String(32), primary_key=True)          # "QRS" + 随机串
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"),
+                     nullable=False, unique=True, index=True)
+    current_version = Column(Integer, nullable=False, default=1)
+    created_by = Column(String(128), nullable=False)
+    updated_by = Column(String(128), nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    versions = relationship("QualityRuleVersion", cascade="all, delete-orphan",
+                            order_by="QualityRuleVersion.version")
+
+
+class QualityRuleVersion(Base):
+    """规则的一个不可变版本: rules 为规范化后的规则定义列表(JSON),
+    content_digest 是规则内容的确定性摘要(相同内容重复保存不产生新版本)。"""
+
+    __tablename__ = "quality_rule_versions"
+    __table_args__ = (
+        UniqueConstraint("ruleset_id", "version", name="uq_quality_rule_version"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ruleset_id = Column(String(32), ForeignKey("quality_rule_sets.id"),
+                        nullable=False, index=True)
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"),
+                     nullable=False, index=True)
+    version = Column(Integer, nullable=False)
+    rules = Column(JSON, nullable=False, default=list)
+    rule_count = Column(Integer, nullable=False, default=0)
+    content_digest = Column(String(64), nullable=False, index=True)
+    note = Column(String(500), nullable=True)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class QualityScan(Base):
+    """质量扫描任务: 对计划涉及的批次逐个扫描旧结构数据, 按批次记录问题明细、
+    严重级别与可追踪样本(记录快照)。
+
+    任务排队/执行/暂停/恢复/取消/失败, 支持并发闸门; 结果与规则版本
+    (rule_version + content_digest)、批次数据指纹(data_fingerprint)和
+    过期时间(expires_at)绑定: 规则版本变化、批次数据变化或结果过期时,
+    门禁判定为 STALE, 旧结果不能放行。"""
+
+    __tablename__ = "quality_scans"
+
+    id = Column(String(32), primary_key=True)          # "QS" + 随机串
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"),
+                     nullable=False, index=True)
+    # 刻意不加 FK 到规则集/版本: 防御性地允许规则缺失被观测为明确失败
+    ruleset_id = Column(String(32), nullable=False)
+    rule_version = Column(Integer, nullable=False)
+    rule_digest = Column(String(64), nullable=False)
+    rules_snapshot = Column(JSON, nullable=False, default=list)  # 自包含规则快照(修复核验用)
+    status = Column(String(16), nullable=False, default="QUEUED", index=True)
+    total_batches = Column(Integer, nullable=False, default=0)
+    completed_batches = Column(Integer, nullable=False, default=0)
+    total_records = Column(Integer, nullable=False, default=0)
+    total_issues = Column(Integer, nullable=False, default=0)
+    blocker_issues = Column(Integer, nullable=False, default=0)
+    warning_issues = Column(Integer, nullable=False, default=0)
+    info_issues = Column(Integer, nullable=False, default=0)
+    open_blocker_issues = Column(Integer, nullable=False, default=0)
+    current_batch_id = Column(String(32), nullable=True)
+    ttl_seconds = Column(Integer, nullable=False, default=86400)
+    expires_at = Column(DateTime, nullable=True)       # COMPLETED 时按 finished_at + ttl 计算
+    last_error = Column(String(500), nullable=True)
+    failure_code = Column(String(48), nullable=True)
+    failure_reason = Column(String(500), nullable=True)
+    created_by = Column(String(128), nullable=False)
+    updated_by = Column(String(128), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    batches = relationship("QualityScanBatch", cascade="all, delete-orphan",
+                           order_by="QualityScanBatch.seq")
+    issues = relationship("QualityIssue", cascade="all, delete-orphan")
+    # scan_id 刻意不加 FK(质量事件也存在于无扫描上下文, 如规则版本创建),
+    # 用显式 join 条件表达一对多关系
+    events = relationship(
+        "QualityEvent",
+        primaryjoin="QualityScan.id == foreign(QualityEvent.scan_id)",
+        cascade="all, delete-orphan",
+        order_by="desc(QualityEvent.id)")
+
+
+class QualityScanBatch(Base):
+    """扫描任务内单批次的扫描结果: 记录数、问题计数与批次数据指纹
+    (扫描完成时范围内旧表全量内容的摘要, 门禁据此判定批次数据是否变化)。"""
+
+    __tablename__ = "quality_scan_batches"
+    __table_args__ = (
+        UniqueConstraint("scan_id", "batch_id", name="uq_quality_scan_batch"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    scan_id = Column(String(32), ForeignKey("quality_scans.id"),
+                     nullable=False, index=True)
+    batch_id = Column(String(32), nullable=False, index=True)
+    seq = Column(Integer, nullable=False)
+    biz = Column(String(128), nullable=True)
+    status = Column(String(16), nullable=False, default="PENDING")
+    record_count = Column(Integer, nullable=False, default=0)
+    issue_count = Column(Integer, nullable=False, default=0)
+    blocker_count = Column(Integer, nullable=False, default=0)
+    data_fingerprint = Column(String(64), nullable=True)
+    last_error = Column(String(500), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+
+
+class QualityIssue(Base):
+    """质量问题明细(按批次 + 记录 + 规则): 严重级别、问题说明与可追踪样本
+    (命中时的完整记录快照)。问题处理状态(FIXED/EXEMPTED)与处理历史绑定,
+    修复/豁免都记录产生时的规则版本。(scan, batch, rule, record, field) 唯一。"""
+
+    __tablename__ = "quality_issues"
+    __table_args__ = (
+        UniqueConstraint("scan_id", "batch_id", "rule_id", "record_id", "field",
+                         name="uq_quality_issue"),
+    )
+
+    id = Column(String(32), primary_key=True)          # "QI" + 随机串
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"),
+                     nullable=False, index=True)
+    scan_id = Column(String(32), ForeignKey("quality_scans.id"),
+                     nullable=False, index=True)
+    batch_id = Column(String(32), nullable=False, index=True)
+    record_id = Column(Integer, nullable=False, index=True)
+    rule_version = Column(Integer, nullable=False)
+    rule_id = Column(String(64), nullable=False)
+    rule_name = Column(String(200), nullable=False)
+    rule_type = Column(String(16), nullable=False)
+    severity = Column(String(16), nullable=False, index=True)
+    field = Column(String(128), nullable=True)
+    message = Column(String(500), nullable=False)
+    sample = Column(JSON, nullable=True)               # 命中记录快照(可追踪样本)
+    status = Column(String(16), nullable=False, default="OPEN", index=True)
+    resolution_type = Column(String(16), nullable=True)   # fix | exemption
+    resolution_id = Column(String(32), nullable=True)     # 修复批次/豁免 id
+    resolved_by = Column(String(128), nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class QualityFixBatch(Base):
+    """修复批次: 管理员针对扫描问题发起的修复核验批次, 逐项重新执行规则核验
+    当前数据(违规消失->RESOLVED 并置问题 FIXED; 仍违规->STILL_OPEN; 记录已删除
+    ->NOT_FOUND)。修复批次只追加, 与扫描时规则版本绑定, 是修复历史的来源。"""
+
+    __tablename__ = "quality_fix_batches"
+
+    id = Column(String(32), primary_key=True)          # "QF" + 随机串
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"),
+                     nullable=False, index=True)
+    scan_id = Column(String(32), nullable=False, index=True)
+    rule_version = Column(Integer, nullable=False)
+    operator = Column(String(128), nullable=False)
+    note = Column(String(500), nullable=True)
+    total = Column(Integer, nullable=False, default=0)
+    resolved = Column(Integer, nullable=False, default=0)
+    still_open = Column(Integer, nullable=False, default=0)
+    not_found = Column(Integer, nullable=False, default=0)
+    rejected = Column(Integer, nullable=False, default=0)
+    results = Column(JSON, nullable=False, default=list)   # 逐项核验结果
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class QualityExemption(Base):
+    """豁免申请(带原因, 提交即批准; 可撤销): 针对单个阻断问题, 绑定规则版本。
+    只追加: 撤销不改写原行而是置 REVOKED; 新一轮同版本扫描可继承有效豁免。"""
+
+    __tablename__ = "quality_exemptions"
+
+    id = Column(String(32), primary_key=True)          # "QE" + 随机串
+    plan_id = Column(String(32), ForeignKey("migration_plans.id"),
+                     nullable=False, index=True)
+    issue_id = Column(String(32), nullable=False, index=True)
+    scan_id = Column(String(32), nullable=False, index=True)
+    batch_id = Column(String(32), nullable=False)
+    rule_id = Column(String(64), nullable=False)
+    record_id = Column(Integer, nullable=False)
+    field = Column(String(128), nullable=True)         # 命中字段(新扫描继承豁免时匹配)
+    rule_version = Column(Integer, nullable=False)
+    reason = Column(String(500), nullable=False)
+    status = Column(String(16), nullable=False, default="APPROVED", index=True)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow)
+    revoked_by = Column(String(128), nullable=True)
+    revoked_at = Column(DateTime, nullable=True)
+    revoke_reason = Column(String(500), nullable=True)
+
+
+class QualityEvent(Base):
+    """质量门禁事件流水(只追加): 规则版本创建、扫描创建/排队/认领/暂停/恢复/
+    取消/完成/失败/重启对账、修复批次、豁免提交/撤销。质量模块不写业务审计表。"""
+
+    __tablename__ = "quality_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=_utcnow)
+    plan_id = Column(String(32), nullable=False, index=True)
+    scan_id = Column(String(32), nullable=True, index=True)
+    event = Column(String(48), nullable=False)
+    operator = Column(String(128), nullable=False)
+    reason = Column(String(500), nullable=True)
+    detail = Column(JSON, nullable=True)

@@ -30,6 +30,13 @@
   .RV_UNREVIEWED { background: #9e9e9e; } .RV_REVIEWING { background: #1565c0; }
   .RV_PENDING { background: #c62828; } .RV_CONFIRMED { background: #2e7d32; }
   .VD_PASS { background: #2e7d32; } .VD_FAIL { background: #c62828; }
+  .QG_PASS { background: #2e7d32; } .QG_NOT_CONFIGURED { background: #78909c; }
+  .QG_BLOCKED, .QG_STALE, .QG_CANCELED, .QG_FAILED { background: #c62828; }
+  .QG_NOT_SCANNED, .QG_RUNNING, .QG_QUEUED, .QG_PAUSED { background: #ef6c00; }
+  .SEV_BLOCKER { background: #c62828; } .SEV_WARNING { background: #ef6c00; }
+  .SEV_INFO { background: #1565c0; }
+  .ST_OPEN { background: #c62828; } .ST_FIXED { background: #2e7d32; }
+  .ST_EXEMPTED { background: #6a1b9a; }
   .tag { display: inline-block; background: #eceff1; border: 1px solid #b0bec5;
          color: #37474f; border-radius: 10px; padding: 1px 8px; font-size: 11px;
          margin: 1px 2px 1px 0; }
@@ -111,6 +118,60 @@
   </div>
   <div id="planMsg" class="msg"></div>
   <div id="plans" style="margin-top:12px"></div>
+</div>
+
+<div class="card">
+  <b>迁移前数据质量门禁</b>（为计划绑定可版本化规则: 必填 / 格式 / 跨字段一致性 / 范围;
+  对计划涉及批次生成质量扫描; 只有全部阻断级问题被修复或豁免、且扫描结果未过期/未漂移, 计划才允许启动）
+  <div style="margin:8px 0">
+    计划 <select id="qgPlan" style="max-width:360px" onchange="qgOnPlanChange()"></select>
+    <span class="muted">并发上限: 同时执行中的质量扫描不超过 <b id="qgConcurrency">-</b> 个</span>
+  </div>
+  <div id="qgGate" style="margin:6px 0"></div>
+  <b>规则版本</b> <button class="plain" onclick="qgLoadRules()">载入当前规则</button>
+  <button onclick="qgAddRuleRow()">+ 规则行</button>
+  <span class="muted">保存时内容变化才产生新版本; 规则版本变化后旧扫描结果不放行</span>
+  <table style="margin-top:4px">
+    <thead><tr><th>规则 id</th><th>名称</th><th>类型</th><th>字段</th><th>严重级别</th>
+      <th>参数(JSON)</th><th></th></tr></thead>
+    <tbody id="qgRuleRows"></tbody>
+  </table>
+  版本说明 <input id="qgNote" size="24" placeholder="可选">
+  <button onclick="qgSaveRules()">保存规则(新版本)</button>
+  <div id="qgMsg" class="msg"></div>
+  <div id="qgVersions" class="muted" style="margin:4px 0"></div>
+
+  <div style="margin:10px 0">
+    <button onclick="qgCreateScan()">对计划涉及批次发起质量扫描</button>
+    <button class="plain" onclick="qgLoadOverview()">刷新质量总览</button>
+    <span class="muted">扫描按批次记录问题明细、严重级别与命中样本; 重复发起活动扫描幂等</span>
+  </div>
+  <div id="qgScans"></div>
+  <b style="display:block;margin:10px 0 4px">质量问题(按计划查询)</b>
+  <div>
+    严重级别
+    <select id="qgFsev">
+      <option value="">全部</option><option value="BLOCKER">BLOCKER 阻断</option>
+      <option value="WARNING">WARNING</option><option value="INFO">INFO</option>
+    </select>
+    处理状态
+    <select id="qgFstatus">
+      <option value="">全部</option><option value="OPEN">OPEN 待处理</option>
+      <option value="FIXED">FIXED 已修复</option><option value="EXEMPTED">EXEMPTED 已豁免</option>
+    </select>
+    <button class="plain" onclick="qgLoadIssues()">查询问题</button>
+  </div>
+  <table style="margin-top:4px">
+    <thead><tr><th></th><th>批次</th><th>记录</th><th>规则</th><th>类型</th><th>严重级别</th>
+      <th>字段</th><th>问题说明</th><th>样本</th><th>状态</th><th>操作</th></tr></thead>
+    <tbody id="qgIssues"><tr><td colspan="11" class="muted">选择计划后点击"查询问题"</td></tr></tbody>
+  </table>
+  <div style="margin:8px 0">
+    <button onclick="qgFixSelected()">创建修复批次(核验勾选项)</button>
+    说明 <input id="qgFixNote" size="18" placeholder="可选, 绑定规则版本">
+    <span class="muted">逐项在当前数据上重跑规则: 违规消失才置 FIXED, 数据变化后需重新扫描</span>
+  </div>
+  <div id="qgHistory" style="margin-top:10px"></div>
 </div>
 
 <div class="card">
@@ -327,6 +388,7 @@ async function refresh() {
   renderReviewQueue();
   renderArchiveControls(s);
   renderArchives(s.archives || []);
+  renderQuality(s);
   const rows = await (await fetch('/api/admin/audit?limit=50')).json();
   document.getElementById('audit').innerHTML = rows.map(r =>
     `<tr><td>${r.ts||''}</td><td>${r.batch_id||r.plan_id||''}</td><td>${r.operator}</td><td>${r.action}</td>
@@ -437,7 +499,301 @@ async function createPlan() {
       || ((j.detail && j.detail.reason) || JSON.stringify(j))));
   }
   document.getElementById('idem').value = '';
-  refresh();
+  // ---------- 迁移前数据质量门禁 ----------
+
+let lastStatus = null;
+let qgOverview = null;
+let qgIssues = [];
+const QG_FIELDS = ['name','email','tags_csv','tags','id'];
+const QG_TYPES = ['required','format','cross_field','range'];
+const RULE_PARAM_HINTS = {
+  required: '{"allow_blank": false}',
+  format: '{"pattern": "[^@]+@[^@]+\\\\.[^@]+"}',
+  cross_field: '{"other_field":"name","op":"ne"}',
+  range: '{"min":1,"max":1000000} 或 {"min_length":1,"max_length":20}',
+};
+
+function qgStatusText(s) {
+  return { PASS: '通过', NOT_CONFIGURED: '未配置规则', NOT_SCANNED: '未扫描',
+           RUNNING: '扫描中', QUEUED: '排队中', PAUSED: '已暂停',
+           BLOCKED: '阻断问题未处理', STALE: '结果已失效',
+           FAILED: '扫描失败', CANCELED: '已取消' }[s] || s;
+}
+
+function showQgMsg(ok, text) {
+  const el = document.getElementById('qgMsg');
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+}
+
+function qgSelectedPlan() { return document.getElementById('qgPlan').value; }
+
+async function qgOnPlanChange() {
+  await qgLoadRules();
+  qgLoadOverview();
+}
+
+function renderQuality(s) {
+  lastStatus = s;
+  document.getElementById('qgConcurrency').textContent = s.quality ? s.quality.concurrency : '-';
+  const prev = document.getElementById('qgPlan').value;
+  document.getElementById('qgPlan').innerHTML = (s.plans || []).map(p =>
+    `<option value="${p.id}" ${p.id===prev?'selected':''}>${p.id} · ${escapeHtml(p.name)} · ${p.status}</option>`
+  ).join('');
+  const pid = qgSelectedPlan();
+  if (pid) renderQgGate(s.quality.gates[pid]);
+}
+
+function renderQgGate(gate) {
+  if (!gate) { document.getElementById('qgGate').innerHTML = ''; return; }
+  const c = gate.issue_counts || {};
+  document.getElementById('qgGate').innerHTML = `
+    <span class="badge QG_${gate.status}">${qgStatusText(gate.status)}</span>
+    <span class="muted">规则 v${gate.current_rule_version ?? '-'} · 最新扫描 ${gate.latest_scan_id || '无'}
+      (${gate.latest_scan_status || '-'})${gate.expires_at ? ' · 有效期至 ' + gate.expires_at : ''}</span>
+    ${c.total != null ? `<span class="muted" style="margin-left:8px">问题 ${c.total}:
+      <b class="err">阻断 ${c.blocker}(待处理 ${c.open_blocker})</b> / 警告 ${c.warning} / 提示 ${c.info}
+      · 修复 ${c.fixed} · 豁免 ${c.exempted}</span>` : ''}
+    ${gate.reasons && gate.reasons.length ? '<div class="err">' + gate.reasons.slice(0,5).map(escapeHtml).join('<br>') + '</div>' : ''}`;
+}
+
+function qgAddRuleRow(rule) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td><input class="qr-id" value="${rule?escapeHtml(rule.id):''}" size="12" placeholder="rule_id"></td>
+    <td><input class="qr-name" value="${rule?escapeHtml(rule.name||''):''}" size="12"></td>
+    <td><select class="qr-type">${QG_TYPES.map(t =>
+      `<option ${rule&&rule.type===t?'selected':''}>${t}</option>`).join('')}</select></td>
+    <td><select class="qr-field">${QG_FIELDS.map(f =>
+      `<option ${rule&&rule.field===f?'selected':''}>${f}</option>`).join('')}</select></td>
+    <td><select class="qr-sev">${['BLOCKER','WARNING','INFO'].map(s =>
+      `<option ${rule&&rule.severity===s?'selected':''}>${s}</option>`).join('')}</select></td>
+    <td><input class="qr-params" value="${rule?escapeHtml(JSON.stringify(qgRuleParams(rule))):''}" size="34"
+       placeholder='{"pattern":"..."}'></td>
+    <td><button class="danger" onclick="this.closest('tr').remove()">删</button></td>`;
+  tr.querySelector('.qr-type').onchange = e => {
+    const hintInput = tr.querySelector('.qr-params');
+    if (!hintInput.value) hintInput.value = RULE_PARAM_HINTS[e.target.value] || '';
+  };
+  document.getElementById('qgRuleRows').appendChild(tr);
+}
+
+function qgRuleParams(rule) {
+  const keys = ['pattern','op','other_field','value','min','max','min_length','max_length','allow_blank'];
+  const p = {};
+  for (const k of keys) if (rule[k] !== undefined && rule[k] !== null) p[k] = rule[k];
+  return p;
+}
+
+async function qgLoadRules() {
+  const pid = qgSelectedPlan();
+  if (!pid) return;
+  const r = await fetch(`/api/admin/plans/${pid}/quality-rules`);
+  document.getElementById('qgRuleRows').innerHTML = '';
+  if (r.status === 404) {
+    qgAddRuleRow({ id: 'email_format', name: '邮箱格式', type: 'format', field: 'email',
+                   severity: 'BLOCKER', params: { pattern: '[^@\\s]+@[^@\\s]+\\.[^@\\s]+' } });
+    document.getElementById('qgVersions').textContent = '该计划尚未绑定规则集(保存后创建 v1)';
+    return;
+  }
+  const j = await r.json();
+  (j.current_rules || []).forEach(qgAddRuleRow);
+  document.getElementById('qgVersions').innerHTML = '历史版本: ' + (j.versions || []).map(v =>
+    `<span class="tag">v${v.version} · ${v.rule_count} 条 · ${escapeHtml(v.created_by)}</span>`).join('');
+}
+
+async function qgSaveRules() {
+  const pid = qgSelectedPlan();
+  const rules = [];
+  for (const tr of document.querySelectorAll('#qgRuleRows tr')) {
+    let params = {};
+    const raw = tr.querySelector('.qr-params').value.trim();
+    if (raw) { try { params = JSON.parse(raw); } catch { showQgMsg(false, '参数必须是合法 JSON: ' + raw); return; } }
+    rules.push({ id: tr.querySelector('.qr-id').value.trim(),
+                 name: tr.querySelector('.qr-name').value.trim(),
+                 type: tr.querySelector('.qr-type').value,
+                 field: tr.querySelector('.qr-field').value,
+                 severity: tr.querySelector('.qr-sev').value, params });
+  }
+  const note = document.getElementById('qgNote').value.trim() || null;
+  const { status, j } = await post(`/api/admin/plans/${pid}/quality-rules`,
+    { operator: operator(), idempotency_key: idemKey(), plan_id: pid, rules, note });
+  if (status === 200) {
+    showQgMsg(true, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+    document.getElementById('qgNote').value = '';
+  } else {
+    const reasons = (j.detail && j.detail.reasons) || [];
+    showQgMsg(false, '规则校验失败:\n - ' + (reasons.join('\n - ')
+      || ((j.detail && j.detail.reason) || JSON.stringify(j))));
+  }
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadRules();
+}
+
+async function qgCreateScan() {
+  const pid = qgSelectedPlan();
+  const { status, j } = await post(`/api/admin/plans/${pid}/quality-scans`,
+    { operator: operator(), idempotency_key: idemKey(), plan_id: pid });
+  if (status === 201) {
+    showQgMsg(j.ok, (j.replayed ? '[幂等重放] ' : '')
+      + (j.already_active ? `已有 ${j.status} 扫描, 幂等返回` : j.detail));
+  } else showQgMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadOverview();
+}
+
+async function qgScanAct(sid, name) {
+  const { status, j } = await post(`/api/admin/quality-scans/${sid}/${name}`,
+    { operator: operator(), idempotency_key: idemKey() });
+  if (status === 200) showQgMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showQgMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadOverview();
+}
+
+async function qgLoadOverview() {
+  const pid = qgSelectedPlan();
+  qgOverview = await (await fetch(`/api/admin/plans/${pid}/quality-overview`)).json();
+  renderQgGate(qgOverview.gate);
+  document.getElementById('qgScans').innerHTML = (qgOverview.scans || []).map(s => {
+    const pct = s.progress.total ? Math.round(100 * s.progress.done / s.progress.total) : 0;
+    const d = s.issue_distribution || {};
+    const bl = d.BLOCKER || {};
+    const active = ['QUEUED','RUNNING','PAUSED','FAILED'].includes(s.status);
+    return `<div style="border-top:1px dashed #ddd;padding:6px 0">
+      <span class="badge ${s.status}">${s.status}</span>
+      <b>${s.id}</b> <span class="muted">规则 v${s.rule_version} · ${s.progress.done}/${s.progress.total} 批次
+        · ${s.total_records} 条记录 · ${s.total_issues} 问题
+        (阻断 ${bl.total||0}: 待处理 ${bl.OPEN||0}/修复 ${bl.FIXED||0}/豁免 ${bl.EXEMPTED||0})
+        ${s.expires_at ? ' · 有效期至 ' + s.expires_at : ''}</span>
+      ${s.failure_reason ? `<div class="err">${escapeHtml(s.failure_reason)}</div>` : ''}
+      ${(s.stale && s.stale.length) ? `<div class="err">结果失效: ${s.stale.slice(0,3).map(escapeHtml).join('; ')}</div>` : ''}
+      <div class="bar" style="width:240px;display:inline-block;vertical-align:middle">
+        <div style="width:${pct}%;background:#00838f"></div></div>
+      <button class="plain" ${['QUEUED','RUNNING'].includes(s.status)?'':'disabled'} onclick="qgScanAct('${s.id}','pause')">暂停</button>
+      <button ${['PAUSED','FAILED'].includes(s.status)?'':'disabled'} onclick="qgScanAct('${s.id}','resume')">恢复</button>
+      <button class="danger" ${['QUEUED','RUNNING','PAUSED'].includes(s.status)?'':'disabled'} onclick="qgScanAct('${s.id}','cancel')">取消</button>
+      <button class="plain" onclick="qgViewScan('${s.id}')">批次/事件</button>
+      <div id="qgsd-${s.id}"></div>
+    </div>`;
+  }).join('') || '<span class="muted">尚无扫描任务</span>';
+  qgLoadHistory();
+  qgLoadIssues();
+}
+
+async function qgViewScan(sid) {
+  const box = document.getElementById('qgsd-' + sid);
+  if (box.dataset.open) { box.innerHTML = ''; box.dataset.open = ''; return; }
+  const j = await (await fetch(`/api/admin/quality-scans/${sid}`)).json();
+  const batches = (j.batches || []).map(b =>
+    `<tr><td>${b.seq}</td><td>${b.batch_id}</td><td>${escapeHtml(b.biz||'')}</td>
+      <td><span class="badge ${b.status}">${b.status}</span></td><td>${b.record_count}</td>
+      <td>${b.issue_count} (阻断 ${b.blocker_count})</td>
+      <td><code style="font-size:10px">${(b.data_fingerprint||'').slice(0,12)}</code></td>
+      <td class="err">${escapeHtml(b.last_error||'')}</td></tr>`).join('');
+  const events = (j.events || []).slice(0, 12).map(e =>
+    `<div class="muted">[${(e.ts||'').slice(11,19)}] ${e.event} · ${escapeHtml(e.operator)}
+      ${e.reason ? ' · ' + escapeHtml(e.reason) : ''}</div>`).join('');
+  box.innerHTML = `<table style="margin-top:4px"><thead><tr><th>seq</th><th>批次</th><th>业务组</th>
+    <th>状态</th><th>记录数</th><th>问题</th><th>数据指纹</th><th>错误</th></tr></thead>
+    <tbody>${batches}</tbody></table><div style="margin-top:4px">${events}</div>`;
+  box.dataset.open = '1';
+}
+
+async function qgLoadIssues() {
+  const pid = qgSelectedPlan();
+  const p = new URLSearchParams();
+  const sev = document.getElementById('qgFsev').value;
+  const st = document.getElementById('qgFstatus').value;
+  if (sev) p.set('severity', sev);
+  if (st) p.set('status_filter', st);
+  qgIssues = await (await fetch(`/api/admin/plans/${pid}/quality-issues?` + p.toString())).json();
+  document.getElementById('qgIssues').innerHTML = qgIssues.map(i => `
+    <tr>
+      <td><input type="checkbox" class="qg-sel" value="${i.id}" ${i.status==='OPEN'?'':'disabled'}></td>
+      <td>${i.batch_id}</td><td>${i.record_id}</td>
+      <td>${escapeHtml(i.rule_id)}<div class="muted">v${i.rule_version} ${escapeHtml(i.rule_name||'')}</div></td>
+      <td>${i.rule_type}</td>
+      <td><span class="badge SEV_${i.severity}">${i.severity}</span></td>
+      <td>${i.field || '-'}</td>
+      <td>${escapeHtml(i.message)}</td>
+      <td><code class="muted" style="font-size:10px">${escapeHtml(JSON.stringify(i.sample))}</code></td>
+      <td><span class="badge ST_${i.status}">${i.status}</span>
+        <div class="muted">${i.resolved_by ? escapeHtml(i.resolved_by) : ''}</div></td>
+      <td>${i.status === 'OPEN' && i.severity === 'BLOCKER'
+        ? `<button onclick="qgExempt('${i.id}')">豁免</button>` : ''}</td>
+    </tr>`).join('') || '<tr><td colspan="11" class="muted">无匹配问题</td></tr>';
+}
+
+function qgSelectedIssues() {
+  return Array.from(document.querySelectorAll('.qg-sel:checked')).map(c => c.value);
+}
+
+async function qgFixSelected() {
+  const pid = qgSelectedPlan();
+  const ids = qgSelectedIssues();
+  if (!ids.length) { showQgMsg(false, '请先勾选要修复核验的 OPEN 问题'); return; }
+  const note = document.getElementById('qgFixNote').value.trim() || null;
+  const { status, j } = await post(`/api/admin/plans/${pid}/quality-fixes`,
+    { operator: operator(), idempotency_key: idemKey(), plan_id: pid, issue_ids: ids, note });
+  if (status === 201) {
+    const pr = j.progress;
+    showQgMsg(pr.still_open || pr.rejected || pr.not_found,
+      `修复批次 ${j.fix_batch_id}: 共 ${pr.total}, 解决 ${pr.resolved}, 仍违规 ${pr.still_open}, `
+      + `记录缺失 ${pr.not_found}, 拒绝 ${pr.rejected}; 数据变化后需重新扫描`);
+  } else showQgMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadOverview();
+}
+
+async function qgExempt(issueId) {
+  const pid = qgSelectedPlan();
+  const reason = prompt('豁免原因(必填, 将与规则版本一起保留历史):');
+  if (!reason) return;
+  const { status, j } = await post(`/api/admin/plans/${pid}/quality-exemptions`,
+    { operator: operator(), idempotency_key: idemKey(), plan_id: pid,
+      issue_id: issueId, reason });
+  if (status === 201) showQgMsg(true, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showQgMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadOverview();
+}
+
+async function qgLoadHistory() {
+  const pid = qgSelectedPlan();
+  const h = await (await fetch(`/api/admin/plans/${pid}/quality-history`)).json();
+  const fixes = (h.fix_batches || []).slice(0, 10).map(f => `
+    <tr><td>${f.id}</td><td>${f.scan_id}</td><td>v${f.rule_version}</td><td>${escapeHtml(f.operator)}</td>
+      <td>${f.resolved}/${f.total} 解决 · ${f.still_open} 仍违规 · ${f.not_found} 缺失 · ${f.rejected} 拒绝</td>
+      <td class="muted">${f.created_at||''}</td></tr>`).join('');
+  const exs = (h.exemptions || []).slice(0, 20).map(e => `
+    <tr><td>${e.id}</td><td>${e.record_id} / ${escapeHtml(e.rule_id)}</td><td>v${e.rule_version}</td>
+      <td><span class="badge ${e.status==='APPROVED'?'ST_EXEMPTED':'CANCELED'}">${e.status}</span></td>
+      <td>${escapeHtml(e.reason)}</td><td>${escapeHtml(e.created_by)}<div class="muted">${e.created_at||''}</div></td>
+      <td>${e.status==='APPROVED' ? `<button class="danger" onclick="qgRevokeExemption('${e.id}')">撤销</button>`
+        : `<span class="muted">${escapeHtml(e.revoked_by||'')}: ${escapeHtml(e.revoke_reason||'')}</span>`}</td>
+    </tr>`).join('');
+  document.getElementById('qgHistory').innerHTML = `
+    <b>修复批次历史</b>
+    <table><thead><tr><th>批次</th><th>扫描</th><th>规则版本</th><th>操作者</th><th>结果</th><th>时间</th></tr></thead>
+      <tbody>${fixes || '<tr><td colspan="6" class="muted">尚无修复批次</td></tr>'}</tbody></table>
+    <b style="display:block;margin-top:6px">豁免历史</b>
+    <table><thead><tr><th>豁免</th><th>记录/规则</th><th>版本</th><th>状态</th><th>原因</th><th>申请人/时间</th><th></th></tr></thead>
+      <tbody>${exs || '<tr><td colspan="7" class="muted">尚无豁免</td></tr>'}</tbody></table>`;
+}
+
+async function qgRevokeExemption(exId) {
+  const pid = qgSelectedPlan();
+  const reason = prompt('撤销豁免原因(必填, 阻断问题将重新打开):');
+  if (!reason) return;
+  const { status, j } = await post(`/api/admin/plans/${pid}/quality-exemptions/${exId}/revoke`,
+    { operator: operator(), idempotency_key: idemKey(), plan_id: pid, reason });
+  if (status === 200) showQgMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showQgMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadOverview();
+}
+
+refresh();
 }
 
 async function planAct(pid, name) {
@@ -495,10 +851,14 @@ async function savePlanWindow(pid) {
 }
 
 function renderPlans(plans) {
+  const qg = (lastStatus && lastStatus.quality && lastStatus.quality.gates) || {};
   document.getElementById('plans').innerHTML = plans.map(p => {
     const pct = p.progress.total ? Math.round(100 * p.progress.done / p.progress.total) : 0;
+    const gate = qg[p.id];
+    const gateBlocks = gate && !gate.passed;
     const canStart = p.status === 'DRAFT'
-      && (p.risk_level === 'LOW' || p.approval_status === 'APPROVED');
+      && (p.risk_level === 'LOW' || p.approval_status === 'APPROVED')
+      && !gateBlocks;
     const canPause = p.status === 'RUNNING';
     const canResume = ['PAUSED','HALTED'].includes(p.status);
     const canCancel = ['DRAFT','RUNNING','PAUSED','HALTED'].includes(p.status);
@@ -555,11 +915,16 @@ function renderPlans(plans) {
       <span class="badge ${p.risk_level}">${p.risk_level === 'HIGH' ? '高风险' : '低风险'}</span>
       <b>${escapeHtml(p.name)}</b> <span class="muted">${p.id}</span>
       <span style="margin-left:12px">
-        <button ${canStart?'':'disabled'} title="${p.status === 'DRAFT' && p.risk_level === 'HIGH' && p.approval_status !== 'APPROVED' ? '高风险计划须先由另一名管理员审批通过' : ''}" onclick="planAct('${p.id}','start')">启动</button>
+        <button ${canStart?'':'disabled'} title="${gateBlocks ? ('质量门禁未通过('+gate.status+'): '+(gate.reasons||[]).join('; ')) : (p.status === 'DRAFT' && p.risk_level === 'HIGH' && p.approval_status !== 'APPROVED' ? '高风险计划须先由另一名管理员审批通过' : '')}" onclick="planAct('${p.id}','start')">启动</button>
         <button class="plain" ${canPause?'':'disabled'} onclick="planAct('${p.id}','pause')">暂停</button>
         <button ${canResume?'':'disabled'} onclick="planAct('${p.id}','resume')">恢复</button>
         <button class="danger" ${canCancel?'':'disabled'} onclick="planAct('${p.id}','cancel')">取消</button>
       </span>
+      ${gate ? `<div style="margin:4px 0">质量门禁:
+        <span class="badge QG_${gate.status}" title="${(gate.reasons||[]).join('&#10;')}">${qgStatusText(gate.status)}</span>
+        <button class="plain" onclick="document.getElementById('qgPlan').value='${p.id}';qgLoadOverview();qgLoadRules();">查看质量</button>
+        ${gate.reasons && gate.reasons.length ? `<div class="err">${gate.reasons.slice(0,3).map(escapeHtml).join('<br>')}</div>` : ''}
+      </div>` : ''}
       ${approvalLine}
       ${winEditor}
       <div style="margin:6px 0">
@@ -1442,7 +1807,298 @@ async function toggleCleanupDetail(pid, btn) {
   btn.textContent = '收起';
 }
 
-refresh();
+// ---------- 迁移前数据质量门禁 ----------
+
+let lastStatus = null;
+let qgIssues = [];
+const QG_FIELDS = ['name','email','tags_csv','tags','id'];
+const QG_TYPES = ['required','format','cross_field','range'];
+const RULE_PARAM_HINTS = {
+  required: '{"allow_blank": false}',
+  format: '{"pattern": "[^@]+@[^@]+\\\\.[^@]+"}',
+  cross_field: '{"other_field":"name","op":"ne"}',
+  range: '{"min":1,"max":1000000} 或 {"min_length":1,"max_length":20}',
+};
+
+function qgStatusText(s) {
+  return { PASS: '通过', NOT_CONFIGURED: '未配置规则', NOT_SCANNED: '未扫描',
+           RUNNING: '扫描中', QUEUED: '排队中', PAUSED: '已暂停',
+           BLOCKED: '阻断问题未处理', STALE: '结果已失效',
+           FAILED: '扫描失败', CANCELED: '已取消' }[s] || s;
+}
+
+function showQgMsg(ok, text) {
+  const el = document.getElementById('qgMsg');
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+}
+
+function qgSelectedPlan() { return document.getElementById('qgPlan').value; }
+
+function renderQuality(s) {
+  lastStatus = s;
+  document.getElementById('qgConcurrency').textContent = s.quality ? s.quality.concurrency : '-';
+  const sel = document.getElementById('qgPlan');
+  const prev = sel.value;
+  sel.innerHTML = (s.plans || []).map(p =>
+    `<option value="${p.id}" ${p.id===prev?'selected':''}>${p.id} · ${escapeHtml(p.name)} · ${p.status}</option>`
+  ).join('');
+  const pid = qgSelectedPlan();
+  if (pid && s.quality && s.quality.gates) renderQgGate(s.quality.gates[pid]);
+}
+
+function renderQgGate(gate) {
+  if (!gate) { document.getElementById('qgGate').innerHTML = ''; return; }
+  const c = gate.issue_counts || {};
+  document.getElementById('qgGate').innerHTML = `
+    <span class="badge QG_${gate.status}">${qgStatusText(gate.status)}</span>
+    <span class="muted">规则 v${gate.current_rule_version ?? '-'} · 最新扫描 ${gate.latest_scan_id || '无'}
+      (${gate.latest_scan_status || '-'})${gate.expires_at ? ' · 有效期至 ' + gate.expires_at : ''}</span>
+    ${c.total != null ? `<span class="muted" style="margin-left:8px">问题 ${c.total}:
+      <b class="err">阻断 ${c.blocker}(待处理 ${c.open_blocker})</b> / 警告 ${c.warning} / 提示 ${c.info}
+      · 修复 ${c.fixed} · 豁免 ${c.exempted}</span>` : ''}
+    ${gate.reasons && gate.reasons.length ? '<div class="err">' + gate.reasons.slice(0,5).map(escapeHtml).join('<br>') + '</div>' : ''}`;
+}
+
+function qgRuleParams(rule) {
+  const keys = ['pattern','op','other_field','value','min','max','min_length','max_length','allow_blank'];
+  const p = {};
+  for (const k of keys) if (rule[k] !== undefined && rule[k] !== null) p[k] = rule[k];
+  return p;
+}
+
+function qgAddRuleRow(rule) {
+  const tr = document.createElement('tr');
+  tr.innerHTML = `<td><input class="qr-id" value="${rule?escapeHtml(rule.id):''}" size="12" placeholder="rule_id"></td>
+    <td><input class="qr-name" value="${rule?escapeHtml(rule.name||''):''}" size="12"></td>
+    <td><select class="qr-type">${QG_TYPES.map(t =>
+      `<option ${rule&&rule.type===t?'selected':''}>${t}</option>`).join('')}</select></td>
+    <td><select class="qr-field">${QG_FIELDS.map(f =>
+      `<option ${rule&&rule.field===f?'selected':''}>${f}</option>`).join('')}</select></td>
+    <td><select class="qr-sev">${['BLOCKER','WARNING','INFO'].map(sv =>
+      `<option ${rule&&rule.severity===sv?'selected':''}>${sv}</option>`).join('')}</select></td>
+    <td><input class="qr-params" value="${rule?escapeHtml(JSON.stringify(qgRuleParams(rule))):''}" size="36"
+       placeholder='{"pattern":"..."}'></td>
+    <td><button class="danger" onclick="this.closest('tr').remove()">删</button></td>`;
+  tr.querySelector('.qr-type').onchange = e => {
+    const hintInput = tr.querySelector('.qr-params');
+    if (!hintInput.value) hintInput.value = RULE_PARAM_HINTS[e.target.value] || '';
+  };
+  document.getElementById('qgRuleRows').appendChild(tr);
+}
+
+async function qgLoadRules() {
+  const pid = qgSelectedPlan();
+  if (!pid) return;
+  const r = await fetch(`/api/admin/plans/${pid}/quality-rules`);
+  document.getElementById('qgRuleRows').innerHTML = '';
+  if (r.status === 404) {
+    qgAddRuleRow({ id: 'email_format', name: '邮箱格式', type: 'format', field: 'email',
+                   severity: 'BLOCKER', params: { pattern: '[^@\\s]+@[^@\\s]+\\.[^@\\s]+' } });
+    document.getElementById('qgVersions').textContent = '该计划尚未绑定规则集(保存后创建 v1)';
+    return;
+  }
+  const j = await r.json();
+  (j.current_rules || []).forEach(qgAddRuleRow);
+  document.getElementById('qgVersions').innerHTML = '历史版本: ' + (j.versions || []).map(v =>
+    `<span class="tag">v${v.version} · ${v.rule_count} 条 · ${escapeHtml(v.created_by)}</span>`).join('');
+}
+
+async function qgSaveRules() {
+  const pid = qgSelectedPlan();
+  const rules = [];
+  for (const tr of document.querySelectorAll('#qgRuleRows tr')) {
+    let params = {};
+    const raw = tr.querySelector('.qr-params').value.trim();
+    if (raw) { try { params = JSON.parse(raw); } catch { showQgMsg(false, '参数必须是合法 JSON: ' + raw); return; } }
+    rules.push({ id: tr.querySelector('.qr-id').value.trim(),
+                 name: tr.querySelector('.qr-name').value.trim(),
+                 type: tr.querySelector('.qr-type').value,
+                 field: tr.querySelector('.qr-field').value,
+                 severity: tr.querySelector('.qr-sev').value, params });
+  }
+  const note = document.getElementById('qgNote').value.trim() || null;
+  const { status, j } = await post(`/api/admin/plans/${pid}/quality-rules`,
+    { operator: operator(), idempotency_key: idemKey(), plan_id: pid, rules, note });
+  if (status === 200) {
+    showQgMsg(true, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+    document.getElementById('qgNote').value = '';
+  } else {
+    const reasons = (j.detail && j.detail.reasons) || [];
+    showQgMsg(false, '规则校验失败:\n - ' + (reasons.join('\n - ')
+      || ((j.detail && j.detail.reason) || JSON.stringify(j))));
+  }
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadRules();
+}
+
+async function qgCreateScan() {
+  const pid = qgSelectedPlan();
+  const { status, j } = await post(`/api/admin/plans/${pid}/quality-scans`,
+    { operator: operator(), idempotency_key: idemKey(), plan_id: pid });
+  if (status === 201) {
+    showQgMsg(j.ok, (j.replayed ? '[幂等重放] ' : '')
+      + (j.already_active ? `已有 ${j.status} 扫描, 幂等返回` : j.detail));
+  } else showQgMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadOverview();
+}
+
+async function qgScanAct(sid, name) {
+  const { status, j } = await post(`/api/admin/quality-scans/${sid}/${name}`,
+    { operator: operator(), idempotency_key: idemKey() });
+  if (status === 200) showQgMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showQgMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadOverview();
+}
+
+async function qgLoadOverview() {
+  const pid = qgSelectedPlan();
+  if (!pid) return;
+  qgOverview = await (await fetch(`/api/admin/plans/${pid}/quality-overview`)).json();
+  renderQgGate(qgOverview.gate);
+  document.getElementById('qgScans').innerHTML = (qgOverview.scans || []).map(s => {
+    const pct = s.progress.total ? Math.round(100 * s.progress.done / s.progress.total) : 0;
+    const d = s.issue_distribution || {};
+    const bl = d.BLOCKER || {};
+    return `<div style="border-top:1px dashed #ddd;padding:6px 0">
+      <span class="badge ${s.status}">${s.status}</span>
+      <b>${s.id}</b> <span class="muted">规则 v${s.rule_version} · ${s.progress.done}/${s.progress.total} 批次
+        · ${s.total_records} 条记录 · ${s.total_issues} 问题
+        (阻断 ${bl.total||0}: 待处理 ${bl.OPEN||0}/修复 ${bl.FIXED||0}/豁免 ${bl.EXEMPTED||0})
+        ${s.expires_at ? ' · 有效期至 ' + s.expires_at : ''}</span>
+      ${s.failure_reason ? `<div class="err">${escapeHtml(s.failure_reason)}</div>` : ''}
+      ${(s.stale && s.stale.length) ? `<div class="err">结果失效: ${s.stale.slice(0,3).map(escapeHtml).join('; ')}</div>` : ''}
+      <div class="bar" style="width:240px;display:inline-block;vertical-align:middle">
+        <div style="width:${pct}%;background:#00838f"></div></div>
+      <button class="plain" ${['QUEUED','RUNNING'].includes(s.status)?'':'disabled'} onclick="qgScanAct('${s.id}','pause')">暂停</button>
+      <button ${['PAUSED','FAILED'].includes(s.status)?'':'disabled'} onclick="qgScanAct('${s.id}','resume')">恢复</button>
+      <button class="danger" ${['QUEUED','RUNNING','PAUSED'].includes(s.status)?'':'disabled'} onclick="qgScanAct('${s.id}','cancel')">取消</button>
+      <button class="plain" onclick="qgViewScan('${s.id}')">批次/事件</button>
+      <div id="qgsd-${s.id}"></div>
+    </div>`;
+  }).join('') || '<span class="muted">尚无扫描任务</span>';
+  qgLoadHistory();
+  qgLoadIssues();
+}
+
+async function qgViewScan(sid) {
+  const box = document.getElementById('qgsd-' + sid);
+  if (box.dataset.open) { box.innerHTML = ''; box.dataset.open = ''; return; }
+  const j = await (await fetch(`/api/admin/quality-scans/${sid}`)).json();
+  const batches = (j.batches || []).map(b =>
+    `<tr><td>${b.seq}</td><td>${b.batch_id}</td><td>${escapeHtml(b.biz||'')}</td>
+      <td><span class="badge ${b.status}">${b.status}</span></td><td>${b.record_count}</td>
+      <td>${b.issue_count} (阻断 ${b.blocker_count})</td>
+      <td><code style="font-size:10px">${(b.data_fingerprint||'').slice(0,12)}</code></td>
+      <td class="err">${escapeHtml(b.last_error||'')}</td></tr>`).join('');
+  const events = (j.events || []).slice(0, 12).map(e =>
+    `<div class="muted">[${(e.ts||'').slice(11,19)}] ${e.event} · ${escapeHtml(e.operator)}
+      ${e.reason ? ' · ' + escapeHtml(e.reason) : ''}</div>`).join('');
+  box.innerHTML = `<table style="margin-top:4px"><thead><tr><th>seq</th><th>批次</th><th>业务组</th>
+    <th>状态</th><th>记录数</th><th>问题</th><th>数据指纹</th><th>错误</th></tr></thead>
+    <tbody>${batches}</tbody></table><div style="margin-top:4px">${events}</div>`;
+  box.dataset.open = '1';
+}
+
+async function qgLoadIssues() {
+  const pid = qgSelectedPlan();
+  if (!pid) return;
+  const p = new URLSearchParams();
+  const sev = document.getElementById('qgFsev').value;
+  const st = document.getElementById('qgFstatus').value;
+  if (sev) p.set('severity', sev);
+  if (st) p.set('status_filter', st);
+  qgIssues = await (await fetch(`/api/admin/plans/${pid}/quality-issues?` + p.toString())).json();
+  document.getElementById('qgIssues').innerHTML = qgIssues.map(i => `
+    <tr>
+      <td><input type="checkbox" class="qg-sel" value="${i.id}" ${i.status==='OPEN'?'':'disabled'}></td>
+      <td>${i.batch_id}</td><td>${i.record_id}</td>
+      <td>${escapeHtml(i.rule_id)}<div class="muted">v${i.rule_version} ${escapeHtml(i.rule_name||'')}</div></td>
+      <td>${i.rule_type}</td>
+      <td><span class="badge SEV_${i.severity}">${i.severity}</span></td>
+      <td>${i.field || '-'}</td>
+      <td>${escapeHtml(i.message)}</td>
+      <td><code class="muted" style="font-size:10px">${escapeHtml(JSON.stringify(i.sample))}</code></td>
+      <td><span class="badge ST_${i.status}">${i.status}</span>
+        <div class="muted">${i.resolved_by ? escapeHtml(i.resolved_by) : ''}</div></td>
+      <td>${i.status === 'OPEN' && i.severity === 'BLOCKER'
+        ? `<button onclick="qgExempt('${i.id}')">豁免</button>` : ''}</td>
+    </tr>`).join('') || '<tr><td colspan="11" class="muted">无匹配问题</td></tr>';
+}
+
+async function qgFixSelected() {
+  const pid = qgSelectedPlan();
+  const ids = Array.from(document.querySelectorAll('.qg-sel:checked')).map(c => c.value);
+  if (!ids.length) { showQgMsg(false, '请先勾选要修复核验的 OPEN 问题'); return; }
+  const note = document.getElementById('qgFixNote').value.trim() || null;
+  const { status, j } = await post(`/api/admin/plans/${pid}/quality-fixes`,
+    { operator: operator(), idempotency_key: idemKey(), plan_id: pid, issue_ids: ids, note });
+  if (status === 201) {
+    const pr = j.progress;
+    showQgMsg(!!(pr.still_open || pr.rejected || pr.not_found),
+      `修复批次 ${j.fix_batch_id}: 共 ${pr.total}, 解决 ${pr.resolved}, 仍违规 ${pr.still_open}, `
+      + `记录缺失 ${pr.not_found}, 拒绝 ${pr.rejected}; 数据变化后需重新扫描`);
+  } else showQgMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadOverview();
+}
+
+async function qgExempt(issueId) {
+  const pid = qgSelectedPlan();
+  const reason = prompt('豁免原因(必填, 将与规则版本一起保留历史):');
+  if (!reason) return;
+  const { status, j } = await post(`/api/admin/plans/${pid}/quality-exemptions`,
+    { operator: operator(), idempotency_key: idemKey(), plan_id: pid,
+      issue_id: issueId, reason });
+  if (status === 201) showQgMsg(true, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showQgMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadOverview();
+}
+
+async function qgLoadHistory() {
+  const pid = qgSelectedPlan();
+  const h = await (await fetch(`/api/admin/plans/${pid}/quality-history`)).json();
+  const fixes = (h.fix_batches || []).slice(0, 10).map(f => `
+    <tr><td>${f.id}</td><td>${f.scan_id}</td><td>v${f.rule_version}</td><td>${escapeHtml(f.operator)}</td>
+      <td>${f.resolved}/${f.total} 解决 · ${f.still_open} 仍违规 · ${f.not_found} 缺失 · ${f.rejected} 拒绝</td>
+      <td class="muted">${f.created_at||''}</td></tr>`).join('');
+  const exs = (h.exemptions || []).slice(0, 20).map(e => `
+    <tr><td>${e.id}</td><td>${e.record_id} / ${escapeHtml(e.rule_id)}</td><td>v${e.rule_version}</td>
+      <td><span class="badge ${e.status==='APPROVED'?'ST_EXEMPTED':'CANCELED'}">${e.status}</span></td>
+      <td>${escapeHtml(e.reason)}</td><td>${escapeHtml(e.created_by)}<div class="muted">${e.created_at||''}</div></td>
+      <td>${e.status==='APPROVED' ? `<button class="danger" onclick="qgRevokeExemption('${e.id}')">撤销</button>`
+        : `<span class="muted">${escapeHtml(e.revoked_by||'')}: ${escapeHtml(e.revoke_reason||'')}</span>`}</td>
+    </tr>`).join('');
+  document.getElementById('qgHistory').innerHTML = `
+    <b>修复批次历史</b>
+    <table><thead><tr><th>批次</th><th>扫描</th><th>规则版本</th><th>操作者</th><th>结果</th><th>时间</th></tr></thead>
+      <tbody>${fixes || '<tr><td colspan="6" class="muted">尚无修复批次</td></tr>'}</tbody></table>
+    <b style="display:block;margin-top:6px">豁免历史</b>
+    <table><thead><tr><th>豁免</th><th>记录/规则</th><th>版本</th><th>状态</th><th>原因</th><th>申请人/时间</th><th></th></tr></thead>
+      <tbody>${exs || '<tr><td colspan="7" class="muted">尚无豁免</td></tr>'}</tbody></table>`;
+}
+
+async function qgRevokeExemption(exId) {
+  const pid = qgSelectedPlan();
+  const reason = prompt('撤销豁免原因(必填, 阻断问题将重新打开):');
+  if (!reason) return;
+  const { status, j } = await post(`/api/admin/plans/${pid}/quality-exemptions/${exId}/revoke`,
+    { operator: operator(), idempotency_key: idemKey(), plan_id: pid, reason });
+  if (status === 200) showQgMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showQgMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh(); qgLoadOverview();
+}
+
+function qgInit() {
+  qgAddRuleRow({ id: 'email_format', name: '邮箱格式', type: 'format', field: 'email',
+                 severity: 'BLOCKER', params: { pattern: '[^@\\s]+@[^@\\s]+\\.[^@\\s]+' } });
+}
+qgInit();
+refresh().then(() => { qgLoadRules(); qgLoadOverview(); });
 addPlanStepRow(1);
 addPlanStepRow(2);
 searchCatalog();

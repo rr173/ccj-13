@@ -332,6 +332,83 @@ QUEUED ─claim(单 RUNNING 串行)─▶ RUNNING ─全部项处理完─▶ CO
   清理状态、保留策略设置按钮）、清理计划表（进度条/当前项/最近错误/暂停恢复取消/逐项结果），
   逐项结果表展示每项的跳过/失败原因码与说明。
 
+## 迁移前数据质量门禁
+
+管理员在计划**启动前**为其绑定一组**可版本化**的数据质量规则, 对计划涉及的批次
+生成质量扫描任务; 扫描结果生成后, 只有**全部阻断级(BLOCKER)问题被修复或豁免**、
+且扫描结果仍有效(规则版本未变 / 批次数据未变 / 未过期), 计划才允许通过质量门禁
+进入启动流程。门禁与高风险审批、执行窗口是**叠加闸门**。
+
+### 规则与版本(quality_rule_sets / quality_rule_versions)
+
+- 一个计划至多一个规则集; 规则整体版本化, 每次修改且**内容摘要变化**才新增一个
+  **不可变版本**(`rules` 规范化后 sha256), 相同内容重复保存幂等无副作用;
+  旧版本永不修改, 扫描/问题/修复/豁免都绑定产生时的规则版本。
+- 四类规则(校验非法时聚合返回全部原因, 不落任何数据):
+  - `required` 必填(`params.allow_blank` 可放行纯空白);
+  - `format` 格式: `params.pattern` 正则(保存时编译校验);
+  - `cross_field` 跨字段一致性: `params.other_field` + `op`
+    (`eq/ne/contains/not_contains/regex_match`);
+  - `range` 范围: 数值 `min/max`, 或字符串/数组长度 `min_length/max_length`。
+- 严重级别 `BLOCKER/WARNING/INFO`; 只有 BLOCKER 阻断门禁, WARNING/INFO 仅提示。
+- 规则作用于批次范围内的**旧结构记录**(迁移前事实来源), 可作用字段
+  `name/email/tags_csv/tags(派生)/id`。
+
+### 质量扫描任务(quality_scans / quality_scan_batches / quality_issues)
+
+- 对计划涉及的每个批次逐批扫描, 按批次记录状态、记录数、问题数与**批次数据指纹**
+  (扫描完成时范围内旧表全量内容 sha256); 问题按 `(扫描,批次,规则,记录,字段)` 唯一,
+  带严重级别、问题说明与**可追踪样本**(命中时的完整记录快照, 每条 规则×批次 至多
+  保留 500 个样本, 超出仍计数)。
+- 状态机(与回放任务同构):
+  ```
+  QUEUED ─claim(并发额度)─▶ RUNNING ─全部批次扫完─▶ COMPLETED(终态)
+    ▲                          │
+    └──── resume ──── PAUSED ◀──┘(pause 在批次边界生效)
+                                 │
+                                 ├─ cancel ─▶ CANCELED(终态, 未开始批次 SKIPPED)
+                                 └─ 规则版本缺失/批次删除/执行异常 ─▶ FAILED(终态, 可 resume)
+  ```
+- 并发受 `QUALITY_SCAN_MAX_CONCURRENCY`(默认 2, 至少 1)限制, 超出排队;
+  暂停/恢复/取消均幂等(同态重复 `already_in_state:true`, 同键重放 `replayed:true`)。
+- 重复扫描幂等: 同一计划已有活动(QUEUED/RUNNING/PAUSED)扫描时返回已有任务
+  (`already_active:true`); 终态后允许重新发起。扫描只能在计划 **DRAFT** 时发起。
+- 结果**有效期**: `QUALITY_SCAN_TTL_SECONDS`(默认 86400 秒), COMPLETED 时记录
+  `expires_at`。**规则版本变化、批次数据变化(指纹漂移)或结果过期 -> 门禁 STALE,
+  旧结果不能直接放行**, 必须重新扫描。
+- 重启安全: RUNNING 标记为崩溃边界(先提交后扫描); 重启把遗留 RUNNING 扫描复位
+  QUEUED、RUNNING 批次复位 PENDING(问题未提交, 安全重扫), 已 SUCCESS 批次与其
+  问题、数据指纹全部保留, worker 自动续跑。
+- 同规则版本重新扫描时, 历史**有效豁免自动继承**到新扫描的相同问题
+  (解决 TTL 过期重扫后无需重复豁免; 规则版本变化不继承)。
+
+### 修复批次与豁免(quality_fix_batches / quality_exemptions)
+
+- **修复批次**: `POST .../quality-fixes {issue_ids}` 逐项在**当前数据**上重跑问题
+  对应规则做核验, 每项给结论: `RESOLVED`(违规消失, 问题置 FIXED) /
+  `STILL_OPEN`(仍违规) / `NOT_FOUND`(记录已不存在) / `REJECTED`(问题不存在、
+  不属于最近一次 COMPLETED 扫描或已非 OPEN)。修复批次**只追加**, 绑定扫描规则版本;
+  修复会改变数据指纹, 因此修复后需重新扫描, 门禁才重新评估。
+- **豁免**: 对单个 BLOCKER 问题提交带原因的豁免申请(**提交即批准**), 与规则版本
+  绑定、只追加保留历史; 可撤销(豁免置 REVOKED, 问题回到 OPEN, 门禁重新阻断);
+  重复豁免幂等; 非阻断/已 FIXED 的问题不能豁免。豁免不改数据, 不触发结果失效。
+
+### 门禁判定与接口
+
+实时判定状态: `NOT_CONFIGURED`(未绑定规则, 不约束, 兼容历史行为) /
+`NOT_SCANNED` / `RUNNING` / `FAILED` / `CANCELED` / `STALE` / `BLOCKED` / `PASS`。
+仅 PASS 放行启动(在 `do_start` 内与高风险审批串联)。
+
+- 页面显示: 规则版本(当前版本+全部历史版本)、扫描进度(批次/记录/当前批次)、
+  问题分布(严重级别 × 处理状态)、修复/豁免历史与门禁状态徽章(计划卡片上同步展示,
+  未通过时启动按钮禁用并给出原因)。
+- 幂等: 规则保存/扫描创建与控制/修复/豁免全部要求 `idempotency_key`
+  (`quality.*` 命名空间), 同键跨动作/跨目标/不同请求体复用返回 409。
+- 配置: `QUALITY_SCAN_MAX_CONCURRENCY`(默认 2)、`QUALITY_SCAN_TTL_SECONDS`
+  (默认 86400)、`QUALITY_WORKER_POLL_INTERVAL`(默认 0.5s);
+  worker 随 `PLAN_WORKER_ENABLED=0` 一并关闭, 测试手动 `claim_due_scans` +
+  `run_scan_tick` 驱动。
+
 ## 运行
 
 ```bash
@@ -366,7 +443,27 @@ POST /api/admin/plans/{id}/approve                 {operator, idempotency_key} �
 POST /api/admin/plans/{id}/reject                  {operator, idempotency_key, reason} 拒绝并阻止启动
 POST /api/admin/plans/{id}/revoke-approval         {operator, idempotency_key} 启动前撤销审批
 PUT  /api/admin/plans/{id}/window                  {operator, idempotency_key, windows:[{starts_at,ends_at}]}
-                                                    (启动前整体替换; 空列表清空限制; POST 同义)
+POST /api/admin/plans/{id}/window                  (启动前整体替换; 空列表清空限制; POST 同义)
+PUT/POST /api/admin/plans/{id}/quality-rules  {operator, idempotency_key, plan_id,
+                                                rules:[{id,name,type,field,severity,params}], note?}
+                                                      绑定/更新可版本化质量规则(内容变化才升版本)
+GET  /api/admin/plans/{id}/quality-rules             规则集(当前版本规则+全部历史版本)
+POST /api/admin/plans/{id}/quality-scans             对计划涉及批次生成质量扫描并排队(活动扫描幂等)
+GET  /api/admin/plans/{id}/quality-gate              门禁结果(规则版本/最新扫描/失效原因/问题计数)
+GET  /api/admin/plans/{id}/quality-overview          规则版本+扫描列表(进度/问题分布)+门禁
+GET  /api/admin/plans/{id}/quality-issues?scan_id=&batch_id=&severity=&status_filter=&rule_type=
+                                                      按计划查询质量问题(含可追踪样本)
+GET  /api/admin/plans/{id}/quality-history           修复批次与豁免全量历史(绑定规则版本)
+GET  /api/admin/quality-scans?plan_id=&status_filter= 质量扫描任务列表
+GET  /api/admin/quality-scans/{id}                   扫描详情(批次进度/问题分布/过期原因/事件流水)
+GET  /api/admin/quality-scans/{id}/issues?severity=&status_filter=  扫描问题明细(含样本)
+POST /api/admin/quality-scans/{id}/pause|resume|cancel {operator, idempotency_key}
+POST /api/admin/plans/{id}/quality-fixes      {operator, idempotency_key, plan_id,
+                                                issue_ids:[...], note?}  创建修复批次(逐项重跑规则核验)
+POST /api/admin/plans/{id}/quality-exemptions {operator, idempotency_key, plan_id,
+                                                issue_id, reason}       阻断问题豁免(带原因,绑定规则版本)
+POST /api/admin/plans/{id}/quality-exemptions/{eid}/revoke {operator, idempotency_key,
+                                                plan_id, reason}        撤销豁免(问题重新打开)
 POST /api/admin/checkpoints          {operator, idempotency_key, plan_id}  固化审计检查点与批次快照
 GET  /api/admin/checkpoints                         检查点列表
 GET  /api/admin/checkpoints/{id}                    检查点详情(逐步骤审计证据/快照统计/不完整原因)
@@ -422,7 +519,7 @@ GET  /api/records/{id}/compare                     批次冻结窗内双读比�
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 125 个用例:
+python3 -m pytest tests/ -q   # 165 个用例:
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
 # 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
@@ -465,4 +562,15 @@ python3 -m pytest tests/ -q   # 125 个用例:
 #           同摘要去重非canonical清理解除引用保文件/canonical移交物理文件与引用数/
 #           移交失败 digest_referenced 跳过/重启保留保留策略·引用关系·逐项清理进度与 RUNNING 复位/
 #           重启清零在途占用计数/FAILED 计划 resume 重试失败项/status 含清理计划且已清理归档不展示
+# 迁移前质量门禁(39): 无规则计划不受门禁/规则保存版本化与历史不可变/同内容不升版本/同键重放/
+#           规则聚合校验不落数据/四类规则求值(必填·格式·跨字段eq/ne·数值与长度范围)/
+#           严重级别与可追踪样本/多批次扫描进度与数据指纹/无规则与已启动计划拒绝扫描/
+#           活动扫描重复创建幂等/暂停在批次边界(排队暂停不被认领)/恢复续跑/取消跳过未开始批次/
+#           批次删除 FAILED+resume 成功/并发上限排队与完成后放行/
+#           阻断问题阻止启动且 WARNING 不阻断/修复批次 RESOLVED·STILL_OPEN·NOT_FOUND·REJECTED/
+#           修复后需重扫/豁免放行不改数据/豁免幂等与撤销重开/修复豁免历史绑定规则版本/
+#           规则版本变化旧结果 STALE/批次数据变化 STALE/结果过期 STALE/同版本重扫豁免继承/
+#           扫描控制幂等与状态冲突/同键跨动作复用 409/重启 RUNNING 复位排队与 RUNNING 批次复位/
+#           重启后规则·扫描·豁免·门禁状态保留/按计划多维查询问题与门禁结果/总览与扫描列表/
+#           门禁与高风险审批叠加
 ```

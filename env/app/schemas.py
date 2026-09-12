@@ -193,3 +193,57 @@ class CleanupCreate(BaseModel):
 class CleanupAction(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+
+
+# ---------- 迁移前数据质量门禁 ----------
+
+class QualityRuleIn(BaseModel):
+    id: str = Field(min_length=1, max_length=64)       # 规则稳定标识(版本间沿用)
+    name: Optional[str] = None                          # 规则名称
+    type: str = Field(min_length=1)                     # required | format | cross_field | range
+    field: Optional[str] = None                          # 作用字段(name/email/tags_csv/tags/id)
+    severity: str = "BLOCKER"                            # BLOCKER | WARNING | INFO
+    enabled: bool = True
+    params: dict[str, Any] = {}                           # pattern/format/op/other_field/min/max/...
+
+
+class QualityRulesSave(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    plan_id: str = Field(min_length=1)
+    rules: list[QualityRuleIn] = Field(min_length=1, max_length=500)
+    note: Optional[str] = None                           # 版本说明
+
+
+class QualityScanCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    plan_id: str = Field(min_length=1)
+
+
+class QualityScanAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+
+
+class QualityFixCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    plan_id: str = Field(min_length=1)
+    issue_ids: list[str] = Field(min_length=1, max_length=1000)
+    note: Optional[str] = None
+
+
+class QualityExemptionCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    plan_id: str = Field(min_length=1)
+    issue_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)                    # 豁免原因必填, 与规则版本一起留痕
+
+
+class QualityExemptionRevoke(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    plan_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
