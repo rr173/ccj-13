@@ -8,14 +8,15 @@ from sqlalchemy.orm import Session
 from .db import Base, SessionLocal, engine
 from .models import (
     REVIEW_STATUSES, AuditLog, MigrationBatch, MigrationPlan, RecordNew,
-    RecordOld, ReplayCheckpoint, ReplayTask,
+    RecordOld, ReplayBatchOp, ReplayCheckpoint, ReplayTask,
 )
 from .plans import PlanWorker
 from .replay import ReplayWorker
 from .schemas import (
     AdminAction, BatchCreate, CheckpointCreate, PlanAction, PlanCreate,
     PlanRejectAction, PlanWindowAction, RecordIn, RecoverAction, ReplayAction,
-    ReplayCreate, ReviewConfirm, ReviewReopen, ReviewSubmit,
+    ReplayCreate, ReviewBatchAssign, ReviewBatchReview, ReviewConfirm,
+    ReviewReopen, ReviewSubmit,
 )
 from . import plans, replay, service
 
@@ -72,6 +73,7 @@ def _backfill_replay_columns():
         "review_status": "VARCHAR(16) NOT NULL DEFAULT 'UNREVIEWED'",
         "confirmed_by": "VARCHAR(128)",
         "confirmed_at": "TIMESTAMP",
+        "assignee": "VARCHAR(128)",
     }
     with engine.begin() as conn:
         for col, ddl in defaults.items():
@@ -512,6 +514,71 @@ def get_review_queue(status: str = "PENDING", db: Session = Depends(get_db)):
             "error": "invalid_review_status",
             "reason": f"复核状态必须是 {list(REVIEW_STATUSES)} 之一(收到 {status!r})"})
     return replay.review_queue_view(db, status)
+
+
+# ---------- 批量复核与分派(逐项独立提交, 结果持久化可查) ----------
+
+@app.get("/api/admin/review-tasks")
+def list_review_tasks(review_status: str | None = None, biz: str | None = None,
+                      report_version: int | None = None,
+                      db: Session = Depends(get_db)):
+    """筛选进入复核流程(COMPLETED)的回放任务: 按复核状态、业务分组、报告版本过滤;
+    返回带当前分派人与分派历史的任务列表, 供批量分派/批量复核选择。"""
+    if review_status is not None and review_status not in REVIEW_STATUSES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_review_status",
+            "reason": f"复核状态必须是 {list(REVIEW_STATUSES)} 之一(收到 {review_status!r})"})
+    return replay.review_tasks_view(db, review_status, biz, report_version)
+
+
+def _run_batch(db: Session, action: str, body, fn):
+    try:
+        result, replayed = replay.run_batch_action(
+            db, action=action, operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(), fn=fn)
+    except replay.ReplayStateError as e:
+        db.rollback()
+        _replay_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/review-batch/assign", status_code=201)
+def batch_assign(body: ReviewBatchAssign, db: Session = Depends(get_db)):
+    """批量分派: 把一批回放任务分派给指定复核人。逐项独立提交——已确认/不存在/
+    未完成的任务逐项返回失败原因, 成功项不回滚; 重复分派(同人)幂等, 改派保留历史。"""
+    return _run_batch(db, "batch.assign", body,
+                      lambda s: replay.do_batch_assign(
+                          s, body.operator, body.assignee, body.replay_ids,
+                          body.reason, body.idempotency_key))
+
+
+@app.post("/api/admin/review-batch/reviews", status_code=201)
+def batch_review(body: ReviewBatchReview, db: Session = Depends(get_db)):
+    """批量提交复核结论: 所有项必须基于同一报告版本。逐项独立提交——版本已变化/
+    已确认/无权限(任务分派给他人)等逐项返回失败原因, 成功项不回滚。"""
+    items = [i.model_dump() for i in body.items]
+    return _run_batch(db, "batch.review", body,
+                      lambda s: replay.do_batch_review(
+                          s, body.operator, body.report_version, items,
+                          body.idempotency_key))
+
+
+@app.get("/api/admin/review-batch")
+def list_batch_ops(limit: int = 20, db: Session = Depends(get_db)):
+    """最近批量操作列表(分派/复核, 含进度汇总; 逐项结果用详情接口查询)。"""
+    rows = (db.query(ReplayBatchOp)
+            .order_by(ReplayBatchOp.id.desc()).limit(limit).all())
+    return [replay.batch_op_to_dict(op, with_results=False) for op in rows]
+
+
+@app.get("/api/admin/review-batch/{op_id}")
+def get_batch_op(op_id: str, db: Session = Depends(get_db)):
+    """批量操作结果查询: 进度(总数/成功/失败)与逐项成功/失败原因, 重启后保留。"""
+    op = db.get(ReplayBatchOp, op_id)
+    if op is None:
+        _replay_not_found(Exception(f"批量操作 {op_id} 不存在"))
+    return replay.batch_op_to_dict(op)
 
 
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------

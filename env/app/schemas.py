@@ -134,3 +134,28 @@ class ReviewReopen(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
     reason: Optional[str] = None                   # 重新打开原因(可选, 落事件流水)
+
+
+# ---------- 批量复核与分派 ----------
+
+class ReviewBatchAssign(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    assignee: str = Field(min_length=1)            # 被分派的复核人
+    replay_ids: list[str] = Field(min_length=1, max_length=200)  # 待分派的回放任务
+    reason: Optional[str] = None                   # 分派说明(可选, 落分派历史)
+
+
+class ReviewBatchReviewItem(BaseModel):
+    replay_id: str = Field(min_length=1)
+    step_seq: int = Field(ge=1)
+    verdict: str = Field(min_length=1)             # PASS | FAIL
+    issue: Optional[str] = None                    # 问题说明(FAIL 时必填)
+    fix_tags: list[str] = []                       # 修复标签
+
+
+class ReviewBatchReview(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    report_version: int = Field(ge=1)              # 批量项必须同属该报告版本
+    items: list[ReviewBatchReviewItem] = Field(min_length=1, max_length=200)

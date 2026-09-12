@@ -36,8 +36,9 @@ from sqlalchemy.orm import Session
 from . import plans, service
 from .models import (
     REVIEW_VERDICTS, AuditLog, MigrationBatch, MigrationPlan, PlanStep,
-    RecordNew, RecordOld, ReplayCheckpoint, ReplayCheckpointStep, ReplayReview,
-    ReplayTask, ReplayTaskEvent, ReplayTaskStep,
+    RecordNew, RecordOld, ReplayAssignment, ReplayBatchOp, ReplayCheckpoint,
+    ReplayCheckpointStep, ReplayReview, ReplayTask, ReplayTaskEvent,
+    ReplayTaskStep,
 )
 from .service import APP_VERSION
 
@@ -458,19 +459,29 @@ def _require_current_version(task: ReplayTask, report_version: int) -> None:
             f"请获取最新报告后重试")
 
 
+def _require_assignee(task: ReplayTask, operator: str) -> None:
+    """分派权限栅栏: 任务已分派时, 只有被分派的复核人能提交步骤结论;
+    未分派(assignee 为空)的任务不限制提交人。"""
+    if task.assignee and task.assignee != operator:
+        raise ReplayStateError(
+            f"回放任务 {task.id} 已分派给复核人 {task.assignee}, "
+            f"{operator} 不是被分派人, 无权提交该任务的复核结论")
+
+
 def do_submit_review(session: Session, task: ReplayTask, operator: str,
                      step_seq: int, report_version: int, verdict: str,
                      issue: str | None, fix_tags: list[str] | None) -> dict:
     """提交单个步骤的复核结论(结论/问题说明/修复标签), 与当前报告版本绑定。
 
-    校验: 回放须 COMPLETED 且未确认; 报告版本必须为当前版本(过期 409);
-    步骤须存在且 SUCCESS(报告已生成); 同一(版本, 步骤)只允许一条结论,
-    重复写入(不同幂等键)返回冲突, 不覆盖已有结论。
+    校验: 回放须 COMPLETED 且未确认; 已分派任务仅被分派人可提交;
+    报告版本必须为当前版本(过期 409); 步骤须存在且 SUCCESS(报告已生成);
+    同一(版本, 步骤)只允许一条结论, 重复写入(不同幂等键)返回冲突, 不覆盖已有结论。
     """
     _require_completed(task, "提交复核结论")
     if task.review_status == "CONFIRMED":
         raise ReplayStateError(
             f"回放任务 {task.id} 已确认(CONFIRMED), 复核已锁定, 不能再提交结论")
+    _require_assignee(task, operator)
     _require_current_version(task, report_version)
     verdict = (verdict or "").strip().upper()
     if verdict not in REVIEW_VERDICTS:
@@ -583,6 +594,195 @@ def do_reopen_review(session: Session, task: ReplayTask, operator: str,
             "review_status": task.review_status,
             "detail": f"回放已重新打开: 报告版本 v{old} -> v{task.report_version}, "
                       f"历史结论保留, 请基于新版本重新复核"}
+
+
+# ---------- 批量复核与分派(逐项独立提交: 成功项不回滚, 失败项带原因) ----------
+
+def run_batch_action(session: Session, *, action: str, operator: str,
+                     idempotency_key: str, payload: dict, fn) -> tuple[dict, bool]:
+    """批量操作幂等框架: 与 run_replay_action 同键约束(同键不同请求体 -> 409),
+    但 fn 内部逐项独立提交 —— 单项失败只回滚该项, 已成功项保留;
+    批量结果(含逐项原因)落 replay_batch_ops, 与幂等键同事务保存, 重启后仍可查询。"""
+    req_hash = _hash({"action": f"replay.{action}", "payload": payload})
+    from .models import IdempotencyKey
+    existing = session.get(IdempotencyKey, idempotency_key)
+    if existing is not None:
+        if existing.request_hash != req_hash:
+            raise ReplayStateError("幂等键被不同请求复用")
+        return existing.response_json, True
+    result = fn(session)
+    session.add(IdempotencyKey(key=idempotency_key, action=f"replay.{action}",
+                               request_hash=req_hash, response_json=result))
+    try:
+        session.commit()
+    except IntegrityError:  # 并发同键撞主键: 返回先提交者的结果
+        session.rollback()
+        winner = session.get(IdempotencyKey, idempotency_key)
+        if winner is not None and winner.request_hash == req_hash:
+            return winner.response_json, True
+        raise
+    return result, False
+
+
+def _finish_batch_op(session: Session, *, action: str, operator: str,
+                     idempotency_key: str, assignee: str | None,
+                     report_version: int | None, results: list[dict]) -> dict:
+    """汇总逐项结果并落批量操作记录(不 commit, 由 run_batch_action 与幂等键一起提交)。"""
+    succeeded = sum(1 for r in results if r["ok"])
+    failed = len(results) - succeeded
+    op_id = "BO" + uuid.uuid4().hex[:10]
+    session.add(ReplayBatchOp(
+        id=op_id, action=action, operator=operator,
+        idempotency_key=idempotency_key, assignee=assignee,
+        report_version=report_version, total=len(results),
+        succeeded=succeeded, failed=failed, results=results))
+    session.flush()
+    label = "分派" if action == "assign" else "复核"
+    fails = [r for r in results if not r["ok"]]
+    return {"ok": failed == 0, "batch_op_id": op_id, "action": action,
+            "progress": {"total": len(results), "succeeded": succeeded,
+                         "failed": failed},
+            "results": results,
+            "detail": (f"批量{label}完成: 共 {len(results)} 项, 成功 {succeeded} 项, "
+                       f"失败 {failed} 项(成功项已生效不回滚)"
+                       + ("; 失败原因: " + "; ".join(
+                           f"{r.get('replay_id')}: {r['reason']}" for r in fails[:3])
+                          if fails else ""))}
+
+
+def _assign_one(session: Session, operator: str, assignee: str,
+                replay_id: str, reason: str | None) -> dict:
+    """分派单个任务, 返回逐项结果。重复分派(同人)幂等; 改派写历史行与事件。"""
+    task = session.get(ReplayTask, replay_id)
+    if task is None:
+        return {"replay_id": replay_id, "ok": False,
+                "reason": f"回放任务 {replay_id} 不存在"}
+    if task.status != "COMPLETED":
+        return {"replay_id": replay_id, "ok": False,
+                "reason": f"回放任务当前状态 {task.status}, "
+                          f"只有 COMPLETED 回放才能分派复核"}
+    if task.review_status == "CONFIRMED":
+        return {"replay_id": replay_id, "ok": False,
+                "reason": "回放已确认(CONFIRMED), 复核已锁定, 不能分派"}
+    if task.assignee == assignee:
+        return {"replay_id": replay_id, "ok": True, "already_assigned": True,
+                "assignee": assignee,
+                "reason": f"任务已分派给 {assignee}, 重复分派无副作用"}
+    old = task.assignee
+    task.assignee = assignee
+    task.updated_by = operator
+    session.add(ReplayAssignment(
+        task_id=task.id, assignee=assignee, operator=operator,
+        report_version=task.report_version,
+        reason=(reason[:500] if reason else None)))
+    add_event(session, task_id=task.id, event="review.assign", operator=operator,
+              reason=((f"复核任务分派给 {assignee}" if old is None
+                       else f"复核任务由 {old} 改派给 {assignee}")
+                      + (f": {reason}" if reason else "")),
+              detail={"from": old, "to": assignee,
+                      "report_version": task.report_version})
+    return {"replay_id": replay_id, "ok": True, "already_assigned": False,
+            "assignee": assignee,
+            "reason": (f"已分派给 {assignee}" if old is None
+                       else f"已由 {old} 改派给 {assignee}")}
+
+
+def do_batch_assign(session: Session, operator: str, assignee: str,
+                    replay_ids: list[str], reason: str | None,
+                    idempotency_key: str) -> dict:
+    """批量分派: 逐项独立提交, 成功项不回滚; 已确认/不存在/未完成任务逐项失败。"""
+    assignee = assignee.strip()
+    if not assignee:
+        raise ReplayStateError("复核人(assignee)不能为空")
+    results: list[dict] = []
+    for rid in replay_ids:
+        try:
+            r = _assign_one(session, operator, assignee, rid, reason)
+            session.commit()
+        except Exception as e:  # 防御: 单项异常不影响其他项
+            session.rollback()
+            r = {"replay_id": rid, "ok": False, "reason": f"分派时发生未预期错误: {e}"}
+        results.append(r)
+    return _finish_batch_op(session, action="assign", operator=operator,
+                            idempotency_key=idempotency_key, assignee=assignee,
+                            report_version=None, results=results)
+
+
+def do_batch_review(session: Session, operator: str, report_version: int,
+                    items: list[dict], idempotency_key: str) -> dict:
+    """批量提交复核结论: 所有项必须基于同一报告版本(body 级 report_version)。
+
+    逐项独立提交: 版本已变化/任务已确认/无权限(任务分派给他人)/步骤已有结论等
+    只使该项失败并记录原因, 已成功项保留不回滚。逐项复用单项复核的全部校验。
+    """
+    results: list[dict] = []
+    for item in items:
+        rid = item["replay_id"]
+        seq = item.get("step_seq")
+        try:
+            task = session.get(ReplayTask, rid)
+            if task is None:
+                raise ReplayNotFound(f"回放任务 {rid} 不存在")
+            r = do_submit_review(session, task, operator, seq, report_version,
+                                 item.get("verdict"), item.get("issue"),
+                                 item.get("fix_tags"))
+            session.commit()
+            results.append({"replay_id": rid, "step_seq": seq, "ok": True,
+                            "verdict": r["verdict"],
+                            "review_status": r["review_status"],
+                            "reason": r["detail"]})
+        except (ReplayNotFound, ReplayStateError) as e:
+            session.rollback()
+            results.append({"replay_id": rid, "step_seq": seq, "ok": False,
+                            "reason": str(e)})
+        except Exception as e:  # 防御: 单项异常(如并发唯一约束冲突)不影响其他项
+            session.rollback()
+            results.append({"replay_id": rid, "step_seq": seq, "ok": False,
+                            "reason": f"提交时发生未预期错误: {e}"})
+    return _finish_batch_op(session, action="review", operator=operator,
+                            idempotency_key=idempotency_key, assignee=None,
+                            report_version=report_version, results=results)
+
+
+def get_batch_op(session: Session, op_id: str) -> ReplayBatchOp:
+    op = session.get(ReplayBatchOp, op_id)
+    if op is None:
+        raise ReplayNotFound(f"批量操作 {op_id} 不存在")
+    return op
+
+
+# ---------- 待处理任务筛选(复核状态 / 业务分组 / 报告版本) ----------
+
+def _task_bizs(session: Session, task_id: str) -> list[str]:
+    """回放任务涉及的业务分组(经步骤批次关联; 批次被删的防御性跳过)。"""
+    batch_ids = [s.batch_id for s in _task_steps(session, task_id)]
+    if not batch_ids:
+        return []
+    rows = (session.query(MigrationBatch.biz)
+            .filter(MigrationBatch.id.in_(batch_ids)).all())
+    return sorted({r[0] for r in rows})
+
+
+def review_tasks_view(session: Session, review_status: str | None = None,
+                      biz: str | None = None,
+                      report_version: int | None = None) -> list[dict]:
+    """筛选进入复核流程(COMPLETED)的回放任务: 按复核状态、业务分组、报告版本过滤,
+    返回带分派人与业务分组的可分派任务列表。"""
+    q = session.query(ReplayTask).filter(ReplayTask.status == "COMPLETED")
+    if review_status:
+        q = q.filter(ReplayTask.review_status == review_status)
+    if report_version is not None:
+        q = q.filter(ReplayTask.report_version == report_version)
+    rows = q.order_by(ReplayTask.updated_at.desc(), ReplayTask.id).all()
+    out: list[dict] = []
+    for t in rows:
+        bizs = _task_bizs(session, t.id)
+        if biz and biz not in bizs:
+            continue
+        d = replay_to_dict(session, t, with_report=False)
+        d["bizs"] = bizs
+        out.append(d)
+    return out
 
 
 # ---------- 回放执行: 调度(并发闸门) + 步骤报告 ----------
@@ -1043,6 +1243,37 @@ def review_to_dict(rv: ReplayReview) -> dict:
     }
 
 
+def assignment_to_dict(a: ReplayAssignment) -> dict:
+    return {
+        "id": a.id,
+        "task_id": a.task_id,
+        "assignee": a.assignee,
+        "operator": a.operator,
+        "report_version": a.report_version,
+        "reason": a.reason,
+        "created_at": _dt(a.created_at),
+    }
+
+
+def batch_op_to_dict(op: ReplayBatchOp, *, with_results: bool = True) -> dict:
+    out = {
+        "id": op.id,
+        "action": op.action,
+        "operator": op.operator,
+        "assignee": op.assignee,
+        "report_version": op.report_version,
+        "progress": {"total": op.total, "succeeded": op.succeeded,
+                     "failed": op.failed},
+        "total": op.total,
+        "succeeded": op.succeeded,
+        "failed": op.failed,
+        "created_at": _dt(op.created_at),
+    }
+    if with_results:
+        out["results"] = list(op.results or [])
+    return out
+
+
 def review_summary(session: Session, task: ReplayTask) -> dict:
     """当前报告版本的复核进度汇总(列表/详情/状态接口共用)。"""
     reviews = _current_reviews(session, task.id, task.report_version)
@@ -1130,6 +1361,9 @@ def replay_to_dict(session: Session, task: ReplayTask, *,
     events = (session.query(ReplayTaskEvent)
               .filter(ReplayTaskEvent.task_id == task.id)
               .order_by(ReplayTaskEvent.id.desc()).limit(50).all())
+    assignments = (session.query(ReplayAssignment)
+                   .filter(ReplayAssignment.task_id == task.id)
+                   .order_by(ReplayAssignment.id.desc()).limit(10).all())
     return {
         "id": task.id,
         "plan_id": task.plan_id,
@@ -1147,6 +1381,8 @@ def replay_to_dict(session: Session, task: ReplayTask, *,
         "concurrency_limit": max_concurrency(),
         "created_by": task.created_by,
         "updated_by": task.updated_by,
+        "assignee": task.assignee,
+        "assignments": [assignment_to_dict(a) for a in assignments],
         "started_at": _dt(task.started_at),
         "finished_at": _dt(task.finished_at),
         "created_at": _dt(task.created_at),

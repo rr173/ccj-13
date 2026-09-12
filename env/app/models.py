@@ -345,6 +345,10 @@ class ReplayTask(Base):
     review_status = Column(String(16), nullable=False, default="UNREVIEWED", index=True)
     confirmed_by = Column(String(128), nullable=True)
     confirmed_at = Column(DateTime, nullable=True)
+    # 复核分派: 当前被分派的复核人(None=未分派, 任何人可提交);
+    # 已分派后只有被分派人能提交该任务的步骤结论。改派只改本列,
+    # 历史在 replay_assignments 只追加保留。重新打开(版本+1)不清空分派关系。
+    assignee = Column(String(128), nullable=True)
 
     task_steps = relationship("ReplayTaskStep", cascade="all, delete-orphan",
                               order_by="ReplayTaskStep.seq")
@@ -429,4 +433,43 @@ class ReplayReview(Base):
     issue = Column(String(500), nullable=True)         # 问题说明(FAIL 必填)
     fix_tags = Column(JSON, nullable=False, default=list)  # 修复标签
     operator = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class ReplayAssignment(Base):
+    """复核分派历史(只追加): 每次分派/改派落一行, 任务当前分派人在
+    replay_tasks.assignee; 历史永不修改, 在任务详情中可见, 重启后保留。"""
+
+    __tablename__ = "replay_assignments"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(32), ForeignKey("replay_tasks.id"),
+                     nullable=False, index=True)
+    assignee = Column(String(128), nullable=False)     # 被分派的复核人
+    operator = Column(String(128), nullable=False)     # 执行分派的管理员
+    report_version = Column(Integer, nullable=False)   # 分派时的报告版本
+    reason = Column(String(500), nullable=True)        # 分派说明(可选)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+# 批量操作类型: assign=批量分派, review=批量提交复核结论
+BATCH_OP_ACTIONS = ("assign", "review")
+
+
+class ReplayBatchOp(Base):
+    """批量复核/分派操作结果(持久化): 逐项成功/失败原因落库, 服务重启后仍可查询;
+    idempotency_key 唯一, 同一批量请求重放返回首次结果, 不产生二次副作用。"""
+
+    __tablename__ = "replay_batch_ops"
+
+    id = Column(String(32), primary_key=True)          # "BO" + 随机串
+    action = Column(String(16), nullable=False)        # assign | review
+    operator = Column(String(128), nullable=False)
+    idempotency_key = Column(String(128), nullable=False, unique=True)
+    assignee = Column(String(128), nullable=True)      # action=assign 时的目标复核人
+    report_version = Column(Integer, nullable=True)    # action=review 时基于的报告版本
+    total = Column(Integer, nullable=False, default=0)
+    succeeded = Column(Integer, nullable=False, default=0)
+    failed = Column(Integer, nullable=False, default=0)
+    results = Column(JSON, nullable=False, default=list)  # 逐项结果(含失败原因)
     created_at = Column(DateTime, default=_utcnow)

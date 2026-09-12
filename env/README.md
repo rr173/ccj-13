@@ -201,6 +201,35 @@ UNREVIEWED ──提交首条复核──▶ REVIEWING ──任一步骤 FAIL�
   "复核"面板逐步展示结论/问题说明/修复标签、提交表单、确认/重新打开操作与历史变更；
   回放任务区顶部实时列出待处理回放队列。
 
+## 批量复核与分派
+
+在单步复核之上，管理员可以**筛选待处理任务、批量分派复核人、批量提交步骤结论**；
+分派关系、分派历史、批量结果与待处理队列全部落库，服务重启后保留。
+
+- **筛选**：`GET /api/admin/review-tasks?review_status=&biz=&report_version=` 按复核状态、
+  业务分组（经回放步骤关联的批次 `biz`）、报告版本过滤进入复核流程（COMPLETED）的任务，
+  返回当前分派人、分派历史与复核进度，供批量操作选择。
+- **分派**：`POST /api/admin/review-batch/assign {assignee, replay_ids, reason?}` 把一批任务
+  分派给指定复核人。当前分派人记录在 `replay_tasks.assignee`，每次分派/改派落一行
+  `replay_assignments` 历史（只追加，含操作者、分派时报告版本、说明）并写 `review.assign` 事件，
+  任务详情可见。**重复分派（同人）幂等**（`already_assigned: true`，不产生新历史）；
+  已确认（CONFIRMED）/不存在/未完成的任务逐项失败。
+- **分派权限**：任务已分派后，**只有被分派的复核人能提交该任务的步骤结论**
+  （单项与批量提交同样校验，其他人 409）；未分派的任务不限制提交人。
+  重新打开（报告版本 +1）不清空分派关系。
+- **批量复核**：`POST /api/admin/review-batch/reviews {report_version, items:[{replay_id,
+  step_seq, verdict, issue?, fix_tags?}]}`。**所有项必须基于同一报告版本**——逐项校验任务
+  当前版本，版本已变化/任务已确认/无权限（任务分派给他人）/步骤已有结论等**逐项返回失败
+  原因，成功项独立提交不被回滚**；每项复用单项复核的全部校验。
+- **批量结果查询**：每次批量操作落一行 `replay_batch_ops`（总数/成功/失败 + 逐项结果）。
+  `GET /api/admin/review-batch/{id}` 返回逐项成功/失败原因；`GET /api/admin/review-batch`
+  返回最近批量操作列表（进度汇总）。
+- **幂等**：批量分派与批量复核都要求 `idempotency_key`（`replay.batch.*` 命名空间），
+  同一请求重放返回首次结果（`replayed: true`），不产生重复历史/重复结论；
+  同键不同请求体返回 409。
+- 页面"批量复核与分派"区：筛选条件 + 结果表格（勾选、分派人列）、批量分派表单、
+  批量复核表单、最近一次批量操作的进度条与逐项失败原因表、批量操作记录列表与按 ID 查询。
+
 ## 运行
 
 ```bash
@@ -252,6 +281,15 @@ POST /api/admin/replays/{id}/review/confirm  {operator, idempotency_key, report_
 POST /api/admin/replays/{id}/review/reopen   {operator, idempotency_key, reason?}
                                                       待处理回放重新打开(报告版本+1, 历史保留)
 GET  /api/admin/review-queue?status=PENDING           按复核状态查询回放(待处理队列)
+GET  /api/admin/review-tasks?review_status=&biz=&report_version=
+                                                      筛选待处理任务(状态/业务分组/报告版本)
+POST /api/admin/review-batch/assign   {operator, idempotency_key, assignee, replay_ids, reason?}
+                                                      批量分派复核人(逐项失败原因, 重复分派幂等)
+POST /api/admin/review-batch/reviews  {operator, idempotency_key, report_version,
+                                       items:[{replay_id, step_seq, verdict, issue?, fix_tags?}]}
+                                                      批量提交复核结论(同一报告版本, 逐项独立提交)
+GET  /api/admin/review-batch                          最近批量操作列表(进度汇总)
+GET  /api/admin/review-batch/{id}                     批量操作结果(逐项成功/失败原因)
 GET  /api/admin/audit?batch_id=&plan_id=           审计日志(可按批次或计划过滤)
 POST /api/records                                  旧结构写入(批次冻结期 423 / 批次切换后 410)
 POST /api/v2/records                               新结构写入(仅所属批次 DONE)
@@ -266,7 +304,7 @@ GET  /api/records/{id}/compare                     批次冻结窗内双读比�
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 78 个用例:
+python3 -m pytest tests/ -q   # 89 个用例:
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
 # 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
@@ -288,4 +326,8 @@ python3 -m pytest tests/ -q   # 78 个用例:
 #           过期版本冲突不覆盖新结论/同版本同步骤重复结论拒绝/同键幂等重放不产生重复结论/
 #           未全部 PASS 与待处理时确认被拒/非 COMPLETED 回放复核被拒/非 SUCCESS 步骤与未知步骤校验/
 #           重启后复核状态·历史·待处理队列保留/按状态查询待处理回放/状态与详情接口带复核进度
+# 批量复核与分派(11): 按状态/业务分组/报告版本筛选待处理任务/批量分派与历史保留(改派追加)/
+#           重复分派幂等/已确认与不存在任务逐项失败/分派后仅被分派人可提交(单项+批量)/
+#           批量复核逐项失败(版本变化·已确认·无权限)且成功项不回滚/同一报告版本约束/
+#           批量分派与批量提交同键幂等重放/批量结果查询接口/重启后分派关系·批量结果·队列保留
 ```

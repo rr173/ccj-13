@@ -146,6 +146,54 @@
 </div>
 
 <div class="card">
+  <b>批量复核与分派</b>（按复核状态 / 业务分组 / 报告版本筛选待处理任务; 批量分派复核人、批量提交步骤结论;
+  逐项独立提交, 成功项不回滚, 失败项逐项给出原因）
+  <div style="margin:8px 0">
+    复核状态
+    <select id="bqStatus">
+      <option value="PENDING" selected>待处理(PENDING)</option>
+      <option value="UNREVIEWED">未复核(UNREVIEWED)</option>
+      <option value="REVIEWING">复核中(REVIEWING)</option>
+      <option value="CONFIRMED">已确认(CONFIRMED)</option>
+      <option value="">全部</option>
+    </select>
+    业务分组 <input id="bqBiz" size="10" placeholder="如 订单">
+    报告版本 <input id="bqVersion" type="number" min="1" style="width:70px" placeholder="全部">
+    <button onclick="queryReviewTasks()">查询</button>
+  </div>
+  <table>
+    <thead><tr><th><input type="checkbox" id="bqAll" onclick="bqToggleAll(this)"></th>
+      <th>任务</th><th>计划</th><th>业务分组</th><th>复核状态</th><th>报告版本</th>
+      <th>复核进度</th><th>分派人</th></tr></thead>
+    <tbody id="bqRows"><tr><td colspan="8" class="muted">点击"查询"加载待处理任务</td></tr></tbody>
+  </table>
+  <div style="margin:8px 0">
+    <b>批量分派</b>: 复核人 <input id="baAssignee" size="12" placeholder="复核人账号">
+    说明 <input id="baReason" size="16" placeholder="可选, 落分派历史">
+    <button onclick="batchAssign()">分派选中任务</button>
+    <span class="muted">已分派任务只能由被分派人提交复核结论; 重复分派幂等, 改派保留历史</span>
+  </div>
+  <div style="margin:8px 0">
+    <b>批量复核</b>: 报告版本 <input id="brVersion" type="number" min="1" value="1" style="width:60px">
+    步骤 seq <input id="brStep" type="number" min="1" value="1" style="width:60px">
+    结论 <select id="brVerdict"><option value="PASS">PASS 通过</option><option value="FAIL">FAIL 不通过</option></select>
+    问题说明 <input id="brIssue" size="14" placeholder="FAIL 时必填">
+    修复标签 <input id="brTags" size="12" placeholder="逗号分隔">
+    <button onclick="batchReview()">对选中任务提交</button>
+    <span class="muted">批量项必须同属一个报告版本; 版本变化/已确认/无权限的任务逐项失败</span>
+  </div>
+  <div id="bqMsg" class="msg"></div>
+  <div id="bqResult"></div>
+  <div style="margin-top:10px">
+    <b>批量操作记录</b>
+    <button class="plain" onclick="loadBatchOps()">刷新</button>
+    按 ID 查询 <input id="bqOpId" size="16" placeholder="BO...">
+    <button class="plain" onclick="queryBatchOp()">查询结果</button>
+    <div id="bqOps" style="margin-top:4px"></div>
+  </div>
+</div>
+
+<div class="card">
   <b>写入探测</b>（批次内冻结拒写 / 切换后旧路径关闭; 批次外正常读写）:
   <input id="wId" type="number" value="1" style="width:70px">
   <input id="wName" value="demo" size="10">
@@ -684,6 +732,14 @@ function renderReplays(replays) {
     const canResume = r.status === 'PAUSED';
     const canCancel = ['QUEUED', 'RUNNING', 'PAUSED'].includes(r.status);
     const rv = r.review || {};
+    const assignHist = (r.assignments || []).slice(0, 3).map(a =>
+      `${escapeHtml(a.assignee)}<span class="muted">(by ${escapeHtml(a.operator)} · v${a.report_version})</span>`
+    ).join(' → ');
+    const assignLine = r.status === 'COMPLETED' ? `
+      <div style="margin:4px 0">分派人:
+        ${r.assignee ? `<b>${escapeHtml(r.assignee)}</b>` : '<span class="muted">未分派(任何人可提交复核)</span>'}
+        ${assignHist ? `<span class="muted"> · 分派历史: ${assignHist}</span>` : ''}
+      </div>` : '';
     const reviewLine = r.status === 'COMPLETED' ? `
       <div style="margin:4px 0">复核:
         <span class="badge RV_${rv.status}">${rvStatusText(rv.status)}</span>
@@ -711,6 +767,7 @@ function renderReplays(replays) {
           (批次状态差异 ${r.state_diff_count})</span>
       </div>
       ${reviewLine}
+      ${assignLine}
       ${r.failure_reason ? `<div class="err"><b>失败原因:</b> ${escapeHtml(r.failure_reason)}<br>
         <span class="muted">已完成步骤的报告保留, 未执行步骤已跳过</span></div>` : ''}
       ${r.last_error && r.last_error !== r.failure_reason
@@ -856,6 +913,138 @@ async function reopenReview(rid) {
   const { status, j } = await post(`/api/admin/replays/${rid}/review/reopen`,
     { operator: operator(), idempotency_key: idemKey(), reason: reason || null });
   await afterReviewAction(rid, status, j);
+}
+
+// ---------- 批量复核与分派 ----------
+
+let bqTasks = [];
+
+function showBqMsg(ok, text) {
+  const el = document.getElementById('bqMsg');
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+}
+
+async function queryReviewTasks() {
+  const p = new URLSearchParams();
+  const st = document.getElementById('bqStatus').value;
+  const biz = document.getElementById('bqBiz').value.trim();
+  const ver = document.getElementById('bqVersion').value;
+  if (st) p.set('review_status', st);
+  if (biz) p.set('biz', biz);
+  if (ver) p.set('report_version', ver);
+  const r = await fetch('/api/admin/review-tasks?' + p.toString());
+  const j = await r.json();
+  if (r.status !== 200) { showBqMsg(false, '查询被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j))); return; }
+  bqTasks = j;
+  document.getElementById('bqRows').innerHTML = j.map(t => {
+    const rv = t.review || {};
+    return `<tr>
+      <td><input type="checkbox" class="bq-sel" value="${t.id}"></td>
+      <td>${t.id}</td><td>${escapeHtml(t.plan_name)}</td>
+      <td>${(t.bizs || []).map(escapeHtml).join(', ') || '-'}</td>
+      <td><span class="badge RV_${rv.status}">${rvStatusText(rv.status)}</span></td>
+      <td>v${rv.report_version}</td>
+      <td>${rv.reviewed}/${rv.total} · 问题 ${rv.failed}</td>
+      <td>${t.assignee ? `<b>${escapeHtml(t.assignee)}</b>` : '<span class="muted">未分派</span>'}</td></tr>`;
+  }).join('') || '<tr><td colspan="8" class="muted">没有符合筛选条件的任务</td></tr>';
+  showBqMsg(true, `筛选到 ${j.length} 个任务`);
+}
+
+function bqToggleAll(box) {
+  document.querySelectorAll('.bq-sel').forEach(c => { c.checked = box.checked; });
+}
+
+function bqSelected() {
+  return Array.from(document.querySelectorAll('.bq-sel:checked')).map(c => c.value);
+}
+
+function renderBatchResult(j) {
+  const p = j.progress || {};
+  const rows = (j.results || []).map(r =>
+    `<tr><td>${r.replay_id || ''}</td><td>${r.step_seq ?? ''}</td>
+     <td>${r.ok ? '<span class="ok">成功</span>' : '<span class="err">失败</span>'}</td>
+     <td>${escapeHtml(r.reason || '')}${r.already_assigned ? ' <span class="muted">(幂等)</span>' : ''}</td></tr>`).join('');
+  document.getElementById('bqResult').innerHTML = `
+    <div style="margin-top:6px;border-top:1px dashed #ddd;padding-top:6px">
+      <b>批量${j.action === 'assign' ? '分派' : '复核'}结果</b>
+      <span class="muted">操作 ${j.batch_op_id || j.id} · 进度 ${p.succeeded}/${p.total} 成功
+        · 失败 <b class="${p.failed ? 'err' : 'ok'}">${p.failed}</b></span>
+      <div class="bar" style="width:240px;margin:4px 0"><div style="width:${p.total ? Math.round(100 * p.succeeded / p.total) : 0}%;background:${p.failed ? '#ef6c00' : '#2e7d32'}"></div></div>
+      ${rows ? `<table><thead><tr><th>任务</th><th>步骤</th><th>结果</th><th>说明/失败原因</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
+    </div>`;
+}
+
+async function batchAssign() {
+  const ids = bqSelected();
+  const assignee = document.getElementById('baAssignee').value.trim();
+  if (!ids.length) { showBqMsg(false, '请先勾选要分派的任务'); return; }
+  if (!assignee) { showBqMsg(false, '请填写复核人'); return; }
+  const { status, j } = await post('/api/admin/review-batch/assign',
+    { operator: operator(), idempotency_key: idemKey(), assignee,
+      replay_ids: ids, reason: document.getElementById('baReason').value.trim() || null });
+  if (status === 201) {
+    showBqMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+    renderBatchResult(j);
+  } else {
+    showBqMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  }
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function batchReview() {
+  const ids = bqSelected();
+  if (!ids.length) { showBqMsg(false, '请先勾选要提交复核的任务'); return; }
+  const version = parseInt(document.getElementById('brVersion').value);
+  const seq = parseInt(document.getElementById('brStep').value);
+  const verdict = document.getElementById('brVerdict').value;
+  const items = ids.map(rid => ({ replay_id: rid, step_seq: seq, verdict,
+    issue: document.getElementById('brIssue').value.trim() || null,
+    fix_tags: (document.getElementById('brTags').value || '')
+      .split(',').map(x => x.trim()).filter(x => x) }));
+  const { status, j } = await post('/api/admin/review-batch/reviews',
+    { operator: operator(), idempotency_key: idemKey(),
+      report_version: version, items });
+  if (status === 201) {
+    showBqMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+    renderBatchResult(j);
+  } else {
+    showBqMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  }
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function loadBatchOps() {
+  const rows = await (await fetch('/api/admin/review-batch?limit=20')).json();
+  document.getElementById('bqOps').innerHTML = rows.length ? `<table>
+    <thead><tr><th>操作</th><th>类型</th><th>操作者</th><th>对象</th><th>进度</th><th>时间</th><th></th></tr></thead>
+    <tbody>${rows.map(o => `<tr>
+      <td>${o.id}</td><td>${o.action === 'assign' ? '批量分派' : '批量复核'}</td>
+      <td>${escapeHtml(o.operator)}</td>
+      <td>${o.action === 'assign' ? escapeHtml(o.assignee || '') : 'v' + (o.report_version ?? '')}</td>
+      <td>${o.progress.succeeded}/${o.progress.total} 成功
+        ${o.progress.failed ? `<span class="err">· 失败 ${o.progress.failed}</span>` : ''}</td>
+      <td class="muted">${o.created_at || ''}</td>
+      <td><button class="plain" onclick="showBatchOp('${o.id}')">逐项结果</button></td></tr>`).join('')}
+    </tbody></table>` : '<span class="muted">尚无批量操作</span>';
+}
+
+async function showBatchOp(id) {
+  const j = await (await fetch('/api/admin/review-batch/' + id)).json();
+  renderBatchResult(j);
+  showBqMsg(j.failed === 0, `批量操作 ${j.id}: 共 ${j.progress.total} 项, 成功 ${j.progress.succeeded}, 失败 ${j.progress.failed}`);
+}
+
+async function queryBatchOp() {
+  const id = document.getElementById('bqOpId').value.trim();
+  if (!id) { showBqMsg(false, '请输入批量操作 ID'); return; }
+  const r = await fetch('/api/admin/review-batch/' + id);
+  const j = await r.json();
+  if (r.status !== 200) { showBqMsg(false, '查询失败: ' + ((j.detail && j.detail.reason) || JSON.stringify(j))); return; }
+  renderBatchResult(j);
+  showBqMsg(j.failed === 0, `批量操作 ${j.id}: 共 ${j.progress.total} 项, 成功 ${j.progress.succeeded}, 失败 ${j.progress.failed}`);
 }
 
 refresh();
