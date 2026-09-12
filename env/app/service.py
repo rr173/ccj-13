@@ -366,10 +366,16 @@ def batch_for_record(session: Session, record_id: int) -> MigrationBatch | None:
 
 
 def batch_progress(session: Session, batch: MigrationBatch) -> dict:
+    """回填进度始终以批次范围 [id_start, id_end] 内的旧表记录为基准:
+    total = 范围内旧表记录数; done = 其中在新表也存在的记录数。
+    旧表不存在的"多余"新表记录(如旧记录删除后的残留、误写入)不算已迁移,
+    否则会出现 done > total(例如 2/1); 这类记录由 compare_batch 作为差异报出并阻止切换。
+    """
     total = (session.query(RecordOld)
              .filter(_in_range(RecordOld.id, batch)).count())
-    done = (session.query(RecordNew)
-            .filter(_in_range(RecordNew.id, batch)).count())
+    done = (session.query(RecordOld.id)
+            .join(RecordNew, RecordNew.id == RecordOld.id)
+            .filter(_in_range(RecordOld.id, batch)).count())
     return {"done": done, "total": total}
 
 

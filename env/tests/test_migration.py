@@ -170,6 +170,39 @@ def test_diff_blocks_cutover(client):
     assert act(client, bid, "cutover", "k5").json()["ok"]
 
 
+def test_extra_new_record_does_not_inflate_progress(client):
+    """范围内多出一条旧表没有的新表记录时, 进度不得显示 done > total(例如 2/1):
+    done 只统计范围内旧记录中已回填的部分; 多余记录由差异机制报出并阻止切换。"""
+    mk_records(client, [1])                 # 旧表只有 id=1
+    bid = mk_batch(client, start=1, end=2)  # 批次范围 1..2
+    act(client, bid, "freeze", "k1")
+    assert act(client, bid, "validate", "k2").json()["ok"]
+    assert batch_view(client, bid)["progress"] == {"done": 1, "total": 1}
+    # 范围内多出一条记录(误写入/残留): 新表 id=2 在旧表没有对应行
+    from app.db import SessionLocal
+    from app.models import RecordNew
+    db = SessionLocal()
+    db.add(RecordNew(id=2, name="多余", email="x@x.com", tags=[], schema_version=2))
+    db.commit(); db.close()
+    # 修正前: done=2, total=1 -> 页面显示 2/1; 修正后多余记录不计入已完成
+    assert batch_view(client, bid)["progress"] == {"done": 1, "total": 1}
+    # 多余记录仍作为范围内差异阻止切换, 不会被静默生效
+    c = act(client, bid, "cutover", "k3").json()
+    assert c["ok"] is False
+    assert any(d["field"] == "__extra__" and d["record_id"] == 2 for d in c["diffs"])
+
+    # 回填后旧记录被删除的残留行同样不能抬高进度
+    mk_records(client, [10, 11, 12])
+    bid2 = mk_batch(client, biz="用户", start=10, end=12, key="kb2")
+    act(client, bid2, "freeze", "k4")
+    assert act(client, bid2, "validate", "k5").json()["ok"]
+    from app.models import RecordOld
+    db = SessionLocal()
+    db.query(RecordOld).filter_by(id=12).delete()
+    db.commit(); db.close()
+    assert batch_view(client, bid2)["progress"] == {"done": 2, "total": 2}
+
+
 def test_extra_record_scoping(client):
     """新表多余记录: 在批次范围内阻止切换; 在批次范围外不影响本批次。"""
     mk_records(client, range(1, 4))

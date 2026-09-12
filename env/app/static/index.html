@@ -101,7 +101,7 @@ async function refresh() {
   document.getElementById('aver').textContent = s.app_version;
   batchCache = Object.fromEntries(s.batches.map(b => [b.id, b]));
   document.getElementById('batches').innerHTML = s.batches.map(b => {
-    const p = b.progress, pct = p.total ? Math.round(100 * p.done / p.total) : 0;
+    const p = b.progress, pct = p.total ? Math.min(100, Math.round(100 * p.done / p.total)) : 0;
     const canFreeze = b.phase === 'NORMAL';
     const canValidate = ['FROZEN','VALIDATING','VALIDATED'].includes(b.phase);
     const canCutover = b.phase === 'VALIDATED';
