@@ -159,3 +159,17 @@ class ReviewBatchReview(BaseModel):
     idempotency_key: str = Field(min_length=1)
     report_version: int = Field(ge=1)              # 批量项必须同属该报告版本
     items: list[ReviewBatchReviewItem] = Field(min_length=1, max_length=200)
+
+
+# ---------- 回放证据归档 ----------
+
+class ArchiveCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    replay_id: str = Field(min_length=1)               # 已 COMPLETED 的回放任务
+    report_version: int = Field(ge=1)                 # 归档必须锁定的报告版本
+
+
+class ArchiveAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)

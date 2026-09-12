@@ -468,6 +468,18 @@ def _require_assignee(task: ReplayTask, operator: str) -> None:
             f"{operator} 不是被分派人, 无权提交该任务的复核结论")
 
 
+def _assert_not_archiving(session: Session, task: ReplayTask, action_desc: str) -> None:
+    """归档活动栅栏: 该回放存在活动归档(QUEUED/RUNNING/PAUSED)时, 复核结论、
+    确认、重新打开与分派等一切修改原回放/复核数据的操作都被拒绝。"""
+    from . import archives
+    active = archives.active_archive_for_replay(session, task.id)
+    if active is not None:
+        raise ReplayStateError(
+            f"回放任务 {task.id} 的归档任务 {active.id} 正在进行(状态 {active.status}, "
+            f"锁定报告版本 v{active.report_version}), {action_desc}被拒绝: "
+            f"归档期间不能修改原回放或复核数据; 请等待归档完成或取消该归档任务")
+
+
 def do_submit_review(session: Session, task: ReplayTask, operator: str,
                      step_seq: int, report_version: int, verdict: str,
                      issue: str | None, fix_tags: list[str] | None) -> dict:
@@ -478,6 +490,7 @@ def do_submit_review(session: Session, task: ReplayTask, operator: str,
     同一(版本, 步骤)只允许一条结论, 重复写入(不同幂等键)返回冲突, 不覆盖已有结论。
     """
     _require_completed(task, "提交复核结论")
+    _assert_not_archiving(session, task, "提交复核结论")
     if task.review_status == "CONFIRMED":
         raise ReplayStateError(
             f"回放任务 {task.id} 已确认(CONFIRMED), 复核已锁定, 不能再提交结论")
@@ -546,6 +559,7 @@ def do_confirm_review(session: Session, task: ReplayTask, operator: str,
         return {"ok": True, "already_in_state": True,
                 "detail": "回放已确认, 重复确认无副作用"}
     _require_completed(task, "确认")
+    _assert_not_archiving(session, task, "确认复核")
     _require_current_version(task, report_version)
     if task.review_status == "PENDING":
         raise ReplayStateError(
@@ -579,6 +593,7 @@ def do_reopen_review(session: Session, task: ReplayTask, operator: str,
                      reason: str | None) -> dict:
     """重新打开待处理回放: 报告版本 +1 进入新一轮复核, 旧版本结论保留为历史。"""
     _require_completed(task, "重新打开")
+    _assert_not_archiving(session, task, "重新打开复核")
     if task.review_status != "PENDING":
         raise ReplayStateError(
             f"回放任务 {task.id} 复核状态为 {task.review_status}, "
@@ -657,6 +672,13 @@ def _assign_one(session: Session, operator: str, assignee: str,
     if task is None:
         return {"replay_id": replay_id, "ok": False,
                 "reason": f"回放任务 {replay_id} 不存在"}
+    active = None
+    from . import archives
+    active = archives.active_archive_for_replay(session, replay_id)
+    if active is not None:
+        return {"replay_id": replay_id, "ok": False,
+                "reason": (f"回放任务的归档任务 {active.id} 正在进行(状态 {active.status}), "
+                           f"归档期间不能修改原回放或复核数据, 分派被拒绝")}
     if task.status != "COMPLETED":
         return {"replay_id": replay_id, "ok": False,
                 "reason": f"回放任务当前状态 {task.status}, "

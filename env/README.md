@@ -230,6 +230,42 @@ UNREVIEWED ──提交首条复核──▶ REVIEWING ──任一步骤 FAIL�
 - 页面"批量复核与分派"区：筛选条件 + 结果表格（勾选、分派人列）、批量分派表单、
   批量复核表单、最近一次批量操作的进度条与逐项失败原因表、批量操作记录列表与按 ID 查询。
 
+## 回放证据归档（不可变归档包）
+
+管理员可以为**已 COMPLETED 的回放**按**指定报告版本**生成不可变归档包。归档严格只读：
+绝不修改批次/计划/回放/复核/业务数据，只写 `replay_archive_*` 表与归档包文件；
+活动归档（QUEUED/RUNNING/PAUSED）期间，对应回放的复核提交/确认/重新打开/分派一律
+被拒绝（归档期间不能修改原回放或复核数据）。
+
+- **归档包内容**（确定性 zip，固定文件顺序与时间戳）：
+  - `metadata.json`：归档 id、指定报告版本、操作者、时间、摘要算法；
+  - `replay/task.json`：回放任务快照（报告版本、复核状态、确认人、差异汇总）；
+  - `replay/steps.json`：**全部步骤报告**（预期/实际状态、字段差异、批次状态差异、检查点证据）；
+  - `review/conclusions.json`：**指定版本逐步复核结论** + **全量历史版本结论**；
+  - `review/assignments.json`：**复核分派历史**（只追加）；
+  - `audit/summary.json`：**审计摘要**（计划级审计 + 每步批次 freeze/cutover 关键证据与计数）；
+  - `manifest.json`：逐文件大小与 sha256、包**内容摘要**（仿 git 风格：逐文件 sha256 与
+    文件名有序拼接后再 sha256）。内容摘要同时落库，供下载后离线比对。
+- **归档任务状态机**：`QUEUED`（排队等并发额度）→ `RUNNING` → `COMPLETED`（包不可变）；
+  `pause` 在归档单元边界停住（PAUSED），`resume` 重新排队（再次受并发闸门约束）；
+  `cancel` 终止不生成包；**版本冲突 / 缺失步骤 / 数据被删除 / 关键审计缺失 / 摘要不一致**
+  一律 `FAILED`，失败码（`version_conflict`/`missing_step`/`data_deleted`/
+  `audit_incomplete`/`digest_mismatch`/`package_missing`）、失败原因、已采集单元与事件流水
+  永久保留可查询。归档单元顺序：校验 → 逐步报告 → 复核结论 → 分派历史 → 审计摘要 → 打包，
+  每个单元产物先入 `staging` 提交（崩溃边界），重启后遗留 RUNNING 归档回到 QUEUED，
+  从首个未完成单元续跑。
+- **幂等**：创建/暂停/恢复/取消走 `archive.*` 幂等命名空间；同一（回放，报告版本）的重复
+  创建幂等返回已有归档（活动中或已完成），FAILED/CANCELED 后允许重新发起；
+  暂停/恢复/取消的同态重复调用无副作用，同键重放返回首次结果。
+- **并发**：同时 RUNNING 的归档不超过 `ARCHIVE_MAX_CONCURRENCY`（默认 2），其余排队
+  （Postgres 咨询锁串行认领，SQLite 写事务串行）。
+- **下载与校验**：`GET /api/admin/archives/{id}/download` 下载 zip；
+  `GET /api/admin/archives/{id}/verify` 回读包重算逐文件与内容摘要并比对——
+  摘要不一致或包文件被删时，归档明确置 FAILED 并保留失败记录（原包保留取证）。
+  包文件落在 `ARCHIVE_STORE_DIR`（默认 `./archive_store`，原子写：先 `.tmp` 再替换）。
+- 页面"回放证据归档"区：归档任务表显示进度条、当前归档单元、失败码与原因、内容摘要、
+  暂停/恢复/取消/下载/校验摘要/详情（包清单与事件流水）；回放卡片在归档期间显示冻结标记。
+
 ## 运行
 
 ```bash
@@ -290,6 +326,13 @@ POST /api/admin/review-batch/reviews  {operator, idempotency_key, report_version
                                                       批量提交复核结论(同一报告版本, 逐项独立提交)
 GET  /api/admin/review-batch                          最近批量操作列表(进度汇总)
 GET  /api/admin/review-batch/{id}                     批量操作结果(逐项成功/失败原因)
+POST /api/admin/archives            {operator, idempotency_key, replay_id, report_version}
+                                                      为已完成回放生成不可变证据归档并排队
+GET  /api/admin/archives                             归档任务列表(含失败/取消记录)
+GET  /api/admin/archives/{id}                        归档详情(进度/当前单元/失败原因/摘要/清单/事件)
+POST /api/admin/archives/{id}/pause|resume|cancel    {operator, idempotency_key}
+GET  /api/admin/archives/{id}/download?operator=     下载不可变归档包(zip)
+GET  /api/admin/archives/{id}/verify?operator=       重算摘要校验(不一致/包缺失 -> FAILED 并保留记录)
 GET  /api/admin/audit?batch_id=&plan_id=           审计日志(可按批次或计划过滤)
 POST /api/records                                  旧结构写入(批次冻结期 423 / 批次切换后 410)
 POST /api/v2/records                               新结构写入(仅所属批次 DONE)
@@ -304,7 +347,7 @@ GET  /api/records/{id}/compare                     批次冻结窗内双读比�
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 89 个用例:
+python3 -m pytest tests/ -q   # 109 个用例:
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
 # 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
@@ -330,4 +373,13 @@ python3 -m pytest tests/ -q   # 89 个用例:
 #           重复分派幂等/已确认与不存在任务逐项失败/分派后仅被分派人可提交(单项+批量)/
 #           批量复核逐项失败(版本变化·已确认·无权限)且成功项不回滚/同一报告版本约束/
 #           批量分派与批量提交同键幂等重放/批量结果查询接口/重启后分派关系·批量结果·队列保留
+# 归档(20): 非 COMPLETED/不存在回放拒绝/创建时归档版本冲突 409/创建同键幂等重放/
+#           完整归档包内容(元信息·任务·全步骤报告·复核结论含历史·分派历史·审计摘要·清单)/
+#           逐文件 sha256 与内容摘要校验通过/zip 下载/载荷摘要确定性/
+#           同(回放,版本)重复归档幂等回显(活动中+已完成)/暂停恢复取消同态与同键幂等/终态拒绝控制/
+#           取消保留记录不出包且可重新归档/暂停在单元边界从下一单元续跑/并发上限排队与放行/
+#           执行中版本冲突 version_conflict/步骤报告缺失 missing_step/批次删除 data_deleted/
+#           回放删除 data_deleted/篡改包摘要不一致 digest_mismatch 且失败留痕/包被删 package_missing/
+#           归档活动期间复核提交与分派被冻结/归档严格只读不改原报告/重启 RUNNING 复位续跑已采集单元不丢/
+#           status 汇总含归档与并发上限
 ```

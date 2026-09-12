@@ -8,17 +8,17 @@ from sqlalchemy.orm import Session
 from .db import Base, SessionLocal, engine
 from .models import (
     REVIEW_STATUSES, AuditLog, MigrationBatch, MigrationPlan, RecordNew,
-    RecordOld, ReplayBatchOp, ReplayCheckpoint, ReplayTask,
+    RecordOld, ReplayArchive, ReplayBatchOp, ReplayCheckpoint, ReplayTask,
 )
 from .plans import PlanWorker
 from .replay import ReplayWorker
+from . import archives, plans, replay, service
 from .schemas import (
-    AdminAction, BatchCreate, CheckpointCreate, PlanAction, PlanCreate,
-    PlanRejectAction, PlanWindowAction, RecordIn, RecoverAction, ReplayAction,
-    ReplayCreate, ReviewBatchAssign, ReviewBatchReview, ReviewConfirm,
-    ReviewReopen, ReviewSubmit,
+    AdminAction, ArchiveAction, ArchiveCreate, BatchCreate, CheckpointCreate,
+    PlanAction, PlanCreate, PlanRejectAction, PlanWindowAction, RecordIn,
+    RecoverAction, ReplayAction, ReplayCreate, ReviewBatchAssign,
+    ReviewBatchReview, ReviewConfirm, ReviewReopen, ReviewSubmit,
 )
-from . import plans, replay, service
 
 APP_VERSION = service.APP_VERSION
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -31,6 +31,7 @@ def _worker_enabled() -> bool:
 app = FastAPI(title="结构迁移切换服务(按业务分组批次)", version=APP_VERSION)
 worker = PlanWorker(poll_interval=float(os.getenv("PLAN_WORKER_POLL_INTERVAL", "0.5")))
 replay_worker = ReplayWorker()
+archive_worker = archives.ArchiveWorker()
 
 
 def get_db():
@@ -97,17 +98,23 @@ def startup():
         # 回放重启对账: 遗留 RUNNING 回放回到排队位置, 已完成步骤报告保留
         replay.boot_recover_replays(db)
         db.commit()
+        # 归档重启对账: 遗留 RUNNING 归档回到排队位置, 已完成单元产物保留
+        archives.boot_recover_archives(db)
+        db.commit()
+        archives.ensure_store_dir()
     finally:
         db.close()
     if _worker_enabled():
         worker.start()
         replay_worker.start()
+        archive_worker.start()
 
 
 @app.on_event("shutdown")
 def shutdown():
     worker.stop()
     replay_worker.stop()
+    archive_worker.stop()
 
 
 # ---------- 错误映射 ----------
@@ -132,6 +139,8 @@ def status(db: Session = Depends(get_db)):
                        .order_by(ReplayCheckpoint.created_at, ReplayCheckpoint.id).all())
     replay_rows = (db.query(ReplayTask)
                    .order_by(ReplayTask.created_at, ReplayTask.id).all())
+    archive_rows = (db.query(ReplayArchive)
+                    .order_by(ReplayArchive.created_at, ReplayArchive.id).all())
     return {
         "app_version": APP_VERSION,
         "batches": [service.batch_to_dict(db, b) for b in batches],
@@ -140,7 +149,10 @@ def status(db: Session = Depends(get_db)):
                         for c in checkpoint_rows],
         "replays": [replay.replay_to_dict(db, t, with_report=False)
                     for t in replay_rows],
+        "archives": [archives.archive_to_dict(db, a, with_events=False)
+                     for a in archive_rows],
         "replay_concurrency": replay.max_concurrency(),
+        "archive_concurrency": archives.max_concurrency(),
     }
 
 
@@ -579,6 +591,117 @@ def get_batch_op(op_id: str, db: Session = Depends(get_db)):
     if op is None:
         _replay_not_found(Exception(f"批量操作 {op_id} 不存在"))
     return replay.batch_op_to_dict(op)
+
+
+# ---------- 回放证据归档(不可变归档包: 版本/步骤报告/复核结论/分派历史/审计摘要 + 摘要) ----------
+
+def _archive_not_found(e: Exception):
+    raise HTTPException(status_code=404, detail={
+        "error": "archive_not_found", "reason": str(e)})
+
+
+def _archive_conflict(e: Exception):
+    raise HTTPException(status_code=409, detail={
+        "error": "archive_conflict", "reason": str(e)})
+
+
+def _run_archive(db: Session, action: str, body, fn, archive_id: str | None = None):
+    try:
+        result, replayed = archives.run_archive_action(
+            db, action=action, operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            archive_id=archive_id, fn=fn)
+    except archives.ArchiveNotFound as e:
+        db.rollback()
+        _archive_not_found(e)
+    except archives.ArchiveStateError as e:
+        db.rollback()
+        _archive_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/archives", status_code=201)
+def create_archive(body: ArchiveCreate, db: Session = Depends(get_db)):
+    """为已 COMPLETED 回放按指定报告版本生成不可变证据归档并排队。
+    回放不存在 -> 404; 回放未完成/指定版本与当前报告版本冲突 -> 409;
+    同一(回放,版本)重复归档幂等返回已有归档(活动中/已完成)。"""
+    return _run_archive(db, "create", body,
+                       lambda s, _a: archives.do_create_archive(
+                           s, _a, body.operator, body.replay_id, body.report_version))
+
+
+@app.get("/api/admin/archives")
+def list_archives(db: Session = Depends(get_db)):
+    """归档任务列表(含排队/执行中/暂停/失败记录/已完成归档, 重启后仍可查询)。"""
+    rows = (db.query(ReplayArchive)
+            .order_by(ReplayArchive.created_at, ReplayArchive.id).all())
+    return [archives.archive_to_dict(db, a, with_events=False) for a in rows]
+
+
+@app.get("/api/admin/archives/{archive_id}")
+def get_archive(archive_id: str, db: Session = Depends(get_db)):
+    """归档详情: 进度、当前归档单元、失败原因、摘要、清单与事件流水。"""
+    a = db.get(ReplayArchive, archive_id)
+    if a is None:
+        _archive_not_found(Exception(f"归档任务 {archive_id} 不存在"))
+    return archives.archive_to_dict(db, a)
+
+
+@app.post("/api/admin/archives/{archive_id}/pause")
+def pause_archive(archive_id: str, body: ArchiveAction, db: Session = Depends(get_db)):
+    """暂停归档: 在当前归档单元边界停住; 重复暂停幂等。"""
+    return _run_archive(db, "pause", body,
+                       lambda s, a: archives.do_pause(s, a, body.operator), archive_id)
+
+
+@app.post("/api/admin/archives/{archive_id}/resume")
+def resume_archive(archive_id: str, body: ArchiveAction, db: Session = Depends(get_db)):
+    """恢复归档: 重新排队(再次受并发闸门约束), 从首个未完成单元续跑; 重复恢复幂等。"""
+    return _run_archive(db, "resume", body,
+                       lambda s, a: archives.do_resume(s, a, body.operator), archive_id)
+
+
+@app.post("/api/admin/archives/{archive_id}/cancel")
+def cancel_archive(archive_id: str, body: ArchiveAction, db: Session = Depends(get_db)):
+    """取消归档: 不生成归档包, 已采集单元与任务记录保留; 重复取消幂等。"""
+    return _run_archive(db, "cancel", body,
+                       lambda s, a: archives.do_cancel(s, a, body.operator), archive_id)
+
+
+@app.get("/api/admin/archives/{archive_id}/download")
+def download_archive(archive_id: str, operator: str = "system",
+                     db: Session = Depends(get_db)):
+    """下载不可变归档包(zip)。包不存在(被外部删除) -> 404 并记录失败。"""
+    a = db.get(ReplayArchive, archive_id)
+    if a is None:
+        _archive_not_found(Exception(f"归档任务 {archive_id} 不存在"))
+    try:
+        path = archives.package_path_for_download(db, a, operator)
+    except archives.ArchiveNotFound as e:
+        db.rollback()
+        _archive_not_found(e)
+    except archives.ArchiveStateError as e:
+        db.rollback()
+        _archive_conflict(e)
+    return FileResponse(
+        path, media_type="application/zip",
+        filename=f"replay-archive-{a.id}-v{a.report_version}.zip")
+
+
+@app.get("/api/admin/archives/{archive_id}/verify")
+def verify_archive(archive_id: str, operator: str = "system",
+                   db: Session = Depends(get_db)):
+    """重算归档包逐文件摘要与内容摘要并与记录比对; 摘要不一致/包缺失时
+    归档明确置为 FAILED 并保留失败记录, 返回中 valid=false 与逐项原因。"""
+    a = db.get(ReplayArchive, archive_id)
+    if a is None:
+        _archive_not_found(Exception(f"归档任务 {archive_id} 不存在"))
+    try:
+        return archives.verify_archive(db, a, operator)
+    except archives.ArchiveStateError as e:
+        db.rollback()
+        _archive_conflict(e)
 
 
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------

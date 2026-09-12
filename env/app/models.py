@@ -473,3 +473,77 @@ class ReplayBatchOp(Base):
     failed = Column(Integer, nullable=False, default=0)
     results = Column(JSON, nullable=False, default=list)  # 逐项结果(含失败原因)
     created_at = Column(DateTime, default=_utcnow)
+
+
+# ---------- 回放证据归档 ----------
+# 归档任务状态机(与回放任务同构):
+#   QUEUED(排队, 等待并发额度) --claim--> RUNNING --pause(单元边界)--> PAUSED --resume--> QUEUED
+#      |                                     |
+#      +--cancel--> CANCELED(终态)           +--全部归档单元完成--> COMPLETED(终态, 包不可变)
+#                                            +--版本冲突/缺失步骤/数据被删/摘要不一致--> FAILED(终态)
+# FAILED/CANCELED 记录永久保留可查询; COMPLETED 归档包可下载、可重新校验摘要。
+ARCHIVE_STATUSES = ("QUEUED", "RUNNING", "PAUSED", "CANCELED", "COMPLETED", "FAILED")
+ARCHIVE_TERMINAL_STATUSES = ("CANCELED", "COMPLETED", "FAILED")
+ARCHIVE_ACTIVE_STATUSES = ("QUEUED", "RUNNING", "PAUSED")
+
+
+class ReplayArchive(Base):
+    """回放证据归档任务: 为已 COMPLETED 的回放按指定报告版本生成不可变归档包。
+
+    包内必须包含: 指定报告版本、逐步步骤报告、该版本复核结论(含全量历史)、
+    复核分派历史与审计摘要, 并计算可校验的内容摘要(sha256, 逐文件摘要合成)。
+    归档严格只读: 绝不修改回放/复核/业务数据, 只写 replay_archive_* 表与归档包文件;
+    归档活动期间(QUEUED/RUNNING/PAUSED)对应回放的复核写入/分派/重新打开被拒绝。
+    同一(回放, 报告版本)的重复归档请求幂等返回已有归档(活动中或已完成)。
+    并发执行数受 ARCHIVE_MAX_CONCURRENCY 限制, 超出排队; 重启后任务/失败记录/
+    已完成归档均可查询, 遗留 RUNNING 任务回到排队位置续跑。"""
+
+    __tablename__ = "replay_archives"
+
+    id = Column(String(32), primary_key=True)          # "A" + 随机串
+    # 刻意不加 FK: 回放被删除是必须能观测并明确失败(data_deleted)的场景
+    replay_id = Column(String(32), nullable=False, index=True)
+    plan_id = Column(String(32), nullable=True)
+    plan_name = Column(String(200), nullable=True)
+    checkpoint_id = Column(String(32), nullable=True)
+    report_version = Column(Integer, nullable=False)   # 归档指定(锁定)的报告版本
+    status = Column(String(16), nullable=False, default="QUEUED", index=True)
+    # 进度按归档单元计: 1(校验) + N(逐步报告) + 复核结论 + 分派历史 + 审计摘要 + 打包
+    total_units = Column(Integer, nullable=False, default=0)
+    completed_units = Column(Integer, nullable=False, default=0)
+    current_stage = Column(String(256), nullable=True)  # 当前归档单元(页面"当前步骤")
+    # 归档单元产物的暂存(打包后清空); 崩溃/重启后按已提交单元续跑, 不重复副作用
+    staging = Column(JSON, nullable=True)
+    manifest = Column(JSON, nullable=True)              # 包清单(逐文件大小/摘要/总摘要)
+    content_digest = Column(String(64), nullable=True)  # 包内容摘要(sha256 hex)
+    digest_algorithm = Column(String(16), nullable=False, default="sha256")
+    package_path = Column(String(500), nullable=True)   # 归档包(zip)落盘路径
+    package_size = Column(Integer, nullable=True)
+    failure_code = Column(String(48), nullable=True)    # 机器可读失败码
+    failure_reason = Column(String(500), nullable=True)  # FAILED 终态原因(页面展示)
+    created_by = Column(String(128), nullable=False)
+    updated_by = Column(String(128), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    events = relationship("ReplayArchiveEvent", cascade="all, delete-orphan",
+                          order_by="desc(ReplayArchiveEvent.id)")
+
+
+class ReplayArchiveEvent(Base):
+    """归档任务事件流水(只追加): 创建/排队/认领/暂停/恢复/取消/单元进度/
+    完成/失败/重启对账/下载/校验。归档不写回放事件表与业务审计表。"""
+
+    __tablename__ = "replay_archive_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=_utcnow)
+    archive_id = Column(String(32), ForeignKey("replay_archives.id"),
+                        nullable=False, index=True)
+    stage = Column(String(128), nullable=True)          # 发生时的归档单元
+    event = Column(String(32), nullable=False)
+    operator = Column(String(128), nullable=False)
+    reason = Column(String(500), nullable=True)
+    detail = Column(JSON, nullable=True)

@@ -194,6 +194,28 @@
 </div>
 
 <div class="card">
+  <b>回放证据归档</b>（为已完成回放按指定报告版本生成不可变归档包: 报告版本 + 步骤报告 +
+  复核结论 + 分派历史 + 审计摘要, 逐文件 sha256 合成内容摘要; 归档期间原回放/复核数据冻结不可修改）
+  <div style="margin:8px 0">
+    <span class="muted">并发上限: 同时执行中的归档任务不超过 <b id="archiveConcurrency">-</b> 个, 超出排队</span>
+  </div>
+  <div>
+    <b>创建归档</b>:
+    <select id="arReplay" style="max-width:360px"></select>
+    报告版本 <input id="arVersion" type="number" min="1" value="1" style="width:70px">
+    <button onclick="createArchive()">生成不可变归档包</button>
+    <span class="muted">只能基于回放当前报告版本归档; 同(回放,版本)重复请求幂等返回已有归档</span>
+  </div>
+  <div id="archiveMsg" class="msg"></div>
+  <b style="display:block;margin:10px 0 4px">归档任务</b>
+  <table>
+    <thead><tr><th>归档</th><th>回放/计划</th><th>版本</th><th>状态</th><th>进度(归档单元)</th>
+      <th>当前单元</th><th>摘要/包</th><th>失败原因</th><th>操作者/时间</th><th>操作</th></tr></thead>
+    <tbody id="archives"></tbody>
+  </table>
+</div>
+
+<div class="card">
   <b>写入探测</b>（批次内冻结拒写 / 切换后旧路径关闭; 批次外正常读写）:
   <input id="wId" type="number" value="1" style="width:70px">
   <input id="wName" value="demo" size="10">
@@ -229,6 +251,11 @@ function operator() { return document.getElementById('operator').value; }
 async function refresh() {
   const s = await (await fetch('/api/status')).json();
   document.getElementById('aver').textContent = s.app_version;
+  lastArchivesByReplay = {};
+  for (const a of (s.archives || [])) {
+    if (['QUEUED', 'RUNNING', 'PAUSED'].includes(a.status))
+      (lastArchivesByReplay[a.replay_id] = lastArchivesByReplay[a.replay_id] || []).push(a);
+  }
   batchCache = Object.fromEntries(s.batches.map(b => [b.id, b]));
   document.getElementById('batches').innerHTML = s.batches.map(b => {
     const p = b.progress, pct = p.total ? Math.min(100, Math.round(100 * p.done / p.total)) : 0;
@@ -258,6 +285,8 @@ async function refresh() {
   renderCheckpoints(s.checkpoints || []);
   renderReplays(s.replays || []);
   renderReviewQueue();
+  renderArchiveControls(s);
+  renderArchives(s.archives || []);
   const rows = await (await fetch('/api/admin/audit?limit=50')).json();
   document.getElementById('audit').innerHTML = rows.map(r =>
     `<tr><td>${r.ts||''}</td><td>${r.batch_id||r.plan_id||''}</td><td>${r.operator}</td><td>${r.action}</td>
@@ -768,6 +797,12 @@ function renderReplays(replays) {
       </div>
       ${reviewLine}
       ${assignLine}
+      ${(() => {
+        const act = (lastArchivesByReplay[r.id] || []);
+        return act.length ? `<div class="WOUT" style="margin:4px 0">🔒 归档中:
+          ${act.map(x => `${x.id}(v${x.report_version}, ${x.status})`).join('; ')}
+          — 复核/分派已冻结, 归档完成或取消后恢复</div>` : '';
+      })()}
       ${r.failure_reason ? `<div class="err"><b>失败原因:</b> ${escapeHtml(r.failure_reason)}<br>
         <span class="muted">已完成步骤的报告保留, 未执行步骤已跳过</span></div>` : ''}
       ${r.last_error && r.last_error !== r.failure_reason
@@ -1045,6 +1080,136 @@ async function queryBatchOp() {
   if (r.status !== 200) { showBqMsg(false, '查询失败: ' + ((j.detail && j.detail.reason) || JSON.stringify(j))); return; }
   renderBatchResult(j);
   showBqMsg(j.failed === 0, `批量操作 ${j.id}: 共 ${j.progress.total} 项, 成功 ${j.progress.succeeded}, 失败 ${j.progress.failed}`);
+}
+
+// ---------- 回放证据归档 ----------
+
+let lastArchivesByReplay = {};
+
+function archiveStageText(st) {
+  if (!st) return '-';
+  if (st.startsWith('step:')) return '固化步骤 seq=' + st.slice(5) + ' 报告';
+  return { validate: '校验证据完整性', reviews: '固化复核结论',
+           assignments: '固化分派历史', audit_summary: '生成审计摘要',
+           package: '打包并计算摘要' }[st] || st;
+}
+
+function showArchiveMsg(ok, text) {
+  const el = document.getElementById('archiveMsg');
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+}
+
+function renderArchiveControls(s) {
+  document.getElementById('archiveConcurrency').textContent = s.archive_concurrency ?? '-';
+  const replays = (s.replays || []).filter(r => r.status === 'COMPLETED');
+  const prev = document.getElementById('arReplay').value;
+  document.getElementById('arReplay').innerHTML = replays.map(r =>
+    `<option value="${r.id}" ${r.id===prev?'selected':''}>${r.id} · ${escapeHtml(r.plan_name)} (当前 v${r.review.report_version}, ${rvStatusText(r.review.status)})</option>`
+  ).join('') || '<option value="">(没有已完成的回放)</option>';
+}
+
+function renderArchives(archives) {
+  document.getElementById('archives').innerHTML = archives.map(a => {
+    const p = a.progress, pct = p.total ? Math.round(100 * p.done / p.total) : 0;
+    const active = ['QUEUED', 'RUNNING', 'PAUSED'].includes(a.status);
+    const canPause = ['QUEUED', 'RUNNING'].includes(a.status);
+    const canResume = a.status === 'PAUSED';
+    const canCancel = active;
+    const canPackage = a.status === 'COMPLETED'
+      || (a.status === 'FAILED' && a.failure_code === 'digest_mismatch' && a.package_available);
+    const digest = a.content_digest
+      ? `<code style="font-size:11px">${a.digest_algorithm}:${a.content_digest.slice(0, 20)}…</code>`
+      : '<span class="muted">-</span>';
+    return `<tr>
+      <td>${a.id}</td>
+      <td>${a.replay_id}<div class="muted">${escapeHtml(a.plan_name || '')} · ${a.plan_id || ''}</div></td>
+      <td>v${a.report_version}</td>
+      <td><span class="badge ${a.status}">${a.status}</span></td>
+      <td><div class="bar" style="width:120px"><div style="width:${pct}%;background:#6a1b9a"></div></div>
+        <span class="muted">${p.progress.done}/${p.progress.total}</span></td>
+      <td>${archiveStageText(a.current_stage)}</td>
+      <td>${digest}<div class="muted">${a.package_size ? (a.package_size + ' 字节') : ''}
+        ${a.package_available ? ' · 包存在' : (a.status==='COMPLETED' ? ' · <span class="err">包缺失</span>' : '')}</div></td>
+      <td>${a.failure_reason
+        ? `<span class="err">${escapeHtml(a.failure_reason)}</span>`
+        : '<span class="ok">-</span>'}</td>
+      <td>${escapeHtml(a.created_by)}<div class="muted">${a.created_at||''}</div></td>
+      <td style="white-space:nowrap">
+        <button class="plain" ${canPause?'':'disabled'} onclick="archiveAct('${a.id}','pause')">暂停</button>
+        <button ${canResume?'':'disabled'} onclick="archiveAct('${a.id}','resume')">恢复</button>
+        <button class="danger" ${canCancel?'':'disabled'} onclick="archiveAct('${a.id}','cancel')">取消</button>
+        <button class="plain" ${canPackage?'':'disabled'} onclick="downloadArchive('${a.id}')">下载</button>
+        <button class="plain" ${canPackage?'':'disabled'} onclick="verifyArchive('${a.id}')">校验摘要</button>
+        <button class="plain" onclick="toggleArchiveDetail('${a.id}', this)">详情</button>
+      </td></tr>
+      <tr id="ard-${a.id}-row" style="display:none"><td colspan="10" id="ard-${a.id}"></td></tr>`;
+  }).join('') || '<tr><td colspan="10" class="muted">尚无归档任务</td></tr>';
+}
+
+async function createArchive() {
+  const replay_id = document.getElementById('arReplay').value;
+  const report_version = parseInt(document.getElementById('arVersion').value);
+  if (!replay_id) { showArchiveMsg(false, '请先选择一个已完成的回放'); return; }
+  const { status, j } = await post('/api/admin/archives',
+    { operator: operator(), idempotency_key: idemKey(), replay_id, report_version });
+  if (status === 201) {
+    showArchiveMsg(true, (j.replayed ? '[幂等重放] ' : '')
+      + (j.already_existing ? '[已有归档, 幂等返回] ' : '') + j.detail);
+  } else {
+    showArchiveMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  }
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function archiveAct(aid, name) {
+  const { status, j } = await post(`/api/admin/archives/${aid}/${name}`,
+    { operator: operator(), idempotency_key: idemKey() });
+  if (status === 200) showArchiveMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showArchiveMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+function downloadArchive(aid) {
+  const op = encodeURIComponent(operator());
+  window.location.href = `/api/admin/archives/${aid}/download?operator=${op}`;
+}
+
+async function verifyArchive(aid) {
+  const r = await fetch(`/api/admin/archives/${aid}/verify?operator=${encodeURIComponent(operator())}`);
+  const j = await r.json();
+  if (r.status !== 200) { showArchiveMsg(false, '校验请求被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j))); refresh(); return; }
+  if (j.valid) {
+    showArchiveMsg(true, `归档 ${aid} 摘要校验通过: ${j.digest_algorithm}:${j.content_digest}`);
+  } else {
+    showArchiveMsg(false, `归档 ${aid} 摘要不一致/包缺失, 已标记 FAILED:\n - ` + (j.issues || []).join('\n - '));
+  }
+  refresh();
+}
+
+async function toggleArchiveDetail(aid, btn) {
+  const row = document.getElementById('ard-' + aid + '-row');
+  const box = document.getElementById('ard-' + aid);
+  if (row.style.display !== 'none') { row.style.display = 'none'; btn.textContent = '详情'; return; }
+  const a = await (await fetch('/api/admin/archives/' + aid)).json();
+  const fileRows = Object.entries((a.manifest && a.manifest.files) || {}).map(([name, m]) =>
+    `<tr><td>${name}</td><td>${m.size}</td><td><code style="font-size:11px">${m[a.digest_algorithm]}</code></td></tr>`
+  ).join('');
+  box.innerHTML = `
+    <div class="muted">归档单元: ${a.progress.done}/${a.progress.total} · 创建 ${a.created_by} ${a.created_at||''}
+      ${a.started_at ? '· 开始 ' + a.started_at : ''} ${a.finished_at ? '· 结束 ' + a.finished_at : ''}</div>
+    ${fileRows ? `<b>包清单</b><table style="margin-top:4px">
+      <thead><tr><th>文件</th><th>字节</th><th>sha256</th></tr></thead><tbody>${fileRows}</tbody></table>` : ''}
+    <b style="display:block;margin-top:6px">事件流水</b>
+    <table><thead><tr><th>时间</th><th>单元</th><th>事件</th><th>操作者</th><th>原因/明细</th></tr></thead>
+    <tbody>${(a.events || []).map(e => `<tr><td>${e.ts||''}</td><td>${archiveStageText(e.stage)}</td>
+      <td>${e.event}</td><td>${escapeHtml(e.operator)}</td>
+      <td>${e.reason ? escapeHtml(e.reason) : (e.detail ? '<span class="muted">'+escapeHtml(JSON.stringify(e.detail))+'</span>' : '')}</td></tr>`).join('')}
+    </tbody></table>`;
+  row.style.display = '';
+  btn.textContent = '收起';
 }
 
 refresh();
