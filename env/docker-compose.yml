@@ -1,0 +1,31 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: migration
+      POSTGRES_PASSWORD: migration
+      POSTGRES_DB: migration
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U migration"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg://migration:migration@db:5432/migration
+      APP_VERSION: ${APP_VERSION:-1.0.0}
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    # 单副本是设计约束: 迁移协调依赖数据库行锁+epoch 栅栏,
+    # 多副本同样安全(栅栏在库里), 但无需扩容 —— 冻结窗内写流量本来就被拒绝。
+    restart: unless-stopped
+
+volumes:
+  pgdata:

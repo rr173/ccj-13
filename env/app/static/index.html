@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>结构迁移切换控制台</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; color: #222; }
+  h1 { font-size: 20px; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; color: #fff; font-weight: 600; }
+  .NORMAL { background: #2e7d32; } .FROZEN { background: #ef6c00; }
+  .VALIDATING { background: #1565c0; } .VALIDATED { background: #6a1b9a; }
+  .DONE { background: #37474f; }
+  button { padding: 8px 14px; margin-right: 8px; border: 0; border-radius: 6px;
+           background: #1565c0; color: #fff; cursor: pointer; }
+  button.danger { background: #c62828; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  input { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; margin-right: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #e0e0e0; padding: 4px 8px; text-align: left; vertical-align: top; }
+  th { background: #f5f5f5; }
+  pre { background: #fafafa; border: 1px solid #eee; padding: 8px; overflow: auto; font-size: 12px; }
+  .msg { margin-top: 8px; font-size: 13px; white-space: pre-wrap; }
+  .err { color: #c62828; } .ok { color: #2e7d32; }
+</style>
+</head>
+<body>
+<h1>结构迁移切换控制台</h1>
+
+<div class="card">
+  <div>当前阶段: <span id="phase" class="badge">…</span>
+    &nbsp; epoch: <b id="epoch">-</b>
+    &nbsp; 生效结构: <b id="schema">-</b>
+    &nbsp; 水位: <b id="watermark">-</b>
+    &nbsp; 冻结版本: <b id="fver">-</b>
+    &nbsp; 服务版本: <b id="aver">-</b>
+    &nbsp; 待处理差异: <b id="pdiffs">-</b>
+  </div>
+</div>
+
+<div class="card">
+  <div>
+    操作者: <input id="operator" value="admin" size="12">
+    幂等键: <input id="idem" size="28" placeholder="留空自动生成">
+    <button onclick="genKey()">生成</button>
+  </div>
+  <div style="margin-top:10px">
+    <button id="btnFreeze" onclick="act('freeze')">1. 开启冻结窗</button>
+    <button id="btnValidate" onclick="act('validate')">2. 校验(回填+比对)</button>
+    <button id="btnCutover" onclick="act('cutover')">3. 一次性切换</button>
+    <button id="btnRecover" class="danger" onclick="doRecover()">恢复到可写状态</button>
+  </div>
+  <div id="actionMsg" class="msg"></div>
+</div>
+
+<div class="card">
+  <b>写入探测</b>（验证冻结拒绝 / 旧路径关闭）:
+  <input id="wId" type="number" value="1" style="width:70px">
+  <input id="wName" value="demo" size="10">
+  <button onclick="writeOld()">写旧路径</button>
+  <button onclick="writeNew()">写新路径</button>
+  <button onclick="dualRead()">双读该编号</button>
+  <pre id="writeMsg" class="msg"></pre>
+</div>
+
+<div class="card">
+  <b>差异明细</b>（不一致会阻止切换）
+  <div id="diffs"></div>
+</div>
+
+<div class="card">
+  <b>审计日志</b>（操作者 / 版本 / 水位 / 差异 / 恢复原因）
+  <table>
+    <thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>阶段</th><th>epoch</th>
+      <th>版本</th><th>水位</th><th>原因/差异</th></tr></thead>
+    <tbody id="audit"></tbody>
+  </table>
+</div>
+
+<script>
+let lastDiffs = [];
+
+function genKey() {
+  document.getElementById('idem').value = 'op-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+}
+function idemKey() {
+  let v = document.getElementById('idem').value;
+  if (!v) { genKey(); v = document.getElementById('idem').value; }
+  return v;
+}
+
+async function refresh() {
+  const s = await (await fetch('/api/status')).json();
+  const ph = document.getElementById('phase');
+  ph.textContent = s.phase; ph.className = 'badge ' + s.phase;
+  document.getElementById('epoch').textContent = s.epoch;
+  document.getElementById('schema').textContent = s.active_schema;
+  document.getElementById('watermark').textContent = s.watermark;
+  document.getElementById('fver').textContent = s.freeze_version || '-';
+  document.getElementById('aver').textContent = s.app_version;
+  document.getElementById('pdiffs').textContent = s.pending_diffs;
+  document.getElementById('btnFreeze').disabled = s.phase !== 'NORMAL';
+  document.getElementById('btnValidate').disabled = !['FROZEN','VALIDATING'].includes(s.phase);
+  document.getElementById('btnCutover').disabled = s.phase !== 'VALIDATED';
+  document.getElementById('btnRecover').disabled = ['NORMAL','DONE'].includes(s.phase);
+  const rows = await (await fetch('/api/admin/audit?limit=50')).json();
+  document.getElementById('audit').innerHTML = rows.map(r =>
+    `<tr><td>${r.ts||''}</td><td>${r.operator}</td><td>${r.action}</td>
+     <td>${r.from_phase||''} → ${r.to_phase||''}</td><td>${r.epoch??''}</td>
+     <td>${r.app_version||''}</td><td>${r.watermark??''}</td>
+     <td>${r.reason||''}${r.diffs?(' 差异:'+r.diffs.length+'处'):''}</td></tr>`).join('');
+  renderDiffs();
+}
+
+function renderDiffs() {
+  const el = document.getElementById('diffs');
+  if (!lastDiffs.length) { el.innerHTML = '<span class="ok">无差异</span>'; return; }
+  el.innerHTML = '<table><tr><th>记录</th><th>字段</th><th>旧值</th><th>新值</th></tr>' +
+    lastDiffs.map(d => `<tr><td>${d.record_id}</td><td>${d.field}</td>
+      <td>${JSON.stringify(d.old)}</td><td>${JSON.stringify(d.new)}</td></tr>`).join('') +
+    '</table>';
+}
+
+async function act(name) {
+  const msg = document.getElementById('actionMsg');
+  const body = { operator: document.getElementById('operator').value,
+                 idempotency_key: idemKey() };
+  if (name === 'cutover') body.expected_epoch = parseInt(document.getElementById('epoch').textContent);
+  const r = await fetch('/api/admin/' + name, { method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+  const j = await r.json();
+  if (r.ok) {
+    lastDiffs = j.diffs || [];
+    msg.className = 'msg ' + (j.ok ? 'ok' : 'err');
+    msg.textContent = (j.replayed ? '[幂等重放] ' : '') + j.detail;
+  } else {
+    lastDiffs = (j.detail && j.detail.diffs) || [];
+    msg.className = 'msg err';
+    msg.textContent = '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j));
+  }
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function doRecover() {
+  const reason = prompt('请输入恢复原因(必填, 将写入审计):');
+  if (!reason) return;
+  const r = await fetch('/api/admin/recover', { method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ operator: document.getElementById('operator').value,
+                           idempotency_key: idemKey(), reason }) });
+  const j = await r.json();
+  const msg = document.getElementById('actionMsg');
+  msg.className = 'msg ' + (r.ok ? 'ok' : 'err');
+  msg.textContent = r.ok ? j.detail : ('被拒绝: ' + ((j.detail && j.detail.reason) || ''));
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function writeOld() { await tryWrite('/api/records', { tags_csv: 'a,b' }); }
+async function writeNew() { await tryWrite('/api/v2/records', { tags: ['a','b'] }); }
+async function tryWrite(url, extra) {
+  const body = Object.assign({ id: parseInt(document.getElementById('wId').value),
+    name: document.getElementById('wName').value, email: 'demo@x.com' }, extra);
+  const r = await fetch(url, { method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+  const j = await r.json();
+  document.getElementById('writeMsg').textContent =
+    `${url} -> HTTP ${r.status}\n` + JSON.stringify(j, null, 2);
+}
+async function dualRead() {
+  const id = document.getElementById('wId').value;
+  const r = await fetch('/api/records/' + id);
+  const j = await r.json();
+  if (j.diff) lastDiffs = j.diff;
+  document.getElementById('writeMsg').textContent =
+    `GET /api/records/${id} -> HTTP ${r.status}\n` + JSON.stringify(j, null, 2);
+  renderDiffs();
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
