@@ -110,3 +110,27 @@ class ReplayCreate(BaseModel):
 class ReplayAction(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+
+
+# ---------- 回放报告复核 ----------
+
+class ReviewSubmit(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    step_seq: int = Field(ge=1)                    # 被复核的步骤
+    report_version: int = Field(ge=1)              # 必须等于当前报告版本(过期 409)
+    verdict: str = Field(min_length=1)             # PASS | FAIL
+    issue: Optional[str] = None                    # 问题说明(FAIL 时必填)
+    fix_tags: list[str] = []                       # 修复标签
+
+
+class ReviewConfirm(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    report_version: int = Field(ge=1)              # 防止基于过期报告确认
+
+
+class ReviewReopen(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    reason: Optional[str] = None                   # 重新打开原因(可选, 落事件流水)

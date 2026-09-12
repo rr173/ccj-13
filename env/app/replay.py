@@ -16,6 +16,11 @@
 5. 并发: 同时处于 RUNNING 的回放任务不超过 REPLAY_MAX_CONCURRENCY(默认 2),
    其余排队; worker 调度在 Postgres 下用咨询锁串行, SQLite 写事务天然串行。
 6. 创建/暂停/恢复/取消全部走幂等框架(replay.* 命名空间), 重复请求无副作用。
+7. 报告复核工作流(仅 COMPLETED 回放): 管理员对每个 SUCCESS 步骤提交复核结论
+   (PASS/FAIL)、问题说明与修复标签, 结论与报告版本绑定、只追加保留历史;
+   任一 FAIL 回放进入 PENDING(待处理), 全部步骤 PASS 才可确认为 CONFIRMED;
+   待处理回放可重新打开(报告版本 +1 进入新一轮复核, 旧结论保留为历史)。
+   复核写入校验报告版本与步骤状态, 过期版本返回冲突且不覆盖新结论。
 """
 import hashlib
 import json
@@ -30,9 +35,9 @@ from sqlalchemy.orm import Session
 
 from . import plans, service
 from .models import (
-    AuditLog, MigrationBatch, MigrationPlan, PlanStep, RecordNew, RecordOld,
-    ReplayCheckpoint, ReplayCheckpointStep, ReplayTask, ReplayTaskEvent,
-    ReplayTaskStep,
+    REVIEW_VERDICTS, AuditLog, MigrationBatch, MigrationPlan, PlanStep,
+    RecordNew, RecordOld, ReplayCheckpoint, ReplayCheckpointStep, ReplayReview,
+    ReplayTask, ReplayTaskEvent, ReplayTaskStep,
 )
 from .service import APP_VERSION
 
@@ -415,6 +420,169 @@ def do_cancel(session: Session, task: ReplayTask, operator: str) -> dict:
                          if running_step else "")),
               detail={"skipped": skipped})
     return {"ok": True, "detail": f"回放任务已取消, {skipped} 个未开始步骤跳过, 已完成报告保留"}
+
+
+# ---------- 报告复核工作流(仅 COMPLETED 回放; 结论与报告版本绑定, 历史只追加) ----------
+
+def _current_reviews(session: Session, task_id: str, version: int) -> list[ReplayReview]:
+    return (session.query(ReplayReview)
+            .filter(ReplayReview.task_id == task_id,
+                    ReplayReview.report_version == version)
+            .order_by(ReplayReview.step_seq).all())
+
+
+def _refresh_review_status(session: Session, task: ReplayTask) -> None:
+    """按当前报告版本的复核结论重算任务复核状态:
+    任一 FAIL -> PENDING(待处理); 有结论且无 FAIL -> REVIEWING; 无结论 -> UNREVIEWED。"""
+    reviews = _current_reviews(session, task.id, task.report_version)
+    if any(r.verdict == "FAIL" for r in reviews):
+        task.review_status = "PENDING"
+    elif reviews:
+        task.review_status = "REVIEWING"
+    else:
+        task.review_status = "UNREVIEWED"
+
+
+def _require_completed(task: ReplayTask, action: str) -> None:
+    if task.status != "COMPLETED":
+        raise ReplayStateError(
+            f"回放任务 {task.id} 当前状态 {task.status}, 只有 COMPLETED 回放才能{action}")
+
+
+def _require_current_version(task: ReplayTask, report_version: int) -> None:
+    """报告版本栅栏: 过期版本直接冲突, 不写入也不覆盖已有新结论。"""
+    if report_version != task.report_version:
+        raise ReplayStateError(
+            f"报告版本已过期: 请求基于 v{report_version}, 当前报告版本为 "
+            f"v{task.report_version}; 过期版本不能写入, 也不会覆盖已有新结论, "
+            f"请获取最新报告后重试")
+
+
+def do_submit_review(session: Session, task: ReplayTask, operator: str,
+                     step_seq: int, report_version: int, verdict: str,
+                     issue: str | None, fix_tags: list[str] | None) -> dict:
+    """提交单个步骤的复核结论(结论/问题说明/修复标签), 与当前报告版本绑定。
+
+    校验: 回放须 COMPLETED 且未确认; 报告版本必须为当前版本(过期 409);
+    步骤须存在且 SUCCESS(报告已生成); 同一(版本, 步骤)只允许一条结论,
+    重复写入(不同幂等键)返回冲突, 不覆盖已有结论。
+    """
+    _require_completed(task, "提交复核结论")
+    if task.review_status == "CONFIRMED":
+        raise ReplayStateError(
+            f"回放任务 {task.id} 已确认(CONFIRMED), 复核已锁定, 不能再提交结论")
+    _require_current_version(task, report_version)
+    verdict = (verdict or "").strip().upper()
+    if verdict not in REVIEW_VERDICTS:
+        raise ReplayStateError(f"复核结论必须是 PASS 或 FAIL(收到 {verdict!r})")
+    issue = (issue or "").strip()[:500]
+    if verdict == "FAIL" and not issue:
+        raise ReplayStateError("复核结论为 FAIL 时问题说明必填")
+    tags: list[str] = []
+    for t in (fix_tags or []):
+        t = str(t).strip()[:64]
+        if t and t not in tags:
+            tags.append(t)
+    tstep = (session.query(ReplayTaskStep)
+             .filter(ReplayTaskStep.task_id == task.id,
+                     ReplayTaskStep.seq == step_seq).first())
+    if tstep is None:
+        raise ReplayNotFound(f"回放任务 {task.id} 没有 seq={step_seq} 的步骤")
+    if tstep.status != "SUCCESS":
+        raise ReplayStateError(
+            f"步骤 seq={step_seq} 当前状态 {tstep.status}, "
+            f"只有 SUCCESS(报告已生成)的步骤才能复核")
+    existing = (session.query(ReplayReview)
+                .filter(ReplayReview.task_id == task.id,
+                        ReplayReview.report_version == task.report_version,
+                        ReplayReview.step_seq == step_seq).first())
+    if existing is not None:
+        raise ReplayStateError(
+            f"步骤 seq={step_seq} 在报告版本 v{task.report_version} 已有 "
+            f"{existing.verdict} 结论({existing.operator} 提交), 不能覆盖; "
+            f"如需改判请重新打开回放进入新版本")
+    session.add(ReplayReview(
+        task_id=task.id, report_version=task.report_version, step_seq=step_seq,
+        batch_id=tstep.batch_id, verdict=verdict, issue=issue or None,
+        fix_tags=tags, operator=operator))
+    session.flush()
+    _refresh_review_status(session, task)
+    task.updated_by = operator
+    add_event(session, task_id=task.id, event="review.submit", operator=operator,
+              step_seq=step_seq,
+              reason=(f"步骤 seq={step_seq} 复核结论 {verdict}"
+                      f"(报告版本 v{task.report_version})"
+                      + (f": {issue}" if issue else "")),
+              detail={"report_version": task.report_version, "verdict": verdict,
+                      "issue": issue or None, "fix_tags": tags})
+    total = sum(1 for s in _task_steps(session, task.id) if s.status == "SUCCESS")
+    reviewed = len(_current_reviews(session, task.id, task.report_version))
+    note = ("; 发现问题, 回放进入待处理(PENDING), 处理问题后可重新打开"
+            if task.review_status == "PENDING" else "")
+    return {"ok": True, "replay_id": task.id, "report_version": task.report_version,
+            "step_seq": step_seq, "verdict": verdict,
+            "review_status": task.review_status,
+            "review_progress": {"reviewed": reviewed, "total": total},
+            "detail": (f"步骤 seq={step_seq} 复核结论 {verdict} 已记录"
+                       f"(报告版本 v{task.report_version}); "
+                       f"复核进度 {reviewed}/{total}{note}")}
+
+
+def do_confirm_review(session: Session, task: ReplayTask, operator: str,
+                      report_version: int) -> dict:
+    """确认回放: 仅当当前报告版本全部 SUCCESS 步骤都 PASS 才允许; 重复确认幂等。"""
+    if task.review_status == "CONFIRMED":
+        return {"ok": True, "already_in_state": True,
+                "detail": "回放已确认, 重复确认无副作用"}
+    _require_completed(task, "确认")
+    _require_current_version(task, report_version)
+    if task.review_status == "PENDING":
+        raise ReplayStateError(
+            "当前报告版本存在未通过(FAIL)的复核结论, 不能确认; "
+            "请先处理问题并重新打开回放")
+    success_steps = [s for s in _task_steps(session, task.id) if s.status == "SUCCESS"]
+    if not success_steps:
+        raise ReplayStateError("回放没有已完成的步骤报告, 无可确认内容")
+    by_seq = {r.step_seq: r
+              for r in _current_reviews(session, task.id, task.report_version)}
+    missing = [s.seq for s in success_steps
+               if by_seq.get(s.seq) is None or by_seq[s.seq].verdict != "PASS"]
+    if missing:
+        raise ReplayStateError(
+            f"步骤 {missing} 尚未通过复核(需全部 PASS), 不能确认回放")
+    task.review_status = "CONFIRMED"
+    task.confirmed_by = operator
+    task.confirmed_at = now_utc_naive()
+    task.updated_by = operator
+    add_event(session, task_id=task.id, event="review.confirm", operator=operator,
+              reason=(f"报告版本 v{task.report_version} 全部 "
+                      f"{len(success_steps)} 个步骤复核通过, 回放确认"),
+              detail={"report_version": task.report_version,
+                      "steps": len(success_steps)})
+    return {"ok": True, "review_status": "CONFIRMED",
+            "detail": f"回放 {task.id} 已确认: 报告版本 v{task.report_version} "
+                      f"全部 {len(success_steps)} 个步骤复核通过"}
+
+
+def do_reopen_review(session: Session, task: ReplayTask, operator: str,
+                     reason: str | None) -> dict:
+    """重新打开待处理回放: 报告版本 +1 进入新一轮复核, 旧版本结论保留为历史。"""
+    _require_completed(task, "重新打开")
+    if task.review_status != "PENDING":
+        raise ReplayStateError(
+            f"回放任务 {task.id} 复核状态为 {task.review_status}, "
+            f"仅待处理(PENDING)的回放可重新打开")
+    old = task.report_version
+    task.report_version = old + 1
+    task.review_status = "UNREVIEWED"
+    task.updated_by = operator
+    add_event(session, task_id=task.id, event="review.reopen", operator=operator,
+              reason=(reason or "重新打开回放, 进入新一轮复核"),
+              detail={"from_version": old, "to_version": task.report_version})
+    return {"ok": True, "report_version": task.report_version,
+            "review_status": task.review_status,
+            "detail": f"回放已重新打开: 报告版本 v{old} -> v{task.report_version}, "
+                      f"历史结论保留, 请基于新版本重新复核"}
 
 
 # ---------- 回放执行: 调度(并发闸门) + 步骤报告 ----------
@@ -860,6 +1028,78 @@ def checkpoint_to_dict(cp: ReplayCheckpoint, *, with_steps: bool = True) -> dict
     return out
 
 
+def review_to_dict(rv: ReplayReview) -> dict:
+    return {
+        "id": rv.id,
+        "task_id": rv.task_id,
+        "report_version": rv.report_version,
+        "step_seq": rv.step_seq,
+        "batch_id": rv.batch_id,
+        "verdict": rv.verdict,
+        "issue": rv.issue,
+        "fix_tags": list(rv.fix_tags or []),
+        "operator": rv.operator,
+        "created_at": _dt(rv.created_at),
+    }
+
+
+def review_summary(session: Session, task: ReplayTask) -> dict:
+    """当前报告版本的复核进度汇总(列表/详情/状态接口共用)。"""
+    reviews = _current_reviews(session, task.id, task.report_version)
+    success_seqs = [s.seq for s in _task_steps(session, task.id)
+                    if s.status == "SUCCESS"]
+    return {
+        "status": task.review_status,
+        "report_version": task.report_version,
+        "total": len(success_seqs),
+        "reviewed": len(reviews),
+        "passed": sum(1 for r in reviews if r.verdict == "PASS"),
+        "failed": sum(1 for r in reviews if r.verdict == "FAIL"),
+        "confirmed_by": task.confirmed_by,
+        "confirmed_at": _dt(task.confirmed_at),
+        "steps": {str(r.step_seq): review_to_dict(r) for r in reviews},
+    }
+
+
+def reviews_view(session: Session, task: ReplayTask) -> dict:
+    """复核记录全量视图: 当前版本逐步结论 + 全部历史版本结论 + 复核事件流水。"""
+    steps = _task_steps(session, task.id)
+    current = {r.step_seq: r
+               for r in _current_reviews(session, task.id, task.report_version)}
+    history = (session.query(ReplayReview)
+               .filter(ReplayReview.task_id == task.id)
+               .order_by(ReplayReview.id.desc()).all())
+    events = (session.query(ReplayTaskEvent)
+              .filter(ReplayTaskEvent.task_id == task.id,
+                      ReplayTaskEvent.event.like("review.%"))
+              .order_by(ReplayTaskEvent.id.desc()).limit(50).all())
+    return {
+        "replay_id": task.id,
+        "task_status": task.status,
+        "review": review_summary(session, task),
+        "steps": [
+            {"seq": s.seq, "batch_id": s.batch_id, "step_status": s.status,
+             "review": review_to_dict(current[s.seq]) if s.seq in current else None}
+            for s in steps
+        ],
+        "history": [review_to_dict(r) for r in history],
+        "events": [
+            {"id": e.id, "ts": _dt(e.ts), "step_seq": e.step_seq,
+             "event": e.event, "operator": e.operator,
+             "reason": e.reason, "detail": e.detail}
+            for e in events
+        ],
+    }
+
+
+def review_queue_view(session: Session, review_status: str) -> list[dict]:
+    """按复核状态查询回放任务(待处理队列)。"""
+    rows = (session.query(ReplayTask)
+            .filter(ReplayTask.review_status == review_status)
+            .order_by(ReplayTask.updated_at.desc(), ReplayTask.id).all())
+    return [replay_to_dict(session, t, with_report=False) for t in rows]
+
+
 def replay_step_to_dict(ts: ReplayTaskStep, *, with_report: bool = False) -> dict:
     out = {
         "id": ts.id,
@@ -911,6 +1151,7 @@ def replay_to_dict(session: Session, task: ReplayTask, *,
         "finished_at": _dt(task.finished_at),
         "created_at": _dt(task.created_at),
         "updated_at": _dt(task.updated_at),
+        "review": review_summary(session, task),
         "steps": [replay_step_to_dict(s, with_report=with_report) for s in steps],
         "events": [
             {"id": e.id, "ts": _dt(e.ts), "step_seq": e.step_seq,

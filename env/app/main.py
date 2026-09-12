@@ -7,15 +7,15 @@ from sqlalchemy.orm import Session
 
 from .db import Base, SessionLocal, engine
 from .models import (
-    AuditLog, MigrationBatch, MigrationPlan, RecordNew, RecordOld,
-    ReplayCheckpoint, ReplayTask,
+    REVIEW_STATUSES, AuditLog, MigrationBatch, MigrationPlan, RecordNew,
+    RecordOld, ReplayCheckpoint, ReplayTask,
 )
 from .plans import PlanWorker
 from .replay import ReplayWorker
 from .schemas import (
     AdminAction, BatchCreate, CheckpointCreate, PlanAction, PlanCreate,
     PlanRejectAction, PlanWindowAction, RecordIn, RecoverAction, ReplayAction,
-    ReplayCreate,
+    ReplayCreate, ReviewConfirm, ReviewReopen, ReviewSubmit,
 )
 from . import plans, replay, service
 
@@ -61,10 +61,30 @@ def _backfill_plan_columns():
                     f"ALTER TABLE migration_plans ADD COLUMN {col} {ddl}"))
 
 
+def _backfill_replay_columns():
+    """旧库(无迁移框架)补齐回放复核列: 已存在的回放按未复核、报告版本 1 处理。
+    幂等, 可重复执行。"""
+    from sqlalchemy import inspect, text as _text
+    inspector = inspect(engine)
+    existing = {c["name"] for c in inspector.get_columns("replay_tasks")}
+    defaults = {
+        "report_version": "INTEGER NOT NULL DEFAULT 1",
+        "review_status": "VARCHAR(16) NOT NULL DEFAULT 'UNREVIEWED'",
+        "confirmed_by": "VARCHAR(128)",
+        "confirmed_at": "TIMESTAMP",
+    }
+    with engine.begin() as conn:
+        for col, ddl in defaults.items():
+            if col not in existing:
+                conn.execute(_text(
+                    f"ALTER TABLE replay_tasks ADD COLUMN {col} {ddl}"))
+
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
     _backfill_plan_columns()
+    _backfill_replay_columns()
     db = SessionLocal()
     try:
         service.boot_check(db)
@@ -443,6 +463,55 @@ def cancel_replay(replay_id: str, body: ReplayAction, db: Session = Depends(get_
     """取消回放: 未开始步骤置 SKIPPED, 已完成步骤报告保留; 重复取消幂等。"""
     return _run_replay(db, "cancel", body,
                        lambda s, t: replay.do_cancel(s, t, body.operator), replay_id)
+
+
+# ---------- 回放报告复核(结论与报告版本绑定, 历史只追加) ----------
+
+@app.post("/api/admin/replays/{replay_id}/reviews", status_code=201)
+def submit_review(replay_id: str, body: ReviewSubmit, db: Session = Depends(get_db)):
+    """提交单步复核结论(PASS/FAIL)、问题说明与修复标签。
+    回放须 COMPLETED 且未确认; report_version 过期/步骤非 SUCCESS/同版本同步骤
+    已有结论 -> 409, 不覆盖新结论; 同一请求重复提交幂等。"""
+    return _run_replay(db, "review.submit", body,
+                       lambda s, t: replay.do_submit_review(
+                           s, t, body.operator, body.step_seq, body.report_version,
+                           body.verdict, body.issue, body.fix_tags), replay_id)
+
+
+@app.get("/api/admin/replays/{replay_id}/reviews")
+def get_replay_reviews(replay_id: str, db: Session = Depends(get_db)):
+    """复核记录: 当前版本逐步结论 + 全部历史版本结论 + 复核事件流水。"""
+    task = db.get(ReplayTask, replay_id)
+    if task is None:
+        _replay_not_found(Exception(f"回放任务 {replay_id} 不存在"))
+    return replay.reviews_view(db, task)
+
+
+@app.post("/api/admin/replays/{replay_id}/review/confirm")
+def confirm_review(replay_id: str, body: ReviewConfirm, db: Session = Depends(get_db)):
+    """确认回放: 仅当前报告版本全部 SUCCESS 步骤均 PASS 才允许;
+    报告版本过期/有待处理结论 -> 409; 重复确认幂等。"""
+    return _run_replay(db, "review.confirm", body,
+                       lambda s, t: replay.do_confirm_review(
+                           s, t, body.operator, body.report_version), replay_id)
+
+
+@app.post("/api/admin/replays/{replay_id}/review/reopen")
+def reopen_review(replay_id: str, body: ReviewReopen, db: Session = Depends(get_db)):
+    """重新打开待处理(PENDING)回放: 报告版本 +1 进入新一轮复核, 历史结论保留。"""
+    return _run_replay(db, "review.reopen", body,
+                       lambda s, t: replay.do_reopen_review(
+                           s, t, body.operator, body.reason), replay_id)
+
+
+@app.get("/api/admin/review-queue")
+def get_review_queue(status: str = "PENDING", db: Session = Depends(get_db)):
+    """按复核状态查询回放任务(待处理队列): 默认 PENDING(复核发现问题待处理)。"""
+    if status not in REVIEW_STATUSES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_review_status",
+            "reason": f"复核状态必须是 {list(REVIEW_STATUSES)} 之一(收到 {status!r})"})
+    return replay.review_queue_view(db, status)
 
 
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------

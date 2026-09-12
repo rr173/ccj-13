@@ -164,6 +164,43 @@ QUEUED ──获得并发额度──▶ RUNNING ──全部步骤报告完成�
   只有数据无法还原类错误才 FAILED。
 - 回放 worker 与计划 worker 同生命周期（单实例后台线程；测试可用 `PLAN_WORKER_ENABLED=0` 一并关闭）。
 
+## 回放报告复核工作流
+
+管理员对**已完成（COMPLETED）回放**的每个步骤提交复核结论，系统把结论与**回放报告版本**绑定、
+只追加保留历史；全部步骤通过才能确认，发现问题进入待处理队列，可重新打开进入新一轮复核。
+
+### 复核状态机(回放任务级)
+
+```
+UNREVIEWED ──提交首条复核──▶ REVIEWING ──任一步骤 FAIL──▶ PENDING(待处理)
+                               │                            │ reopen(报告版本+1,
+                               │ 全部 SUCCESS 步骤 PASS     │  旧版本结论保留为历史)
+                               ▼                            ▼
+                            CONFIRMED(终态) ◀────────── UNREVIEWED(新一轮复核)
+```
+
+- **提交复核**：`POST /api/admin/replays/{id}/reviews`，携带 `step_seq`、`report_version`、
+  `verdict`(PASS/FAIL)、`issue`(问题说明，FAIL 必填)、`fix_tags`(修复标签)。
+  结论按 `(任务, 报告版本, 步骤)` 唯一落库（唯一约束兜底），只追加、永不修改。
+- **写入校验**：回放须 COMPLETED 且未确认；`report_version` 必须等于当前版本——
+  **过期版本返回 409 冲突，不写入也不覆盖已有新结论**；步骤须 SUCCESS（报告已生成）；
+  同一版本同一步骤只允许一条结论，重复写入（不同幂等键）返回 409，改判须重新打开进入新版本。
+- **确认**：`POST .../review/confirm`（带 `report_version` 防止基于过期报告确认）——
+  仅当前版本全部 SUCCESS 步骤均 PASS 才允许，存在 FAIL 或未复核步骤返回 409；
+  确认后 `review_status=CONFIRMED` 并记录确认人/时间，复核锁定，重复确认幂等。
+- **待处理与重新打开**：任一 FAIL 结论使回放进入 `PENDING`（待处理队列可查）；
+  `POST .../review/reopen` 把报告版本 +1、状态回到 UNREVIEWED 开始新一轮复核，
+  **旧版本结论全部保留为历史**，仅 PENDING 状态可重新打开。
+- **持久化与幂等**：复核状态、历史结论、待处理队列全部落库，服务重启不丢失；
+  提交/确认/重新打开都要求 `idempotency_key`（`replay.review.*` 命名空间），
+  同一请求重复提交返回首次结果（`replayed: true`），不产生重复结论。
+- **查询**：`GET /api/admin/replays/{id}/reviews` 返回当前版本逐步结论、全部历史版本结论
+  与复核事件流水；`GET /api/admin/review-queue?status=PENDING` 按复核状态查询回放
+  （默认待处理队列）；回放列表/详情/报告与 `/api/status` 都带 `review` 进度汇总。
+- 页面：回放卡片显示复核状态徽章、报告版本与进度（已复核/通过/问题数），
+  "复核"面板逐步展示结论/问题说明/修复标签、提交表单、确认/重新打开操作与历史变更；
+  回放任务区顶部实时列出待处理回放队列。
+
 ## 运行
 
 ```bash
@@ -207,6 +244,14 @@ GET  /api/admin/replays                             回放任务列表(进度/�
 GET  /api/admin/replays/{id}                        回放任务详情
 GET  /api/admin/replays/{id}/report                 回放报告详情(逐步预期/实际状态与字段差异)
 POST /api/admin/replays/{id}/pause|resume|cancel    {operator, idempotency_key}
+POST /api/admin/replays/{id}/reviews   {operator, idempotency_key, step_seq, report_version,
+                                        verdict, issue?, fix_tags?}   提交单步复核结论(版本/步骤状态校验)
+GET  /api/admin/replays/{id}/reviews                  复核记录(当前版本逐步结论+历史版本+复核事件)
+POST /api/admin/replays/{id}/review/confirm  {operator, idempotency_key, report_version}
+                                                      全部步骤 PASS 才允许确认
+POST /api/admin/replays/{id}/review/reopen   {operator, idempotency_key, reason?}
+                                                      待处理回放重新打开(报告版本+1, 历史保留)
+GET  /api/admin/review-queue?status=PENDING           按复核状态查询回放(待处理队列)
 GET  /api/admin/audit?batch_id=&plan_id=           审计日志(可按批次或计划过滤)
 POST /api/records                                  旧结构写入(批次冻结期 423 / 批次切换后 410)
 POST /api/v2/records                               新结构写入(仅所属批次 DONE)
@@ -221,7 +266,7 @@ GET  /api/records/{id}/compare                     批次冻结窗内双读比�
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 67 个用例:
+python3 -m pytest tests/ -q   # 78 个用例:
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
 # 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
@@ -239,4 +284,8 @@ python3 -m pytest tests/ -q   # 67 个用例:
 #           暂停在步骤边界+恢复续跑+终态拒绝/排队取消全部 SKIPPED/执行中取消保留报告/排队暂停不被认领/
 #           并发上限排队+完成后放行/重启 RUNNING 复位排队续跑不丢报告/回放只读(批次/业务表/审计不变)/
 #           依赖顺序 1→2→3/控制请求同键幂等重放/status 汇总/失败终态 worker 不再处理
+# 复核(11): 逐步复核进度与确认流程/FAIL 进入待处理且问题说明+修复标签落库/重新打开版本+1 历史保留/
+#           过期版本冲突不覆盖新结论/同版本同步骤重复结论拒绝/同键幂等重放不产生重复结论/
+#           未全部 PASS 与待处理时确认被拒/非 COMPLETED 回放复核被拒/非 SUCCESS 步骤与未知步骤校验/
+#           重启后复核状态·历史·待处理队列保留/按状态查询待处理回放/状态与详情接口带复核进度
 ```

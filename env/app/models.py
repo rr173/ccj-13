@@ -338,6 +338,13 @@ class ReplayTask(Base):
     finished_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=_utcnow)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+    # 报告复核工作流(仅 COMPLETED 回放进入): 复核结论与报告版本绑定,
+    # 全部步骤 PASS 才可确认; 任一 FAIL 进入 PENDING(待处理),
+    # 重新打开报告版本 +1 开始新一轮复核, 旧版本结论原样保留为历史
+    report_version = Column(Integer, nullable=False, default=1)
+    review_status = Column(String(16), nullable=False, default="UNREVIEWED", index=True)
+    confirmed_by = Column(String(128), nullable=True)
+    confirmed_at = Column(DateTime, nullable=True)
 
     task_steps = relationship("ReplayTaskStep", cascade="all, delete-orphan",
                               order_by="ReplayTaskStep.seq")
@@ -377,7 +384,8 @@ class ReplayTaskStep(Base):
 
 class ReplayTaskEvent(Base):
     """回放任务事件流水(只追加): 创建/排队/认领执行/暂停/恢复/取消/
-    步骤开始/成功/失败/跳过/完成/重启对账。回放不写业务审计表 audit_log。"""
+    步骤开始/成功/失败/跳过/完成/重启对账/复核提交/确认/重新打开。
+    回放不写业务审计表 audit_log。"""
 
     __tablename__ = "replay_task_events"
 
@@ -390,3 +398,35 @@ class ReplayTaskEvent(Base):
     operator = Column(String(128), nullable=False)
     reason = Column(String(500), nullable=True)
     detail = Column(JSON, nullable=True)
+
+
+# 回放复核状态机(任务级, 仅 COMPLETED 回放进入复核流程):
+#   UNREVIEWED --提交首条复核--> REVIEWING --任一步骤 FAIL--> PENDING(待处理)
+#   PENDING --reopen(报告版本+1)--> UNREVIEWED(新一轮复核, 旧版本结论保留为历史)
+#   REVIEWING --全部 SUCCESS 步骤 PASS 后 confirm--> CONFIRMED(终态, 复核锁定)
+REVIEW_STATUSES = ("UNREVIEWED", "REVIEWING", "PENDING", "CONFIRMED")
+REVIEW_VERDICTS = ("PASS", "FAIL")
+
+
+class ReplayReview(Base):
+    """步骤复核结论(只追加): 与回放报告版本绑定, 同一(任务, 版本, 步骤)至多一条
+    结论, 并发/重复写入由唯一约束兜底; 重新打开后报告版本 +1, 旧版本结论
+    原样保留为历史, 永不修改。"""
+
+    __tablename__ = "replay_reviews"
+    __table_args__ = (
+        UniqueConstraint("task_id", "report_version", "step_seq",
+                         name="uq_replay_review_step"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(32), ForeignKey("replay_tasks.id"),
+                     nullable=False, index=True)
+    report_version = Column(Integer, nullable=False)   # 绑定的回放报告版本
+    step_seq = Column(Integer, nullable=False)
+    batch_id = Column(String(32), nullable=False)
+    verdict = Column(String(8), nullable=False)        # PASS | FAIL
+    issue = Column(String(500), nullable=True)         # 问题说明(FAIL 必填)
+    fix_tags = Column(JSON, nullable=False, default=list)  # 修复标签
+    operator = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow)

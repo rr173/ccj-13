@@ -27,6 +27,12 @@
   .SUCCESS { background: #2e7d32; }
   .QUEUED { background: #78909c; }
   .INCOMPLETE { background: #ef6c00; } .COMPLETE { background: #2e7d32; }
+  .RV_UNREVIEWED { background: #9e9e9e; } .RV_REVIEWING { background: #1565c0; }
+  .RV_PENDING { background: #c62828; } .RV_CONFIRMED { background: #2e7d32; }
+  .VD_PASS { background: #2e7d32; } .VD_FAIL { background: #c62828; }
+  .tag { display: inline-block; background: #eceff1; border: 1px solid #b0bec5;
+         color: #37474f; border-radius: 10px; padding: 1px 8px; font-size: 11px;
+         margin: 1px 2px 1px 0; }
   button { padding: 6px 12px; margin: 2px 4px 2px 0; border: 0; border-radius: 6px;
            background: #1565c0; color: #fff; cursor: pointer; font-size: 12px; }
   button.danger { background: #c62828; }
@@ -135,6 +141,7 @@
     <tbody id="checkpoints"></tbody>
   </table>
   <b style="display:block;margin:10px 0 4px">回放任务</b>
+  <div id="reviewQueue" style="margin:4px 0"></div>
   <div id="replays"></div>
 </div>
 
@@ -202,6 +209,7 @@ async function refresh() {
   renderReplayControls(s);
   renderCheckpoints(s.checkpoints || []);
   renderReplays(s.replays || []);
+  renderReviewQueue();
   const rows = await (await fetch('/api/admin/audit?limit=50')).json();
   document.getElementById('audit').innerHTML = rows.map(r =>
     `<tr><td>${r.ts||''}</td><td>${r.batch_id||r.plan_id||''}</td><td>${r.operator}</td><td>${r.action}</td>
@@ -664,11 +672,26 @@ async function toggleReplayReport(rid, btn) {
 }
 
 function renderReplays(replays) {
+  // 自动刷新(3s)会重建列表: 先缓存已打开复核面板的内容, 渲染后恢复, 避免表单被清掉
+  const savedPanels = {};
+  openReviewPanels.forEach(rid => {
+    const el = document.getElementById('rvp-' + rid);
+    if (el && el.dataset.open) savedPanels[rid] = el.innerHTML;
+  });
   document.getElementById('replays').innerHTML = replays.map(r => {
     const pct = r.progress.total ? Math.round(100 * r.progress.done / r.progress.total) : 0;
     const canPause = ['QUEUED', 'RUNNING'].includes(r.status);
     const canResume = r.status === 'PAUSED';
     const canCancel = ['QUEUED', 'RUNNING', 'PAUSED'].includes(r.status);
+    const rv = r.review || {};
+    const reviewLine = r.status === 'COMPLETED' ? `
+      <div style="margin:4px 0">复核:
+        <span class="badge RV_${rv.status}">${rvStatusText(rv.status)}</span>
+        <span class="muted">报告版本 v${rv.report_version} · ${rv.reviewed}/${rv.total} 步已复核
+          · 通过 ${rv.passed} · 问题 <b class="${rv.failed ? 'err' : 'ok'}">${rv.failed}</b></span>
+        ${rv.confirmed_by ? `<span class="muted">· 确认 ${escapeHtml(rv.confirmed_by)} · ${rv.confirmed_at || ''}</span>` : ''}
+        <button class="plain" onclick="toggleReviewPanel('${r.id}', this)">复核</button>
+      </div>` : '';
     return `<div class="card" style="background:#faf7ff">
       <span class="badge ${r.status}">${r.status}</span>
       <b>${escapeHtml(r.plan_name)}</b>
@@ -687,14 +710,152 @@ function renderReplays(replays) {
         <span class="muted" style="margin-left:16px">字段差异: <b class="${r.diff_count?'err':'ok'}">${r.diff_count}</b>
           (批次状态差异 ${r.state_diff_count})</span>
       </div>
+      ${reviewLine}
       ${r.failure_reason ? `<div class="err"><b>失败原因:</b> ${escapeHtml(r.failure_reason)}<br>
         <span class="muted">已完成步骤的报告保留, 未执行步骤已跳过</span></div>` : ''}
       ${r.last_error && r.last_error !== r.failure_reason
         ? `<div class="err"><b>最近错误:</b> ${escapeHtml(r.last_error)}</div>` : ''}
       <div id="rep-${r.id}"></div>
+      <div id="rvp-${r.id}"></div>
       <div class="muted" style="margin-top:4px">创建 ${r.created_by} · ${r.created_at||''}</div>
     </div>`;
   }).join('') || '<div class="muted">尚无回放任务</div>';
+  openReviewPanels.forEach(rid => {
+    const el = document.getElementById('rvp-' + rid);
+    if (el && savedPanels[rid] !== undefined) {
+      el.innerHTML = savedPanels[rid];
+      el.dataset.open = '1';
+    }
+  });
+}
+
+// ---------- 回放报告复核 ----------
+
+const openReviewPanels = new Set();
+
+function rvStatusText(s) {
+  return { UNREVIEWED: '未复核', REVIEWING: '复核中', PENDING: '待处理',
+           CONFIRMED: '已确认' }[s] || s;
+}
+
+function verdictBadge(v) {
+  return `<span class="badge VD_${v}">${v === 'PASS' ? 'PASS 通过' : 'FAIL 不通过'}</span>`;
+}
+
+async function renderReviewQueue() {
+  const q = await (await fetch('/api/admin/review-queue?status=PENDING')).json();
+  document.getElementById('reviewQueue').innerHTML = q.length
+    ? `<b class="err">待处理回放(复核发现问题): ${q.length}</b> ` + q.map(t =>
+        `<span class="tag" style="font-size:12px">${t.id} · ${escapeHtml(t.plan_name)}
+          · 问题 ${t.review.failed} · 版本 v${t.review.report_version}</span>
+         <button class="danger" onclick="reopenReview('${t.id}')">重新打开</button>`).join('')
+    : '<span class="muted">待处理回放(复核发现问题): 无</span>';
+}
+
+async function toggleReviewPanel(rid, btn) {
+  const box = document.getElementById('rvp-' + rid);
+  if (box.dataset.open) {
+    box.innerHTML = ''; box.dataset.open = '';
+    openReviewPanels.delete(rid); btn.textContent = '复核'; return;
+  }
+  openReviewPanels.add(rid);
+  await renderReviewPanel(rid);
+  btn.textContent = '收起复核';
+}
+
+async function renderReviewPanel(rid) {
+  const box = document.getElementById('rvp-' + rid);
+  const j = await (await fetch(`/api/admin/replays/${rid}/reviews`)).json();
+  const rv = j.review;
+  const stepRows = j.steps.map(st => {
+    const r = st.review;
+    return `<tr><td>${st.seq}</td><td>${st.batch_id}</td>
+      <td><span class="badge ${st.step_status}">${st.step_status}</span></td>
+      <td>${r ? verdictBadge(r.verdict) : '<span class="muted">未复核</span>'}</td>
+      <td>${r && r.issue ? escapeHtml(r.issue) : ''}</td>
+      <td>${r ? (r.fix_tags || []).map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('') : ''}</td>
+      <td>${r ? escapeHtml(r.operator) : ''}<div class="muted">${r ? (r.created_at || '') : ''}</div></td></tr>`;
+  }).join('');
+  const pendingSteps = j.steps.filter(s => s.step_status === 'SUCCESS' && !s.review);
+  const canReview = j.task_status === 'COMPLETED' && rv.status !== 'CONFIRMED';
+  const form = canReview && pendingSteps.length ? `
+    <div style="margin:6px 0">
+      步骤 <select id="rvs-step-${rid}">${pendingSteps.map(s =>
+        `<option value="${s.seq}">seq=${s.seq} · ${s.batch_id}</option>`).join('')}</select>
+      结论 <select id="rvs-verdict-${rid}">
+        <option value="PASS">PASS 通过</option><option value="FAIL">FAIL 不通过</option></select>
+      问题说明 <input id="rvs-issue-${rid}" size="18" placeholder="FAIL 时必填">
+      修复标签 <input id="rvs-tags-${rid}" size="14" placeholder="逗号分隔, 如 数据修复,复跑">
+      <button onclick="submitReview('${rid}', ${rv.report_version})">提交复核(v${rv.report_version})</button>
+    </div>` : (canReview
+      ? '<div class="muted" style="margin:6px 0">当前报告版本全部步骤已复核</div>' : '');
+  const canConfirm = j.task_status === 'COMPLETED' && rv.status === 'REVIEWING'
+    && rv.total > 0 && rv.reviewed === rv.total && rv.failed === 0;
+  const canReopen = rv.status === 'PENDING';
+  const ops = `<div style="margin:6px 0">
+    <button ${canConfirm ? '' : 'disabled'} title="全部步骤 PASS 才可确认"
+      onclick="confirmReview('${rid}', ${rv.report_version})">确认回放</button>
+    <button class="danger" ${canReopen ? '' : 'disabled'} title="仅待处理回放可重新打开(报告版本 +1)"
+      onclick="reopenReview('${rid}')">重新打开</button>
+    ${rv.status === 'CONFIRMED'
+      ? `<span class="ok">已确认 · ${escapeHtml(rv.confirmed_by || '')} · ${rv.confirmed_at || ''}</span>` : ''}
+  </div>`;
+  const hist = j.history.map(h => `<tr><td>v${h.report_version}</td><td>seq=${h.step_seq}</td>
+    <td>${verdictBadge(h.verdict)}</td><td>${escapeHtml(h.issue || '')}</td>
+    <td>${(h.fix_tags || []).map(t => `<span class="tag">${escapeHtml(t)}</span>`).join('')}</td>
+    <td>${escapeHtml(h.operator)}</td><td class="muted">${h.created_at || ''}</td></tr>`).join('');
+  const evs = (j.events || []).map(e =>
+    `<div class="muted">[${e.ts || ''}] ${e.event} · ${escapeHtml(e.operator)}${e.reason ? ' · ' + escapeHtml(e.reason) : ''}</div>`).join('');
+  box.innerHTML = `<div style="margin-top:6px;border-top:1px dashed #ddd;padding-top:6px">
+    <b>复核</b> <span class="badge RV_${rv.status}">${rvStatusText(rv.status)}</span>
+    <span class="muted">报告版本 v${rv.report_version} · ${rv.reviewed}/${rv.total} 步
+      · 通过 ${rv.passed} · 问题 ${rv.failed}</span>
+    <table style="margin-top:4px"><thead><tr><th>seq</th><th>批次</th><th>步骤状态</th>
+      <th>复核结论</th><th>问题说明</th><th>修复标签</th><th>复核人/时间</th></tr></thead>
+      <tbody>${stepRows}</tbody></table>
+    ${form}${ops}
+    <div style="margin-top:6px"><b>历史变更</b>
+      ${hist ? `<table><thead><tr><th>版本</th><th>步骤</th><th>结论</th><th>问题说明</th>
+        <th>修复标签</th><th>复核人</th><th>时间</th></tr></thead><tbody>${hist}</tbody></table>`
+        : '<div class="muted">尚无复核记录</div>'}
+      ${evs}
+    </div>
+  </div>`;
+  box.dataset.open = '1';
+}
+
+async function afterReviewAction(rid, status, j) {
+  if (status === 200 || status === 201) showReplayMsg(true, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+  else showReplayMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  await refresh();
+  if (openReviewPanels.has(rid)) await renderReviewPanel(rid);
+}
+
+async function submitReview(rid, version) {
+  const body = { operator: operator(), idempotency_key: idemKey(),
+    step_seq: parseInt(document.getElementById('rvs-step-' + rid).value),
+    report_version: version,
+    verdict: document.getElementById('rvs-verdict-' + rid).value,
+    issue: document.getElementById('rvs-issue-' + rid).value || null,
+    fix_tags: (document.getElementById('rvs-tags-' + rid).value || '')
+      .split(',').map(x => x.trim()).filter(x => x) };
+  const { status, j } = await post(`/api/admin/replays/${rid}/reviews`, body);
+  await afterReviewAction(rid, status, j);
+}
+
+async function confirmReview(rid, version) {
+  const { status, j } = await post(`/api/admin/replays/${rid}/review/confirm`,
+    { operator: operator(), idempotency_key: idemKey(), report_version: version });
+  await afterReviewAction(rid, status, j);
+}
+
+async function reopenReview(rid) {
+  const reason = prompt('重新打开原因(可选, 将写入事件流水; 报告版本 +1, 历史结论保留):');
+  if (reason === null) return;
+  const { status, j } = await post(`/api/admin/replays/${rid}/review/reopen`,
+    { operator: operator(), idempotency_key: idemKey(), reason: reason || null });
+  await afterReviewAction(rid, status, j);
 }
 
 refresh();
