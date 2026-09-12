@@ -209,10 +209,50 @@
   <div id="archiveMsg" class="msg"></div>
   <b style="display:block;margin:10px 0 4px">归档任务</b>
   <table>
-    <thead><tr><th>归档</th><th>回放/计划</th><th>版本</th><th>状态</th><th>进度(归档单元)</th>
-      <th>当前单元</th><th>摘要/包</th><th>失败原因</th><th>操作者/时间</th><th>操作</th></tr></thead>
+    <thead><tr><th>归档</th><th>回放/计划</th><th>业务分组</th><th>版本</th><th>状态</th><th>进度(归档单元)</th>
+      <th>当前单元</th><th>摘要/包</th><th>保留状态</th><th>引用数</th><th>失败原因</th><th>操作者/时间</th><th>操作</th></tr></thead>
     <tbody id="archives"></tbody>
   </table>
+</div>
+
+<div class="card">
+  <b>归档目录与生命周期</b>（按回放 / 业务分组 / 报告版本 / 内容摘要检索已完成归档;
+  设置带到期时间的保留策略或永久保留; 发起清理计划逐项清理, 保留期内/永久保留/正在下载或校验/仍被同摘要引用的归档逐项跳过并返回原因）
+  <b style="display:block;margin:10px 0 4px">归档检索</b>
+  <div>
+    回放 <input id="catReplay" size="14" placeholder="R...">
+    业务分组 <input id="catBiz" size="10" placeholder="biz">
+    报告版本 <input id="catVersion" type="number" min="1" style="width:70px" placeholder="版本">
+    摘要(完整/≥12位前缀) <input id="catDigest" size="22" placeholder="sha256">
+    保留 <select id="catRetention">
+      <option value="">全部</option><option value="NONE">未设置</option>
+      <option value="UNTIL">到期保留</option><option value="PERMANENT">永久保留</option>
+    </select>
+    <label class="muted"><input type="checkbox" id="catCleaned"> 含已清理</label>
+    <button onclick="searchCatalog()">检索</button>
+    <button class="plain" onclick="searchByDigest()">按摘要查询</button>
+  </div>
+  <div id="catalogMsg" class="msg"></div>
+  <table>
+    <thead><tr><th>归档</th><th>回放</th><th>业务分组</th><th>版本</th><th>状态</th>
+      <th>内容摘要</th><th>保留状态</th><th>引用</th><th>占用</th><th>清理状态</th><th>保留策略操作</th></tr></thead>
+    <tbody id="catalogBody"></tbody>
+  </table>
+
+  <b style="display:block;margin:14px 0 4px">清理计划</b>
+  <div>
+    归档 ID 列表(逗号或空格分隔)
+    <input id="cpIds" size="60" placeholder="A... , A...">
+    <button class="danger" onclick="createCleanup()">发起清理计划</button>
+    <span class="muted">逐项返回跳过原因; 同时只执行一个计划, 其余排队</span>
+  </div>
+  <div id="cleanupMsg" class="msg"></div>
+  <table>
+    <thead><tr><th>计划</th><th>状态</th><th>进度</th><th>当前项</th><th>最近错误</th>
+      <th>操作者/时间</th><th>操作</th></tr></thead>
+    <tbody id="cleanupPlans"></tbody>
+  </table>
+  <div id="cleanupDetail"></div>
 </div>
 
 <div class="card">
@@ -1121,9 +1161,12 @@ function renderArchives(archives) {
     const digest = a.content_digest
       ? `<code style="font-size:11px">${a.digest_algorithm}:${a.content_digest.slice(0, 20)}…</code>`
       : '<span class="muted">-</span>';
+    const ret = retentionBadge(a.retention);
+    const ref = a.digest_group || {};
     return `<tr>
-      <td>${a.id}</td>
+      <td>${a.id}${a.cleaned ? '<div class="err">已清理</div>' : ''}</td>
       <td>${a.replay_id}<div class="muted">${escapeHtml(a.plan_name || '')} · ${a.plan_id || ''}</div></td>
+      <td>${(a.biz_groups || []).map(escapeHtml).join(', ') || '<span class="muted">-</span>'}</td>
       <td>v${a.report_version}</td>
       <td><span class="badge ${a.status}">${a.status}</span></td>
       <td><div class="bar" style="width:120px"><div style="width:${pct}%;background:#6a1b9a"></div></div>
@@ -1131,6 +1174,8 @@ function renderArchives(archives) {
       <td>${archiveStageText(a.current_stage)}</td>
       <td>${digest}<div class="muted">${a.package_size ? (a.package_size + ' 字节') : ''}
         ${a.package_available ? ' · 包存在' : (a.status==='COMPLETED' ? ' · <span class="err">包缺失</span>' : '')}</div></td>
+      <td>${ret}</td>
+      <td>${ref.reference_count != null ? `${ref.reference_count}${ref.is_canonical ? ' (主)' : ''}` : '-'}</td>
       <td>${a.failure_reason
         ? `<span class="err">${escapeHtml(a.failure_reason)}</span>`
         : '<span class="ok">-</span>'}</td>
@@ -1143,8 +1188,17 @@ function renderArchives(archives) {
         <button class="plain" ${canPackage?'':'disabled'} onclick="verifyArchive('${a.id}')">校验摘要</button>
         <button class="plain" onclick="toggleArchiveDetail('${a.id}', this)">详情</button>
       </td></tr>
-      <tr id="ard-${a.id}-row" style="display:none"><td colspan="10" id="ard-${a.id}"></td></tr>`;
-  }).join('') || '<tr><td colspan="10" class="muted">尚无归档任务</td></tr>';
+      <tr id="ard-${a.id}-row" style="display:none"><td colspan="13" id="ard-${a.id}"></td></tr>`;
+  }).join('') || '<tr><td colspan="13" class="muted">尚无归档任务</td></tr>';
+}
+
+function retentionBadge(r) {
+  if (!r) return '-';
+  if (r.mode === 'PERMANENT') return '<span class="badge DONE" title="永久保留, 清理跳过">🔒 永久</span>';
+  if (r.mode === 'UNTIL') return r.retained
+    ? `<span class="badge VALIDATED" title="保留至 ${r.retain_until}">⏳ 保留中</span><div class="muted" style="font-size:10px">至 ${(r.retain_until||'').replace('T',' ').slice(0,16)}</div>`
+    : `<span class="muted">已到期</span><div class="muted" style="font-size:10px">${(r.retain_until||'').replace('T',' ').slice(0,16)}</div>`;
+  return '<span class="muted">无</span>';
 }
 
 async function createArchive() {
@@ -1212,9 +1266,188 @@ async function toggleArchiveDetail(aid, btn) {
   btn.textContent = '收起';
 }
 
+// ---------- 归档目录检索 / 保留策略 / 清理计划 ----------
+
+function showCatalogMsg(ok, text) {
+  const el = document.getElementById('catalogMsg');
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+}
+
+function showCleanupMsg(ok, text) {
+  const el = document.getElementById('cleanupMsg');
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+}
+
+async function searchCatalog() {
+  const p = new URLSearchParams();
+  const rid = document.getElementById('catReplay').value.trim();
+  const biz = document.getElementById('catBiz').value.trim();
+  const ver = document.getElementById('catVersion').value.trim();
+  const dig = document.getElementById('catDigest').value.trim();
+  const ret = document.getElementById('catRetention').value;
+  if (rid) p.set('replay_id', rid);
+  if (biz) p.set('biz', biz);
+  if (ver) p.set('report_version', ver);
+  if (dig) p.set('content_digest', dig);
+  if (ret) p.set('retention', ret);
+  if (document.getElementById('catCleaned').checked) p.set('include_cleaned', 'true');
+  const rows = await (await fetch('/api/admin/archives?' + p.toString())).json();
+  renderCatalog(rows);
+  showCatalogMsg(true, `检索到 ${rows.length} 个归档`);
+}
+
+async function searchByDigest() {
+  const dig = document.getElementById('catDigest').value.trim();
+  if (dig.length < 12) { showCatalogMsg(false, '按摘要查询需要完整 sha256 或至少 12 位前缀'); return; }
+  const j = await (await fetch('/api/admin/archives/by-digest/' + encodeURIComponent(dig))).json();
+  renderCatalog(j.archives || [], j.digest_groups || []);
+  const refs = (j.digest_groups || []).map(g => `${g.content_digest.slice(0,12)}…: 引用 ${g.reference_count}, 主 ${g.canonical_archive_id||'-'}`).join('; ');
+  showCatalogMsg(true, `按摘要命中 ${j.count} 个归档${refs ? ' (' + refs + ')' : ''}`);
+}
+
+function renderCatalog(rows, groups) {
+  const gmap = {};
+  (groups || []).forEach(g => { gmap[g.content_digest] = g; });
+  document.getElementById('catalogBody').innerHTML = rows.map(a => {
+    const g = a.digest_group || {};
+    const inUse = a.in_use
+      ? `<span class="badge RUNNING">下载 ${a.active_downloads}/校验 ${a.active_verifies}</span>`
+      : '<span class="muted">空闲</span>';
+    return `<tr>
+      <td>${a.id}${a.cleaned ? '<div class="err">已清理 ' + (a.cleaned_at||'').slice(0,16) + '</div>' : ''}</td>
+      <td>${a.replay_id}</td>
+      <td>${(a.biz_groups || []).map(escapeHtml).join(', ') || '-'}</td>
+      <td>v${a.report_version}</td>
+      <td><span class="badge ${a.status}">${a.status}</span></td>
+      <td><code style="font-size:11px">${(a.content_digest||'').slice(0,20)}…</code></td>
+      <td>${retentionBadge(a.retention)}</td>
+      <td>${g.reference_count != null ? `${g.reference_count}${g.is_canonical ? ' (主)' : ''}` : '-'}</td>
+      <td>${inUse}</td>
+      <td>${a.cleaned ? `清理计划 ${a.cleanup_plan_id||''}` : '<span class="ok">存活</span>'}</td>
+      <td style="white-space:nowrap">
+        <button class="plain" ${a.status==='COMPLETED'&&!a.cleaned?'':'disabled'}
+          onclick="setArchiveRetention('${a.id}','PERMANENT')">永久保留</button>
+        <button class="plain" ${a.status==='COMPLETED'&&!a.cleaned?'':'disabled'}
+          onclick="setArchiveRetentionUntil('${a.id}')">到期保留</button>
+        <button class="plain" ${a.status==='COMPLETED'&&!a.cleaned?'':'disabled'}
+          onclick="setArchiveRetention('${a.id}','NONE')">清除策略</button>
+      </td></tr>`;
+  }).join('') || '<tr><td colspan="11" class="muted">无匹配归档(试试放宽检索条件)</td></tr>';
+}
+
+async function setArchiveRetention(aid, mode, until) {
+  const body = { operator: operator(), idempotency_key: idemKey(), mode };
+  if (until) body.retain_until = until;
+  const r = await fetch(`/api/admin/archives/${aid}/retention`, {
+    method: 'PUT', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body) });
+  const j = await r.json();
+  if (r.status === 200) showCatalogMsg(true, (j.replayed?'[幂等重放] ':'') + j.detail);
+  else showCatalogMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  searchCatalog();
+}
+
+function setArchiveRetentionUntil(aid) {
+  const v = prompt('保留到期时间(UTC, ISO 8601, 如 2026-12-31T23:59:00Z)。留空取消。',
+    new Date(Date.now() + 90*86400*1000).toISOString().slice(0,10) + 'T23:59:00Z');
+  if (v === null) return;
+  if (!v) return;
+  setArchiveRetention(aid, 'UNTIL', v);
+}
+
+async function createCleanup() {
+  const ids = document.getElementById('cpIds').value.split(/[\s,]+/).filter(Boolean);
+  if (!ids.length) { showCleanupMsg(false, '请填写至少一个归档 ID'); return; }
+  const { status, j } = await post('/api/admin/archive-cleanups',
+    { operator: operator(), idempotency_key: idemKey(), archive_ids: ids });
+  if (status === 201) {
+    showCleanupMsg(true, (j.replayed?'[幂等重放] ':'') + j.detail);
+    document.getElementById('cpIds').value = '';
+  } else {
+    showCleanupMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  }
+  document.getElementById('idem').value = '';
+  refreshCleanupPlans();
+}
+
+async function refreshCleanupPlans() {
+  const rows = await (await fetch('/api/admin/archive-cleanups')).json();
+  document.getElementById('cleanupPlans').innerHTML = rows.map(p => {
+    const pr = p.progress, pct = pr.total ? Math.round(100 * pr.processed / pr.total) : 0;
+    const active = ['QUEUED','RUNNING','PAUSED','FAILED'].includes(p.status);
+    return `<tr>
+      <td>${p.id}</td>
+      <td><span class="badge ${p.status}">${p.status}</span></td>
+      <td><div class="bar" style="width:140px"><div style="width:${pct}%;background:#ad1457"></div></div>
+        <span class="muted">${pr.processed}/${pr.total}
+          <span class="ok">清理 ${pr.cleaned}</span> /
+          <span class="err">跳过 ${pr.skipped}</span> /
+          <span class="err">失败 ${pr.failed}</span></span></td>
+      <td>${p.current_archive_id || '-'}</td>
+      <td>${p.last_error ? '<span class="err">'+escapeHtml(p.last_error)+'</span>' : '-'}</td>
+      <td>${escapeHtml(p.operator)}<div class="muted">${(p.created_at||'').slice(0,16)}</div></td>
+      <td style="white-space:nowrap">
+        <button class="plain" ${p.status==='QUEUED'||p.status==='RUNNING'?'':'disabled'}
+          onclick="cleanupAct('${p.id}','pause')">暂停</button>
+        <button class="plain" ${p.status==='PAUSED'||p.status==='FAILED'?'':'disabled'}
+          onclick="cleanupAct('${p.id}','resume')">恢复</button>
+        <button class="danger" ${p.status==='QUEUED'||p.status==='RUNNING'||p.status==='PAUSED'?'':'disabled'}
+          onclick="cleanupAct('${p.id}','cancel')">取消</button>
+        <button class="plain" onclick="toggleCleanupDetail('${p.id}', this)">逐项结果</button>
+      </td></tr>
+      <tr id="cpd-${p.id}-row" style="display:none"><td colspan="7" id="cpd-${p.id}"></td></tr>`;
+  }).join('') || '<tr><td colspan="7" class="muted">尚无清理计划</td></tr>';
+}
+
+async function cleanupAct(pid, name) {
+  const { status, j } = await post(`/api/admin/archive-cleanups/${pid}/${name}`,
+    { operator: operator(), idempotency_key: idemKey() });
+  if (status === 200) showCleanupMsg(j.ok, (j.replayed?'[幂等重放] ':'') + j.detail);
+  else showCleanupMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+  document.getElementById('idem').value = '';
+  refreshCleanupPlans();
+}
+
+async function toggleCleanupDetail(pid, btn) {
+  const row = document.getElementById('cpd-' + pid + '-row');
+  const box = document.getElementById('cpd-' + pid);
+  if (row.style.display !== 'none') { row.style.display = 'none'; btn.textContent = '逐项结果'; return; }
+  const p = await (await fetch('/api/admin/archive-cleanups/' + pid)).json();
+  const reasonBadge = {
+    not_found: '归档不存在', not_completed: '归档活动中', already_cleaned: '已清理',
+    retained_until: '保留期内', retained_permanent: '永久保留',
+    in_use_download: '正在下载', in_use_verify: '正在校验',
+    package_missing: '包缺失', file_delete_failed: '文件删除失败',
+    digest_referenced: '仍被同摘要引用', internal_error: '内部错误' };
+  box.innerHTML = `
+    <table><thead><tr><th>#</th><th>归档</th><th>结果</th><th>跳过/失败原因</th>
+      <th>说明</th><th>处理人</th><th>时间</th></tr></thead><tbody>
+    ${(p.items||[]).map(i => {
+      const cls = i.status === 'CLEANED' ? 'ok' : (i.status === 'SKIPPED' || i.status === 'SKIPPED_CANCELED' ? 'muted' : 'err');
+      return `<tr><td>${i.position+1}</td><td>${i.archive_id}</td>
+        <td class="${cls}">${i.status}</td>
+        <td>${i.reason_code ? '<span class="err">'+(reasonBadge[i.reason_code]||i.reason_code)+'</span>' : '-'}</td>
+        <td>${escapeHtml(i.reason || '')}</td>
+        <td>${escapeHtml(i.processed_by||'')}</td><td>${(i.processed_at||'').slice(0,19)}</td></tr>`;
+    }).join('')}</tbody></table>
+    <b style="display:block;margin-top:6px">事件流水</b>
+    <table><tbody>${(p.events||[]).map(e =>
+      `<tr><td class="muted">${(e.ts||'').slice(0,19)}</td><td>${e.event}</td>
+       <td>${escapeHtml(e.operator||'')}</td><td>${escapeHtml(e.reason||'')}</td></tr>`).join('')}
+    </tbody></table>`;
+  row.style.display = '';
+  btn.textContent = '收起';
+}
+
 refresh();
 addPlanStepRow(1);
 addPlanStepRow(2);
+searchCatalog();
+refreshCleanupPlans();
+setInterval(refreshCleanupPlans, 3000);
 setInterval(refresh, 3000);
 </script>
 </body>

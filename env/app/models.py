@@ -507,6 +507,8 @@ class ReplayArchive(Base):
     plan_name = Column(String(200), nullable=True)
     checkpoint_id = Column(String(32), nullable=True)
     report_version = Column(Integer, nullable=False)   # 归档指定(锁定)的报告版本
+    # 归档目录检索: 归档时从回放各步骤关联批次反查并固化的业务分组集合
+    biz_groups = Column(JSON, nullable=True)
     status = Column(String(16), nullable=False, default="QUEUED", index=True)
     # 进度按归档单元计: 1(校验) + N(逐步报告) + 复核结论 + 分派历史 + 审计摘要 + 打包
     total_units = Column(Integer, nullable=False, default=0)
@@ -515,12 +517,29 @@ class ReplayArchive(Base):
     # 归档单元产物的暂存(打包后清空); 崩溃/重启后按已提交单元续跑, 不重复副作用
     staging = Column(JSON, nullable=True)
     manifest = Column(JSON, nullable=True)              # 包清单(逐文件大小/摘要/总摘要)
-    content_digest = Column(String(64), nullable=True)  # 包内容摘要(sha256 hex)
+    content_digest = Column(String(64), nullable=True, index=True)  # 包内容摘要(sha256 hex)
     digest_algorithm = Column(String(16), nullable=False, default="sha256")
-    package_path = Column(String(500), nullable=True)   # 归档包(zip)落盘路径
+    package_path = Column(String(500), nullable=True)   # 归档包(zip)落盘路径(同摘要成员共享同一物理文件)
     package_size = Column(Integer, nullable=True)
     failure_code = Column(String(48), nullable=True)    # 机器可读失败码
     failure_reason = Column(String(500), nullable=True)  # FAILED 终态原因(页面展示)
+    # ---------- 保留策略(归档目录生命周期) ----------
+    # NONE=未设置保留策略(默认可被清理); UNTIL=保留到 retain_until(到期前不可清理);
+    # PERMANENT=永久保留标记(任何清理计划都跳过)。策略持久化, 服务重启不丢失。
+    retention_mode = Column(String(16), nullable=False, default="NONE")
+    retain_until = Column(DateTime, nullable=True)
+    retention_set_by = Column(String(128), nullable=True)
+    retention_set_at = Column(DateTime, nullable=True)
+    # ---------- 下载/校验并发协调(使用计数) ----------
+    # 计数 > 0 表示归档包正在下载或摘要校验, 清理逐项跳过(in_use_download/in_use_verify);
+    # 行锁 + 写事务串行化清理与下载/校验, 归档正在使用时物理文件绝不被删除。
+    # 进程崩溃遗留的计数由重启对账清零(进程死亡意味着在途请求已不存在)。
+    active_downloads = Column(Integer, nullable=False, default=0)
+    active_verifies = Column(Integer, nullable=False, default=0)
+    # ---------- 清理(软删除): 清理只打标记不删归档行, 操作结果与跳过原因永久可查 ----------
+    cleaned_at = Column(DateTime, nullable=True, index=True)
+    cleaned_by = Column(String(128), nullable=True)
+    cleanup_plan_id = Column(String(32), nullable=True)
     created_by = Column(String(128), nullable=False)
     updated_by = Column(String(128), nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -530,11 +549,14 @@ class ReplayArchive(Base):
 
     events = relationship("ReplayArchiveEvent", cascade="all, delete-orphan",
                           order_by="desc(ReplayArchiveEvent.id)")
+    digest_membership = relationship(
+        "ArchiveDigestMember", uselist=False, cascade="all, delete-orphan",
+        back_populates="archive")
 
 
 class ReplayArchiveEvent(Base):
     """归档任务事件流水(只追加): 创建/排队/认领/暂停/恢复/取消/单元进度/
-    完成/失败/重启对账/下载/校验。归档不写回放事件表与业务审计表。"""
+    完成/失败/重启对账/下载/校验/保留策略/清理。归档不写回放事件表与业务审计表。"""
 
     __tablename__ = "replay_archive_events"
 
@@ -547,3 +569,100 @@ class ReplayArchiveEvent(Base):
     operator = Column(String(128), nullable=False)
     reason = Column(String(500), nullable=True)
     detail = Column(JSON, nullable=True)
+
+
+# ---------- 归档目录: 同摘要去重与引用关系 ----------
+# 每个 COMPLETED 归档按内容摘要(content_digest)在 archive_digest_members 登记一行;
+# 同摘要的多个归档互为去重成员, 物理 zip 只保留一份(canonical 指向的成员文件),
+# 其余成员共享该路径。引用数 = 同摘要中仍存活(未清理)的成员数; 清理 canonical 前
+# 必须把物理文件移交给其他存活成员(引用记录保留), 任何被引用的记录/文件不受影响。
+class ArchiveDigestMember(Base):
+    __tablename__ = "archive_digest_members"
+    __table_args__ = (
+        UniqueConstraint("archive_id", name="uq_digest_member_archive"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    content_digest = Column(String(64), nullable=False, index=True)
+    archive_id = Column(String(32), ForeignKey("replay_archives.id"),
+                        nullable=False, index=True)
+    # 是否持有物理 zip 文件的规范成员; 同摘要至多一行为 True
+    is_canonical = Column(Boolean, nullable=False, default=False)
+    created_at = Column(DateTime, default=_utcnow)
+
+    archive = relationship("ReplayArchive", back_populates="digest_membership")
+
+
+# ---------- 归档清理计划(生命周期) ----------
+# QUEUED(排队) -> RUNNING -> COMPLETED(终态); pause 在逐项边界停住(PAUSED),
+# resume 重新排队; cancel 把未处理项置 SKIPPED; 清理执行遇未预期错误 -> FAILED
+# (保留进度, 可 resume 从未完成项继续)。逐项跳过原因永久保留可查。
+CLEANUP_PLAN_STATUSES = ("QUEUED", "RUNNING", "PAUSED", "CANCELED", "COMPLETED", "FAILED")
+CLEANUP_ITEM_STATUSES = ("PENDING", "RUNNING", "CLEANED", "SKIPPED", "FAILED", "SKIPPED_CANCELED")
+CLEANUP_ACTIVE_STATUSES = ("QUEUED", "RUNNING", "PAUSED")
+
+# 逐项跳过/失败原因(机器可读)
+CLEANUP_REASONS = (
+    "not_found",                 # 归档不存在
+    "not_completed",             # 归档尚在活动状态(QUEUED/RUNNING/PAUSED)
+    "already_cleaned",           # 已被清理(可能由其他计划清理)
+    "retained_until",            # 仍在带到期时间的保留期内
+    "retained_permanent",        # 永久保留标记
+    "in_use_download",           # 归档正在下载
+    "in_use_verify",             # 归档正在摘要校验
+    "package_missing",           # 包文件已不存在(记录仍软清理)
+    "file_delete_failed",        # 物理文件删除失败
+    "digest_referenced",         # 规范成员移交失败: 同摘要仍有其他引用
+    "internal_error",            # 未预期错误
+)
+
+
+class ArchiveCleanupPlan(Base):
+    """归档清理计划: 管理员对一批归档发起的生命周期清理。
+
+    逐项独立事务提交: 成功的项 CLEANED(归档软删除, 物理包按引用规则处理),
+    被保留策略/下载校验占用等阻止的项 SKIPPED 并记录跳过原因。计划排队执行,
+    支持暂停/恢复/取消, 进度、逐项结果与跳过原因全部落库, 重启后保留。"""
+
+    __tablename__ = "archive_cleanup_plans"
+
+    id = Column(String(32), primary_key=True)          # "CP" + 随机串
+    operator = Column(String(128), nullable=False)
+    idempotency_key = Column(String(128), nullable=True, unique=True)
+    status = Column(String(16), nullable=False, default="QUEUED", index=True)
+    total_items = Column(Integer, nullable=False, default=0)
+    cleaned_items = Column(Integer, nullable=False, default=0)
+    skipped_items = Column(Integer, nullable=False, default=0)
+    failed_items = Column(Integer, nullable=False, default=0)
+    current_archive_id = Column(String(32), nullable=True)  # 当前处理项(页面进度)
+    last_error = Column(String(500), nullable=True)
+    events = Column(JSON, nullable=False, default=list)     # 计划事件流水(只追加)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+
+    items = relationship("ArchiveCleanupItem", cascade="all, delete-orphan",
+                         order_by="ArchiveCleanupItem.id")
+
+
+class ArchiveCleanupItem(Base):
+    """清理计划逐项结果: 每个归档一行; 状态(CLEANED/SKIPPED/...)与机器可读
+    跳过/失败原因、说明在同事务落库, 重启后可查询, 是页面逐项跳过原因的来源。"""
+
+    __tablename__ = "archive_cleanup_items"
+    __table_args__ = (
+        UniqueConstraint("plan_id", "archive_id", name="uq_cleanup_item_archive"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    plan_id = Column(String(32), ForeignKey("archive_cleanup_plans.id"),
+                     nullable=False, index=True)
+    # 刻意不加 FK 到 replay_archives: 计划创建时归档 id 可能在执行时已不存在
+    archive_id = Column(String(32), nullable=False, index=True)
+    position = Column(Integer, nullable=False)         # 计划内顺序
+    status = Column(String(20), nullable=False, default="PENDING", index=True)
+    reason_code = Column(String(32), nullable=True)    # CLEANUP_REASONS 之一
+    reason = Column(String(500), nullable=True)        # 人类可读跳过/失败说明
+    processed_by = Column(String(128), nullable=True)
+    processed_at = Column(DateTime, nullable=True)

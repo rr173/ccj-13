@@ -41,9 +41,10 @@ from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import flag_modified
 
 from .models import (
-    AuditLog, IdempotencyKey, MigrationBatch, ReplayArchive, ReplayArchiveEvent,
-    ReplayAssignment, ReplayCheckpoint, ReplayCheckpointStep, ReplayReview,
-    ReplayTask, ReplayTaskStep,
+    AuditLog, ArchiveDigestMember, IdempotencyKey, MigrationBatch,
+    MigrationPlan, ReplayArchive, ReplayArchiveEvent, ReplayAssignment,
+    ReplayCheckpoint, ReplayCheckpointStep, ReplayReview, ReplayTask,
+    ReplayTaskStep,
 )
 
 # 归档单元(阶段)顺序: 校验 -> 逐步报告 -> 复核结论 -> 分派历史 -> 审计摘要 -> 打包
@@ -207,7 +208,8 @@ def active_archive_for_replay(session: Session,
     from .models import ARCHIVE_ACTIVE_STATUSES
     return (session.query(ReplayArchive)
             .filter(ReplayArchive.replay_id == replay_id,
-                    ReplayArchive.status.in_(ARCHIVE_ACTIVE_STATUSES))
+                    ReplayArchive.status.in_(ARCHIVE_ACTIVE_STATUSES),
+                    ReplayArchive.cleaned_at.is_(None))
             .order_by(ReplayArchive.created_at, ReplayArchive.id)
             .first())
 
@@ -229,7 +231,8 @@ def _existing_for(session: Session, replay_id: str,
                   version: int) -> ReplayArchive | None:
     return (session.query(ReplayArchive)
             .filter(ReplayArchive.replay_id == replay_id,
-                    ReplayArchive.report_version == version)
+                    ReplayArchive.report_version == version,
+                    ReplayArchive.cleaned_at.is_(None))
             .order_by(ReplayArchive.created_at.desc(), ReplayArchive.id.desc())
             .first())
 
@@ -272,6 +275,8 @@ def do_create_archive(session: Session, _archive, operator: str,
 
     archive_id = "A" + uuid.uuid4().hex[:10]
     total_units = 1 + task.total_steps + len(TAIL_STAGES)
+    # 归档目录检索用: 固化回放各步骤关联批次的业务分组集合(有序去重)
+    biz_groups = _replay_biz_groups(session, task.id)
     a = ReplayArchive(
         id=archive_id, replay_id=replay_id, plan_id=task.plan_id,
         plan_name=task.plan_name, checkpoint_id=task.checkpoint_id,
@@ -279,6 +284,7 @@ def do_create_archive(session: Session, _archive, operator: str,
         total_units=total_units, completed_units=0, current_stage=None,
         staging={"version": 1, "done": [], "data": {}},
         digest_algorithm=DIGEST_ALGORITHM,
+        biz_groups=biz_groups,
         created_by=operator, updated_by=operator)
     session.add(a)
     session.flush()
@@ -874,8 +880,20 @@ def _unit_package(session: Session, archive: ReplayArchive) -> None:
 
     archive.manifest = manifest
     archive.content_digest = content_digest
-    archive.package_path = path
-    archive.package_size = os.path.getsize(path)
+    # 同摘要去重: 物理包只保留一份(canonical 成员的文件), 其余成员共享该路径;
+    # 引用关系落 archive_digest_members, 原(canonical)归档删除前必须先移交文件,
+    # 仍被引用的记录与文件不受影响。
+    canonical_path = _register_digest_member(session, archive, content_digest, path)
+    if canonical_path != path:
+        # 已有同摘要成员: 删除本任务刚写出的副本, 共享 canonical 的物理文件
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        archive.package_path = canonical_path
+    else:
+        archive.package_path = path
+    archive.package_size = os.path.getsize(archive.package_path)
     archive.staging = None  # 包已不可变, 暂存清空
     archive.completed_units = archive.total_units
     archive.status = "COMPLETED"
@@ -1047,7 +1065,23 @@ def verify_package_bytes(path: str, *, expected_manifest: dict | None = None,
 def verify_archive(session: Session, archive: ReplayArchive,
                    operator: str = "system") -> dict:
     """归档包摘要校验: 重算并比对; 不一致/包缺失则把 COMPLETED 归档明确置为
-    FAILED(digest_mismatch/package_missing)并保留失败记录与事件。"""
+    FAILED(digest_mismatch/package_missing)并保留失败记录与事件。
+
+    校验全程持有使用计数(active_verifies+1), 与清理并发协调: 归档正在校验时
+    清理逐项跳过(in_use_verify), 物理文件绝不被删除。"""
+    if archive.status not in ("COMPLETED", "FAILED") or not archive.package_path:
+        raise ArchiveStateError(
+            f"归档任务 {archive.id} 当前状态 {archive.status}, 尚无归档包可校验"
+            f"(仅 COMPLETED 归档提供下载与校验)")
+    begin_archive_use(session, archive, "verify")
+    try:
+        return _verify_archive_locked(session, archive, operator)
+    finally:
+        end_archive_use(session, archive.id, "verify")
+
+
+def _verify_archive_locked(session: Session, archive: ReplayArchive,
+                           operator: str) -> dict:
     if archive.status not in ("COMPLETED", "FAILED") or not archive.package_path:
         raise ArchiveStateError(
             f"归档任务 {archive.id} 当前状态 {archive.status}, 尚无归档包可校验"
@@ -1087,7 +1121,9 @@ def verify_archive(session: Session, archive: ReplayArchive,
 
 def package_path_for_download(session: Session, archive: ReplayArchive,
                               operator: str = "system") -> str:
-    """下载前解析包路径并做存在性检查; COMPLETED 包缺失则明确失败并记录。"""
+    """下载前解析包路径、登记在途下载并做存在性检查; COMPLETED 包缺失则明确
+    失败并记录。使用计数(active_downloads+1)必须在响应发送完毕后由调用方
+    end_archive_use 释放; 期间清理计划逐项跳过(in_use_download)。"""
     if archive.status not in ("COMPLETED", "FAILED") or not archive.package_path:
         raise ArchiveStateError(
             f"归档任务 {archive.id} 当前状态 {archive.status}, 尚无归档包可下载")
@@ -1105,10 +1141,294 @@ def package_path_for_download(session: Session, archive: ReplayArchive,
                       detail={"package_path": archive.package_path})
             session.commit()
         raise ArchiveNotFound(f"归档 {archive.id} 的归档包文件不存在")
+    begin_archive_use(session, archive, "download")
     add_event(session, archive_id=archive.id, event="download", operator=operator,
               detail={"package_path": archive.package_path})
     session.commit()
     return archive.package_path
+
+
+# ---------- 归档目录: 业务分组 / 同摘要去重与引用关系 ----------
+
+def _replay_biz_groups(session: Session, replay_id: str) -> list[str]:
+    """从回放步骤关联批次反查业务分组集合(有序去重), 归档时固化供目录检索。"""
+    rows = (session.query(MigrationBatch.biz)
+            .join(ReplayTaskStep,
+                  ReplayTaskStep.batch_id == MigrationBatch.id)
+            .filter(ReplayTaskStep.task_id == replay_id)
+            .order_by(ReplayTaskStep.seq).all())
+    seen: set[str] = set()
+    groups: list[str] = []
+    for (biz,) in rows:
+        if biz and biz not in seen:
+            seen.add(biz)
+            groups.append(biz)
+    return groups
+
+
+def _register_digest_member(session: Session, archive: ReplayArchive,
+                            content_digest: str, path: str) -> str:
+    """归档完成时登记摘要成员关系(同事务)。同摘要已有存活 canonical 成员则复用
+    其物理文件(返回 canonical 路径); 否则本归档成为 canonical(返回 path)。
+
+    极端情况下原 canonical 已软清理(文件移交失败/手工干预): 由最早的存活成员
+    接管 canonical, 其包文件必须存在且摘要匹配, 不匹配则本归档文件接管。"""
+    members = (session.query(ArchiveDigestMember)
+               .filter(ArchiveDigestMember.content_digest == content_digest)
+               .order_by(ArchiveDigestMember.id).all())
+    live = []
+    for m in members:
+        other = session.get(ReplayArchive, m.archive_id)
+        if other is not None and other.cleaned_at is None and other.package_path:
+            live.append((m, other))
+    for m, other in live:
+        if m.is_canonical and os.path.exists(other.package_path):
+            if not session.get(ArchiveDigestMember,
+                              _member_pk_for_archive(session, archive.id)):
+                session.add(ArchiveDigestMember(
+                    content_digest=content_digest, archive_id=archive.id,
+                    is_canonical=False))
+            add_event(session, archive_id=archive.id, event="digest.dedup",
+                      operator="system",
+                      reason=(f"内容摘要与归档 {other.id} 相同, 已去重并共享物理归档包: "
+                              f"引用关系保留, 本归档引用数计入同摘要组"),
+                      detail={"content_digest": content_digest,
+                              "canonical_archive_id": other.id,
+                              "shared_path": other.package_path})
+            return other.package_path
+    # 无可用 canonical: 本归档接管
+    for m, _other in live:
+        m.is_canonical = False
+    session.add(ArchiveDigestMember(
+        content_digest=content_digest, archive_id=archive.id,
+        is_canonical=True))
+    add_event(session, archive_id=archive.id, event="digest.register",
+              operator="system",
+              reason=(f"内容摘要登记: {content_digest[:16]}…, "
+                      f"本归档为该摘要的规范(canonical)成员, 持有物理归档包"),
+              detail={"content_digest": content_digest})
+    return path
+
+
+def _member_pk_for_archive(session: Session, archive_id: str) -> int | None:
+    m = (session.query(ArchiveDigestMember.id)
+         .filter(ArchiveDigestMember.archive_id == archive_id).first())
+    return m[0] if m else None
+
+
+def digest_group_view(session: Session, content_digest: str) -> dict:
+    """同摘要归档组视图: canonical、全部成员(含引用关系与是否存活)、存活引用数。"""
+    members = (session.query(ArchiveDigestMember)
+               .filter(ArchiveDigestMember.content_digest == content_digest)
+               .order_by(ArchiveDigestMember.id).all())
+    refs = []
+    live_refs = 0
+    canonical_id = None
+    for m in members:
+        a = session.get(ReplayArchive, m.archive_id)
+        alive = bool(a and a.cleaned_at is None)
+        if m.is_canonical:
+            canonical_id = m.archive_id
+        if alive:
+            live_refs += 1
+        refs.append({
+            "archive_id": m.archive_id,
+            "is_canonical": m.is_canonical,
+            "alive": alive,
+            "cleaned_at": _dt(a.cleaned_at) if a else None,
+            "replay_id": a.replay_id if a else None,
+            "report_version": a.report_version if a else None,
+            "created_at": _dt(a.created_at) if a else None,
+        })
+    return {"content_digest": content_digest,
+            "canonical_archive_id": canonical_id,
+            "reference_count": live_refs,
+            "members": refs}
+
+
+# ---------- 保留策略(到期保留 / 永久保留标记) ----------
+
+RETENTION_MODES = ("NONE", "UNTIL", "PERMANENT")
+
+
+def is_retained(archive: ReplayArchive, at=None) -> tuple[bool, str | None, str | None]:
+    """归档当前是否受保留策略保护。返回(受保护, 原因码, 说明)。
+    软清理/非 COMPLETED 的归档不参与保留判定。"""
+    if archive.cleaned_at is not None or archive.status != "COMPLETED":
+        return False, None, None
+    if archive.retention_mode == "PERMANENT":
+        return True, "retained_permanent", "归档带有永久保留标记"
+    if archive.retention_mode == "UNTIL":
+        until = archive.retain_until
+        cur = at or now_utc_naive()
+        if until is not None and until > cur:
+            return True, "retained_until", (
+                f"归档处于保留期内(保留至 {until.isoformat()} UTC)")
+    return False, None, None
+
+
+def retention_dict(archive: ReplayArchive) -> dict:
+    retained, code, reason = is_retained(archive)
+    return {
+        "mode": archive.retention_mode or "NONE",
+        "retain_until": _dt(archive.retain_until),
+        "set_by": archive.retention_set_by,
+        "set_at": _dt(archive.retention_set_at),
+        "retained": retained,
+        "retain_reason": code,
+        "retain_detail": reason,
+        "expired": (archive.retention_mode == "UNTIL" and not retained
+                    and archive.cleaned_at is None and archive.status == "COMPLETED"),
+    }
+
+
+def set_retention(session: Session, archive: ReplayArchive, operator: str,
+                  mode: str, retain_until=None) -> dict:
+    """为已完成归档设置保留策略: UNTIL(必须带未来的到期时间)/PERMANENT/NONE(清除)。
+    策略持久化, 服务重启后保留; 仍在保留期或永久保留的归档会被清理逐项跳过。"""
+    if archive.cleaned_at is not None:
+        raise ArchiveStateError(f"归档 {archive.id} 已被清理, 不能再设置保留策略")
+    if archive.status != "COMPLETED":
+        raise ArchiveStateError(
+            f"归档任务 {archive.id} 当前状态 {archive.status}, "
+            f"只有 COMPLETED 归档才能设置保留策略")
+    if mode not in RETENTION_MODES:
+        raise ArchiveStateError(
+            f"保留模式必须是 {list(RETENTION_MODES)} 之一(收到 {mode!r})")
+    until_dt = None
+    if mode == "UNTIL":
+        if retain_until is None:
+            raise ArchiveStateError("保留模式 UNTIL 必须提供到期时间 retain_until")
+        from datetime import datetime
+        try:
+            until_dt = (retain_until if isinstance(retain_until, datetime)
+                        else datetime.fromisoformat(
+                            str(retain_until).replace("Z", "+00:00")))
+        except (ValueError, TypeError):
+            raise ArchiveStateError(f"retain_until 不是合法的 ISO 8601 时间: {retain_until!r}")
+        if until_dt.tzinfo is not None:
+            from datetime import timezone
+            until_dt = until_dt.astimezone(timezone.utc).replace(tzinfo=None)
+        if until_dt <= now_utc_naive():
+            raise ArchiveStateError(
+                f"保留到期时间必须晚于当前时间(收到 {until_dt.isoformat()} UTC)")
+    old_mode = archive.retention_mode
+    old_until = archive.retain_until
+    archive.retention_mode = mode
+    archive.retain_until = until_dt
+    archive.retention_set_by = operator
+    archive.retention_set_at = now_utc_naive()
+    archive.updated_by = operator
+    if mode == "PERMANENT":
+        detail = "已设置永久保留标记: 任何清理计划都将跳过该归档"
+    elif mode == "UNTIL":
+        detail = f"已设置保留策略: 保留至 {until_dt.isoformat()} UTC, 到期前不可清理"
+    else:
+        detail = "已清除保留策略, 归档可被清理计划处理"
+    add_event(session, archive_id=archive.id, event="retention.set", operator=operator,
+              reason=detail,
+              detail={"from_mode": old_mode,
+                      "from_retain_until": _dt(old_until),
+                      "to_mode": mode, "to_retain_until": _dt(until_dt)})
+    session.commit()
+    return {"ok": True, "archive_id": archive.id, "retention": retention_dict(archive),
+            "detail": detail}
+
+
+# ---------- 下载 / 摘要校验并发协调(使用计数) ----------
+
+def begin_archive_use(session: Session, archive: ReplayArchive, kind: str) -> None:
+    """登记一次下载(download)/校验(verify)在途使用, 与行锁同事务提交。
+    清理计划在逐项处理时看到计数 > 0 即跳过(in_use_download/in_use_verify),
+    保证归档正在下载或校验时物理文件绝不被删除。"""
+    a = lock_archive(session, archive.id)
+    if kind == "download":
+        a.active_downloads = (a.active_downloads or 0) + 1
+    else:
+        a.active_verifies = (a.active_verifies or 0) + 1
+    a.updated_by = "system"
+    session.commit()
+
+
+def end_archive_use(session: Session, archive_id: str, kind: str) -> None:
+    """在途下载/校验结束(响应已发送/校验完成), 释放使用计数。崩溃遗留计数由
+    重启对账清零(进程死亡意味着在途 HTTP 请求已不存在)。"""
+    try:
+        a = lock_archive(session, archive_id)
+        col = a.active_downloads if kind == "download" else a.active_verifies
+        if (col or 0) > 0:
+            if kind == "download":
+                a.active_downloads = col - 1
+            else:
+                a.active_verifies = col - 1
+        session.commit()
+    except Exception:
+        session.rollback()
+
+
+def archive_in_use(archive: ReplayArchive) -> tuple[bool, str | None, str | None]:
+    """归档是否正在下载/校验。返回(在使用, 原因码, 说明)。"""
+    if (archive.active_downloads or 0) > 0:
+        return True, "in_use_download", (
+            f"归档正在下载中({archive.active_downloads} 个在途下载), 不能清理")
+    if (archive.active_verifies or 0) > 0:
+        return True, "in_use_verify", (
+            f"归档正在摘要校验中({archive.active_verifies} 个在途校验), 不能清理")
+    return False, None, None
+
+
+# ---------- 归档目录检索 ----------
+
+def search_archives(session: Session, *, replay_id: str | None = None,
+                    biz: str | None = None, report_version: int | None = None,
+                    content_digest: str | None = None,
+                    status: str | None = None, retention: str | None = None,
+                    include_cleaned: bool = False) -> list[ReplayArchive]:
+    """归档目录多维检索: 按回放、业务分组、报告版本、内容摘要、归档状态、
+    保留状态过滤。默认仅返回未清理(存活)的归档。"""
+    q = session.query(ReplayArchive)
+    if not include_cleaned:
+        q = q.filter(ReplayArchive.cleaned_at.is_(None))
+    if replay_id:
+        q = q.filter(ReplayArchive.replay_id == replay_id)
+    if report_version is not None:
+        q = q.filter(ReplayArchive.report_version == report_version)
+    if status:
+        q = q.filter(ReplayArchive.status == status)
+    if biz:
+        if session.bind.dialect.name == "postgresql":
+            q = q.filter(ReplayArchive.biz_groups.op("?")(biz))
+        # SQLite 的 JSON 文本存储可能把中文转义成 \\uXXXX, 不能直接 LIKE 中文:
+        # 取候选行后在结果侧按精确成员校验兜底
+    rows = q.order_by(ReplayArchive.created_at, ReplayArchive.id).all()
+    if biz and session.bind.dialect.name != "postgresql":
+        rows = [a for a in rows if biz in (a.biz_groups or [])]
+    if content_digest:
+        d = content_digest.strip()
+        rows = [a for a in rows if a.content_digest and (
+            a.content_digest == d or
+            (len(d) >= 12 and a.content_digest.startswith(d)))]
+    if retention:
+        rows = [a for a in rows if (a.retention_mode or "NONE") == retention]
+    return rows
+
+
+def find_by_digest(session: Session, content_digest: str) -> list[ReplayArchive]:
+    """按内容摘要查询归档: 完整摘要精确匹配, 长度 >=12 的前缀也允许(消歧);
+    仅返回未清理的存活归档。"""
+    d = (content_digest or "").strip()
+    if not d:
+        return []
+    q = (session.query(ReplayArchive)
+         .filter(ReplayArchive.cleaned_at.is_(None),
+                 ReplayArchive.content_digest.isnot(None)))
+    if len(d) >= 64:
+        return q.filter(ReplayArchive.content_digest == d).order_by(
+            ReplayArchive.created_at, ReplayArchive.id).all()
+    if len(d) >= 12:
+        rows = q.order_by(ReplayArchive.created_at, ReplayArchive.id).all()
+        return [a for a in rows if a.content_digest.startswith(d)]
+    return []
 
 
 # ---------- 重启对账 ----------
@@ -1116,9 +1436,19 @@ def package_path_for_download(session: Session, archive: ReplayArchive,
 def boot_recover_archives(session: Session) -> None:
     """服务重启时: 遗留 RUNNING 归档(执行线程已死)回到 QUEUED 重新参与排队;
     已完成单元在 staging 中保留, worker 从首个未完成单元续跑。
-    QUEUED/PAUSED/终态任务保持不变(排队/暂停/失败记录都是持久化的用户态)。"""
+    QUEUED/PAUSED/终态任务保持不变(排队/暂停/失败记录都是持久化的用户态)。
+    下载/校验使用计数清零: 进程死亡意味着在途 HTTP 请求已不存在, 不得遗留
+    "永久在使用"而阻止清理; 保留策略、摘要引用关系与清理进度均在库中, 不动。"""
     rows = session.query(ReplayArchive).order_by(ReplayArchive.id).all()
     for a in rows:
+        if (a.active_downloads or 0) or (a.active_verifies or 0):
+            d, v = a.active_downloads or 0, a.active_verifies or 0
+            a.active_downloads = 0
+            a.active_verifies = 0
+            add_event(session, archive_id=a.id, event="boot.reset_use",
+                      operator="system",
+                      reason=(f"服务重启: 清零在途下载/校验计数"
+                              f"(下载 {d}, 校验 {v}), 保留策略与引用关系不变"))
         if a.status != "RUNNING":
             continue
         a.status = "QUEUED"
@@ -1197,6 +1527,16 @@ class ArchiveWorker:
 
 def archive_to_dict(session: Session, a: ReplayArchive, *,
                     with_events: bool = True) -> dict:
+    member = (session.query(ArchiveDigestMember)
+              .filter(ArchiveDigestMember.archive_id == a.id).first())
+    same_digest = (session.query(ArchiveDigestMember)
+                   .filter(ArchiveDigestMember.content_digest == a.content_digest)
+                   .all()) if a.content_digest else []
+    live_refs = 0
+    for m in same_digest:
+        other = session.get(ReplayArchive, m.archive_id)
+        if other is not None and other.cleaned_at is None:
+            live_refs += 1
     out = {
         "id": a.id,
         "replay_id": a.replay_id,
@@ -1204,6 +1544,7 @@ def archive_to_dict(session: Session, a: ReplayArchive, *,
         "plan_name": a.plan_name,
         "checkpoint_id": a.checkpoint_id,
         "report_version": a.report_version,
+        "biz_groups": a.biz_groups or [],
         "status": a.status,
         "progress": {"done": a.completed_units, "total": a.total_units},
         "completed_units": a.completed_units,
@@ -1218,6 +1559,24 @@ def archive_to_dict(session: Session, a: ReplayArchive, *,
         "manifest": a.manifest,
         "stages_planned": _planned_stages(a),
         "stages_done": list((a.staging or {}).get("done") or []),
+        # 保留策略与保留状态
+        "retention": retention_dict(a),
+        # 同摘要去重与引用关系
+        "digest_group": {
+            "content_digest": a.content_digest,
+            "is_canonical": bool(member and member.is_canonical),
+            "reference_count": live_refs,
+            "member_count": len(same_digest),
+        },
+        # 下载/校验并发状态(>0 时清理跳过)
+        "active_downloads": a.active_downloads or 0,
+        "active_verifies": a.active_verifies or 0,
+        "in_use": bool((a.active_downloads or 0) or (a.active_verifies or 0)),
+        # 清理(软删除)状态
+        "cleaned": a.cleaned_at is not None,
+        "cleaned_at": _dt(a.cleaned_at),
+        "cleaned_by": a.cleaned_by,
+        "cleanup_plan_id": a.cleanup_plan_id,
         "created_by": a.created_by,
         "updated_by": a.updated_by,
         "started_at": _dt(a.started_at),

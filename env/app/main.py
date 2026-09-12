@@ -1,23 +1,25 @@
 import os
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from .db import Base, SessionLocal, engine
 from .models import (
-    REVIEW_STATUSES, AuditLog, MigrationBatch, MigrationPlan, RecordNew,
-    RecordOld, ReplayArchive, ReplayBatchOp, ReplayCheckpoint, ReplayTask,
+    REVIEW_STATUSES, ArchiveCleanupPlan, AuditLog, MigrationBatch, MigrationPlan,
+    RecordNew, RecordOld, ReplayArchive, ReplayBatchOp, ReplayCheckpoint,
+    ReplayTask,
 )
 from .plans import PlanWorker
 from .replay import ReplayWorker
-from . import archives, plans, replay, service
+from . import archives, cleanup, plans, replay, service
 from .schemas import (
-    AdminAction, ArchiveAction, ArchiveCreate, BatchCreate, CheckpointCreate,
-    PlanAction, PlanCreate, PlanRejectAction, PlanWindowAction, RecordIn,
-    RecoverAction, ReplayAction, ReplayCreate, ReviewBatchAssign,
-    ReviewBatchReview, ReviewConfirm, ReviewReopen, ReviewSubmit,
+    AdminAction, ArchiveAction, ArchiveCreate, ArchiveRetention, BatchCreate,
+    CheckpointCreate, CleanupAction, CleanupCreate, PlanAction, PlanCreate,
+    PlanRejectAction, PlanWindowAction, RecordIn, RecoverAction, ReplayAction,
+    ReplayCreate, ReviewBatchAssign, ReviewBatchReview, ReviewConfirm,
+    ReviewReopen, ReviewSubmit,
 )
 
 APP_VERSION = service.APP_VERSION
@@ -32,6 +34,7 @@ app = FastAPI(title="结构迁移切换服务(按业务分组批次)", version=A
 worker = PlanWorker(poll_interval=float(os.getenv("PLAN_WORKER_POLL_INTERVAL", "0.5")))
 replay_worker = ReplayWorker()
 archive_worker = archives.ArchiveWorker()
+cleanup_worker = cleanup.CleanupWorker()
 
 
 def get_db():
@@ -83,11 +86,40 @@ def _backfill_replay_columns():
                     f"ALTER TABLE replay_tasks ADD COLUMN {col} {ddl}"))
 
 
+def _backfill_archive_columns():
+    """旧库补齐归档目录/保留策略/并发协调列: 已存在归档按无保留策略、
+    使用计数 0、未清理处理。幂等, 可重复执行。"""
+    from sqlalchemy import inspect, text as _text
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "replay_archives" not in tables:
+        return
+    existing = {c["name"] for c in inspector.get_columns("replay_archives")}
+    defaults = {
+        "biz_groups": "JSON",
+        "retention_mode": "VARCHAR(16) NOT NULL DEFAULT 'NONE'",
+        "retain_until": "TIMESTAMP",
+        "retention_set_by": "VARCHAR(128)",
+        "retention_set_at": "TIMESTAMP",
+        "active_downloads": "INTEGER NOT NULL DEFAULT 0",
+        "active_verifies": "INTEGER NOT NULL DEFAULT 0",
+        "cleaned_at": "TIMESTAMP",
+        "cleaned_by": "VARCHAR(128)",
+        "cleanup_plan_id": "VARCHAR(32)",
+    }
+    with engine.begin() as conn:
+        for col, ddl in defaults.items():
+            if col not in existing:
+                conn.execute(_text(
+                    f"ALTER TABLE replay_archives ADD COLUMN {col} {ddl}"))
+
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
     _backfill_plan_columns()
     _backfill_replay_columns()
+    _backfill_archive_columns()
     db = SessionLocal()
     try:
         service.boot_check(db)
@@ -98,8 +130,12 @@ def startup():
         # 回放重启对账: 遗留 RUNNING 回放回到排队位置, 已完成步骤报告保留
         replay.boot_recover_replays(db)
         db.commit()
-        # 归档重启对账: 遗留 RUNNING 归档回到排队位置, 已完成单元产物保留
+        # 归档重启对账: 遗留 RUNNING 归档回到排队位置, 已完成单元产物保留;
+        # 清零在途下载/校验计数(进程死亡意味着在途请求已不存在)
         archives.boot_recover_archives(db)
+        db.commit()
+        # 清理计划重启对账: 遗留 RUNNING 计划回到排队, 逐项进度与跳过原因保留
+        cleanup.boot_recover_cleanup_plans(db)
         db.commit()
         archives.ensure_store_dir()
     finally:
@@ -108,6 +144,7 @@ def startup():
         worker.start()
         replay_worker.start()
         archive_worker.start()
+        cleanup_worker.start()
 
 
 @app.on_event("shutdown")
@@ -115,6 +152,7 @@ def shutdown():
     worker.stop()
     replay_worker.stop()
     archive_worker.stop()
+    cleanup_worker.stop()
 
 
 # ---------- 错误映射 ----------
@@ -141,6 +179,9 @@ def status(db: Session = Depends(get_db)):
                    .order_by(ReplayTask.created_at, ReplayTask.id).all())
     archive_rows = (db.query(ReplayArchive)
                     .order_by(ReplayArchive.created_at, ReplayArchive.id).all())
+    cleanup_rows = (db.query(ArchiveCleanupPlan)
+                    .order_by(ArchiveCleanupPlan.created_at,
+                              ArchiveCleanupPlan.id).all())
     return {
         "app_version": APP_VERSION,
         "batches": [service.batch_to_dict(db, b) for b in batches],
@@ -150,7 +191,9 @@ def status(db: Session = Depends(get_db)):
         "replays": [replay.replay_to_dict(db, t, with_report=False)
                     for t in replay_rows],
         "archives": [archives.archive_to_dict(db, a, with_events=False)
-                     for a in archive_rows],
+                     for a in archive_rows if a.cleaned_at is None],
+        "cleanup_plans": [cleanup.plan_to_dict(db, p, with_items=False)
+                          for p in cleanup_rows],
         "replay_concurrency": replay.max_concurrency(),
         "archive_concurrency": archives.max_concurrency(),
     }
@@ -632,20 +675,74 @@ def create_archive(body: ArchiveCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/api/admin/archives")
-def list_archives(db: Session = Depends(get_db)):
-    """归档任务列表(含排队/执行中/暂停/失败记录/已完成归档, 重启后仍可查询)。"""
-    rows = (db.query(ReplayArchive)
-            .order_by(ReplayArchive.created_at, ReplayArchive.id).all())
+def list_archives(replay_id: str | None = None, biz: str | None = None,
+                  report_version: int | None = None,
+                  content_digest: str | None = None,
+                  status: str | None = None, retention: str | None = None,
+                  include_cleaned: bool = False,
+                  db: Session = Depends(get_db)):
+    """归档目录检索(多维): 按回放、业务分组、报告版本、内容摘要、归档状态、
+    保留状态过滤已完成/进行中的归档; 默认只返回未清理的存活归档
+    (include_cleaned=true 可查已清理记录)。"""
+    if retention is not None and retention not in archives.RETENTION_MODES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_retention_mode",
+            "reason": f"保留模式必须是 {list(archives.RETENTION_MODES)} 之一"
+                      f"(收到 {retention!r})"})
+    rows = archives.search_archives(
+        db, replay_id=replay_id, biz=biz, report_version=report_version,
+        content_digest=content_digest, status=status, retention=retention,
+        include_cleaned=include_cleaned)
     return [archives.archive_to_dict(db, a, with_events=False) for a in rows]
+
+
+@app.get("/api/admin/archives/by-digest/{content_digest}")
+def archives_by_digest(content_digest: str, db: Session = Depends(get_db)):
+    """按内容摘要查询归档: 完整 sha256 精确匹配, >=12 位前缀消歧;
+    返回同摘要的存活归档列表与引用关系(去重组)。"""
+    rows = archives.find_by_digest(db, content_digest)
+    groups = {}
+    for a in rows:
+        groups.setdefault(a.content_digest,
+                          archives.digest_group_view(db, a.content_digest))
+    return {"query": content_digest, "count": len(rows),
+            "archives": [archives.archive_to_dict(db, a, with_events=False)
+                         for a in rows],
+            "digest_groups": list(groups.values())}
 
 
 @app.get("/api/admin/archives/{archive_id}")
 def get_archive(archive_id: str, db: Session = Depends(get_db)):
-    """归档详情: 进度、当前归档单元、失败原因、摘要、清单与事件流水。"""
+    """归档详情: 进度、当前归档单元、失败原因、摘要、保留策略、引用数、
+    清理状态、清单与事件流水。"""
     a = db.get(ReplayArchive, archive_id)
     if a is None:
         _archive_not_found(Exception(f"归档任务 {archive_id} 不存在"))
     return archives.archive_to_dict(db, a)
+
+
+@app.put("/api/admin/archives/{archive_id}/retention")
+@app.post("/api/admin/archives/{archive_id}/retention")
+def set_archive_retention(archive_id: str, body: ArchiveRetention,
+                          db: Session = Depends(get_db)):
+    """设置归档保留策略: UNTIL(带到期时间, 到期前不可清理)/PERMANENT(永久保留
+    标记)/NONE(清除)。策略持久化, 服务重启不丢失; 同键重放幂等。"""
+    a = db.get(ReplayArchive, archive_id)
+    if a is None:
+        _archive_not_found(Exception(f"归档任务 {archive_id} 不存在"))
+    payload = body.model_dump()
+    try:
+        result, replayed = archives.run_archive_action(
+            db, action="retention", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=payload,
+            archive_id=archive_id,
+            fn=lambda s, _a: archives.set_retention(
+                s, a, body.operator, body.mode, body.retain_until))
+    except archives.ArchiveStateError as e:
+        db.rollback()
+        _archive_conflict(e)
+    result["replayed"] = replayed
+    return result
 
 
 @app.post("/api/admin/archives/{archive_id}/pause")
@@ -670,9 +767,11 @@ def cancel_archive(archive_id: str, body: ArchiveAction, db: Session = Depends(g
 
 
 @app.get("/api/admin/archives/{archive_id}/download")
-def download_archive(archive_id: str, operator: str = "system",
-                     db: Session = Depends(get_db)):
-    """下载不可变归档包(zip)。包不存在(被外部删除) -> 404 并记录失败。"""
+def download_archive(archive_id: str, background_tasks: BackgroundTasks,
+                     operator: str = "system", db: Session = Depends(get_db)):
+    """下载不可变归档包(zip)。包不存在(被外部删除) -> 404 并记录失败。
+    下载期间持有使用计数(active_downloads+1), 响应发送完毕后在后台任务释放;
+    清理计划看到在途下载会逐项跳过(in_use_download), 不会删除文件。"""
     a = db.get(ReplayArchive, archive_id)
     if a is None:
         _archive_not_found(Exception(f"归档任务 {archive_id} 不存在"))
@@ -684,9 +783,19 @@ def download_archive(archive_id: str, operator: str = "system",
     except archives.ArchiveStateError as e:
         db.rollback()
         _archive_conflict(e)
+    # 响应发送后才释放下载计数, 与清理并发协调
+    background_tasks.add_task(_release_archive_use, archive_id, "download")
     return FileResponse(
         path, media_type="application/zip",
         filename=f"replay-archive-{a.id}-v{a.report_version}.zip")
+
+
+def _release_archive_use(archive_id: str, kind: str):
+    db = SessionLocal()
+    try:
+        archives.end_archive_use(db, archive_id, kind)
+    finally:
+        db.close()
 
 
 @app.get("/api/admin/archives/{archive_id}/verify")
@@ -702,6 +811,87 @@ def verify_archive(archive_id: str, operator: str = "system",
     except archives.ArchiveStateError as e:
         db.rollback()
         _archive_conflict(e)
+
+
+# ---------- 归档清理计划(保留策略 / 下载校验占用 / 引用关系逐项判定) ----------
+
+def _cleanup_not_found(e: Exception):
+    raise HTTPException(status_code=404, detail={
+        "error": "cleanup_plan_not_found", "reason": str(e)})
+
+
+def _cleanup_conflict(e: Exception):
+    raise HTTPException(status_code=409, detail={
+        "error": "cleanup_conflict", "reason": str(e)})
+
+
+def _run_cleanup(db: Session, action: str, body, fn, plan_id: str | None = None):
+    try:
+        result, replayed = cleanup.run_cleanup_action(
+            db, action=action, operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            plan_id=plan_id, fn=fn)
+    except cleanup.CleanupNotFound as e:
+        db.rollback()
+        _cleanup_not_found(e)
+    except cleanup.CleanupStateError as e:
+        db.rollback()
+        _cleanup_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/archive-cleanups", status_code=201)
+def create_cleanup_plan(body: CleanupCreate, db: Session = Depends(get_db)):
+    """发起归档清理计划并排队: 逐项判定保留策略(保留期内/永久保留跳过)、
+    下载/摘要校验占用(在途跳过)、同摘要引用关系(仍被引用不删除物理文件);
+    逐项结果与跳过原因落库可查询, 服务重启后保留。"""
+    return _run_cleanup(db, "create", body,
+                        lambda s, _p: cleanup.do_create_plan(
+                            s, _p, body.operator, body.archive_ids))
+
+
+@app.get("/api/admin/archive-cleanups")
+def list_cleanup_plans(limit: int = 50, db: Session = Depends(get_db)):
+    """清理计划列表(排队/执行/暂停/取消/完成/失败, 含进度汇总; 逐项结果用详情)。"""
+    rows = (db.query(ArchiveCleanupPlan)
+            .order_by(ArchiveCleanupPlan.created_at.desc(),
+                      ArchiveCleanupPlan.id.desc()).limit(limit).all())
+    return [cleanup.plan_to_dict(db, p, with_items=False) for p in rows]
+
+
+@app.get("/api/admin/archive-cleanups/{plan_id}")
+def get_cleanup_plan(plan_id: str, db: Session = Depends(get_db)):
+    """清理计划详情: 进度、当前项、逐项跳过原因与事件流水。"""
+    p = db.get(ArchiveCleanupPlan, plan_id)
+    if p is None:
+        _cleanup_not_found(Exception(f"清理计划 {plan_id} 不存在"))
+    return cleanup.plan_to_dict(db, p)
+
+
+@app.post("/api/admin/archive-cleanups/{plan_id}/pause")
+def pause_cleanup_plan(plan_id: str, body: CleanupAction,
+                       db: Session = Depends(get_db)):
+    """暂停清理计划: 在逐项边界停住(已清理/已跳过项保留); 重复暂停幂等。"""
+    return _run_cleanup(db, "pause", body,
+                        lambda s, p: cleanup.do_pause(s, p, body.operator), plan_id)
+
+
+@app.post("/api/admin/archive-cleanups/{plan_id}/resume")
+def resume_cleanup_plan(plan_id: str, body: CleanupAction,
+                        db: Session = Depends(get_db)):
+    """恢复清理计划: 重新排队, 从首个未完成项续跑(PAUSED/FAILED 可恢复,
+    FAILED 时失败项重新排队); 重复恢复幂等。"""
+    return _run_cleanup(db, "resume", body,
+                        lambda s, p: cleanup.do_resume(s, p, body.operator), plan_id)
+
+
+@app.post("/api/admin/archive-cleanups/{plan_id}/cancel")
+def cancel_cleanup_plan(plan_id: str, body: CleanupAction,
+                        db: Session = Depends(get_db)):
+    """取消清理计划: 未处理项置为跳过, 已清理/已跳过结果保留; 重复取消幂等。"""
+    return _run_cleanup(db, "cancel", body,
+                        lambda s, p: cleanup.do_cancel(s, p, body.operator), plan_id)
 
 
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------

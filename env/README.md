@@ -266,6 +266,72 @@ UNREVIEWED ──提交首条复核──▶ REVIEWING ──任一步骤 FAIL�
 - 页面"回放证据归档"区：归档任务表显示进度条、当前归档单元、失败码与原因、内容摘要、
   暂停/恢复/取消/下载/校验摘要/详情（包清单与事件流水）；回放卡片在归档期间显示冻结标记。
 
+## 归档目录与生命周期管理
+
+在不可变归档包之上提供**归档目录检索、保留策略与清理计划**：管理员按回放、业务分组、
+报告版本与内容摘要检索已完成归档，为归档设置带到期时间的保留策略或永久保留标记，
+并可发起逐项返回跳过原因的清理计划。保留策略、摘要引用关系与清理进度全部落库，
+服务重启后保留。
+
+### 归档目录检索
+
+- `GET /api/admin/archives?replay_id=&biz=&report_version=&content_digest=&status=&retention=&include_cleaned=`
+  多维检索：按回放、业务分组（归档时从各步骤批次反查并固化的 `biz_groups`）、报告版本、
+  内容摘要（完整 sha256 或 ≥12 位前缀消歧）、归档状态、保留模式过滤；默认只返回**未清理**
+  的存活归档，`include_cleaned=true` 可查已清理记录。
+- `GET /api/admin/archives/by-digest/{digest}` 按摘要查询归档：返回同摘要存活归档列表与
+  **去重组引用关系**（canonical 成员、存活引用数）。
+
+### 保留策略
+
+- `PUT /api/admin/archives/{id}/retention {mode, retain_until?}`（POST 同义，走
+  `archive.retention` 幂等命名空间）：
+  - `PERMANENT` 永久保留标记；`UNTIL` 带到期时间（必须晚于当前时间，ISO 8601），
+    到期前受保护；`NONE` 清除策略。仅 **COMPLETED** 归档可设置，已清理归档拒绝。
+  - 策略字段（模式/到期时间/设置人/设置时间）持久化，重启保留；归档视图实时返回
+    `retention`（`retained/retain_reason/expired`）。
+
+### 同摘要去重与引用关系
+
+- 每个 COMPLETED 归档完成时按内容摘要在 `archive_digest_members` 登记成员关系：
+  同摘要多个归档**物理 zip 只保留一份**（canonical 成员持有文件），其余成员共享该路径，
+  归档视图带 `digest_group`（`is_canonical/reference_count/member_count`）。
+- 清理 canonical 前必须把物理文件**移交**给同摘要最早的存活成员（其包须存在且摘要匹配）；
+  移交失败逐项跳过（`digest_referenced`），**仍被引用的记录与文件绝不删除**；非 canonical
+  成员清理只解除自身引用；最后一个引用解除后物理文件才删除。
+
+### 清理计划
+
+管理员对一批归档发起清理（逐项独立事务提交，成功项不回滚，跳过/失败项带机器可读原因）：
+
+```
+QUEUED ─claim(单 RUNNING 串行)─▶ RUNNING ─全部项处理完─▶ COMPLETED(终态)
+  ▲                                ├─pause(逐项边界)─▶ PAUSED ─resume─┘
+  └──────────── resume ────────────┴─某 tick 未预期错误─▶ FAILED ─resume(失败项重新排队)
+                                   └─cancel─▶ CANCELED(未处理项 SKIPPED_CANCELED)
+```
+
+- 逐项跳过原因（`reason_code`，永久可查）：`not_found`（归档不存在）/`not_completed`
+  （归档活动中）/`already_cleaned`/`retained_until`（保留期内）/`retained_permanent`
+  （永久保留）/`in_use_download`（正在下载）/`in_use_verify`（正在摘要校验）/
+  `package_missing`/`file_delete_failed`/`digest_referenced`（同摘要仍被引用）/
+  `internal_error`。
+- **下载/校验并发协调**：下载与摘要校验在归档行持有使用计数（`active_downloads/
+  active_verifies`，行锁 + 写事务串行化）；下载响应发送期间计数 >0，清理逐项跳过，
+  **归档正在下载或校验时物理文件绝不被删除**；崩溃遗留计数由重启对账清零。
+- 清理是**软删除**：归档行打 `cleaned_at/cleaned_by/cleanup_plan_id` 标记、默认目录检索
+  不返回（记录与事件永久保留可查），物理文件按上述引用规则处理。
+- `POST /api/admin/archive-cleanups` 创建排队（`archive.cleanup.*` 幂等命名空间，同键重放
+  返回首次结果）；`GET /api/admin/archive-cleanups` 列表；`GET …/{id}` 详情含**逐项
+  跳过原因**与事件流水；`pause/resume/cancel` 均幂等（FAILED 可 resume，失败项重新排队）。
+  每个 tick 至多处理 `CLEANUP_ITEMS_PER_TICK`（默认 5）项，暂停/取消在逐项边界生效。
+- 后台单实例 worker（`CLEANUP_WORKER_POLL_INTERVAL`，随 PLAN_WORKER_ENABLED 一并开关）；
+  重启对账把遗留 RUNNING 计划复位 QUEUED、RUNNING 单项复位 PENDING，逐项进度、跳过原因、
+  保留策略、摘要引用关系全部保留。
+- 页面"归档目录与生命周期"区：多维检索表单与结果表（保留状态徽章、引用数、下载/校验占用、
+  清理状态、保留策略设置按钮）、清理计划表（进度条/当前项/最近错误/暂停恢复取消/逐项结果），
+  逐项结果表展示每项的跳过/失败原因码与说明。
+
 ## 运行
 
 ```bash
@@ -328,11 +394,20 @@ GET  /api/admin/review-batch                          最近批量操作列表(�
 GET  /api/admin/review-batch/{id}                     批量操作结果(逐项成功/失败原因)
 POST /api/admin/archives            {operator, idempotency_key, replay_id, report_version}
                                                       为已完成回放生成不可变证据归档并排队
-GET  /api/admin/archives                             归档任务列表(含失败/取消记录)
-GET  /api/admin/archives/{id}                        归档详情(进度/当前单元/失败原因/摘要/清单/事件)
+GET  /api/admin/archives             归档目录检索(?replay_id=&biz=&report_version=&content_digest=
+                                                      &status=&retention=&include_cleaned=; 默认仅存活归档)
+GET  /api/admin/archives/by-digest/{content_digest}   按内容摘要(完整/≥12位前缀)查询归档与引用关系
+GET  /api/admin/archives/{id}                        归档详情(进度/当前单元/失败原因/摘要/保留/引用/清单/事件)
+PUT  /api/admin/archives/{id}/retention {operator, idempotency_key, mode, retain_until?}
+                                                      保留策略: UNTIL(到期保留)/PERMANENT(永久)/NONE(清除)
 POST /api/admin/archives/{id}/pause|resume|cancel    {operator, idempotency_key}
-GET  /api/admin/archives/{id}/download?operator=     下载不可变归档包(zip)
-GET  /api/admin/archives/{id}/verify?operator=       重算摘要校验(不一致/包缺失 -> FAILED 并保留记录)
+GET  /api/admin/archives/{id}/download?operator=     下载不可变归档包(下载期间清理逐项跳过)
+GET  /api/admin/archives/{id}/verify?operator=       重算摘要校验(校验期间清理逐项跳过; 不一致/包缺失 -> FAILED)
+POST /api/admin/archive-cleanups      {operator, idempotency_key, archive_ids:[...]}
+                                                      发起归档清理计划并排队(逐项跳过原因)
+GET  /api/admin/archive-cleanups                     清理计划列表(进度汇总)
+GET  /api/admin/archive-cleanups/{id}                清理计划详情(逐项 CLEANED/SKIPPED/失败原因 + 事件)
+POST /api/admin/archive-cleanups/{id}/pause|resume|cancel  {operator, idempotency_key}
 GET  /api/admin/audit?batch_id=&plan_id=           审计日志(可按批次或计划过滤)
 POST /api/records                                  旧结构写入(批次冻结期 423 / 批次切换后 410)
 POST /api/v2/records                               新结构写入(仅所属批次 DONE)
@@ -347,7 +422,7 @@ GET  /api/records/{id}/compare                     批次冻结窗内双读比�
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 109 个用例:
+python3 -m pytest tests/ -q   # 125 个用例:
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
 # 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
@@ -382,4 +457,12 @@ python3 -m pytest tests/ -q   # 109 个用例:
 #           回放删除 data_deleted/篡改包摘要不一致 digest_mismatch 且失败留痕/包被删 package_missing/
 #           归档活动期间复核提交与分派被冻结/归档严格只读不改原报告/重启 RUNNING 复位续跑已采集单元不丢/
 #           status 汇总含归档与并发上限
+# 归档目录与生命周期(16): 按业务分组/回放/报告版本/状态/保留模式多维检索(默认仅存活)/
+#           按摘要查询接口(完整+前缀消歧, 引用组)/保留策略 PERMANENT·UNTIL·NONE 与非法参数拒绝/
+#           保留期与永久保留逐项跳过, 到期后可清理/清理逐项跳过原因(不存在·活动中·已清理)/
+#           清理计划排队执行/逐项边界暂停恢复续跑/取消未处理项跳过/创建与控制幂等/
+#           下载/校验占用计数期间清理跳过且文件不删(HTTP 下载持有计数)/
+#           同摘要去重非canonical清理解除引用保文件/canonical移交物理文件与引用数/
+#           移交失败 digest_referenced 跳过/重启保留保留策略·引用关系·逐项清理进度与 RUNNING 复位/
+#           重启清零在途占用计数/FAILED 计划 resume 重试失败项/status 含清理计划且已清理归档不展示
 ```

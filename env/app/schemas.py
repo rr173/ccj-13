@@ -173,3 +173,23 @@ class ArchiveCreate(BaseModel):
 class ArchiveAction(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+
+
+# ---------- 归档目录: 保留策略与清理计划 ----------
+
+class ArchiveRetention(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    mode: str = Field(min_length=1)             # NONE | UNTIL | PERMANENT
+    retain_until: Optional[str] = None          # ISO 8601, mode=UNTIL 必填(未来时刻)
+
+
+class CleanupCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    archive_ids: list[str] = Field(min_length=1, max_length=500)
+
+
+class CleanupAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
