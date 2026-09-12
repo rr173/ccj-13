@@ -2,18 +2,20 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>结构迁移切换控制台</title>
+<title>结构迁移切换控制台(按业务分组批次)</title>
 <style>
   body { font-family: system-ui, sans-serif; margin: 24px; color: #222; }
   h1 { font-size: 20px; }
   .card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
-  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; color: #fff; font-weight: 600; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; color: #fff;
+           font-weight: 600; font-size: 12px; }
   .NORMAL { background: #2e7d32; } .FROZEN { background: #ef6c00; }
   .VALIDATING { background: #1565c0; } .VALIDATED { background: #6a1b9a; }
   .DONE { background: #37474f; }
-  button { padding: 8px 14px; margin-right: 8px; border: 0; border-radius: 6px;
-           background: #1565c0; color: #fff; cursor: pointer; }
+  button { padding: 6px 12px; margin: 2px 4px 2px 0; border: 0; border-radius: 6px;
+           background: #1565c0; color: #fff; cursor: pointer; font-size: 12px; }
   button.danger { background: #c62828; }
+  button.plain { background: #546e7a; }
   button:disabled { background: #aaa; cursor: not-allowed; }
   input { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; margin-right: 8px; }
   table { border-collapse: collapse; width: 100%; font-size: 13px; }
@@ -22,56 +24,59 @@
   pre { background: #fafafa; border: 1px solid #eee; padding: 8px; overflow: auto; font-size: 12px; }
   .msg { margin-top: 8px; font-size: 13px; white-space: pre-wrap; }
   .err { color: #c62828; } .ok { color: #2e7d32; }
+  .bar { background: #eee; border-radius: 4px; height: 8px; min-width: 80px; }
+  .bar > div { background: #1565c0; height: 8px; border-radius: 4px; }
+  .muted { color: #777; font-size: 12px; }
 </style>
 </head>
 <body>
-<h1>结构迁移切换控制台</h1>
-
-<div class="card">
-  <div>当前阶段: <span id="phase" class="badge">…</span>
-    &nbsp; epoch: <b id="epoch">-</b>
-    &nbsp; 生效结构: <b id="schema">-</b>
-    &nbsp; 水位: <b id="watermark">-</b>
-    &nbsp; 冻结版本: <b id="fver">-</b>
-    &nbsp; 服务版本: <b id="aver">-</b>
-    &nbsp; 待处理差异: <b id="pdiffs">-</b>
-  </div>
-</div>
+<h1>结构迁移切换控制台 <span class="muted">按业务分组批次 · 服务版本 <b id="aver">-</b></span></h1>
 
 <div class="card">
   <div>
     操作者: <input id="operator" value="admin" size="12">
     幂等键: <input id="idem" size="28" placeholder="留空自动生成">
-    <button onclick="genKey()">生成</button>
+    <button class="plain" onclick="genKey()">生成</button>
   </div>
   <div style="margin-top:10px">
-    <button id="btnFreeze" onclick="act('freeze')">1. 开启冻结窗</button>
-    <button id="btnValidate" onclick="act('validate')">2. 校验(回填+比对)</button>
-    <button id="btnCutover" onclick="act('cutover')">3. 一次性切换</button>
-    <button id="btnRecover" class="danger" onclick="doRecover()">恢复到可写状态</button>
+    <b>创建批次</b>:
+    业务组 <input id="biz" value="订单" size="8">
+    记录范围 <input id="idStart" type="number" value="1" style="width:80px"> -
+    <input id="idEnd" type="number" value="100" style="width:80px">
+    <button onclick="createBatch()">创建批次</button>
+    <span class="muted">范围之间不允许重叠; 冻结/校验/切换都只针对单个批次</span>
   </div>
   <div id="actionMsg" class="msg"></div>
 </div>
 
 <div class="card">
-  <b>写入探测</b>（验证冻结拒绝 / 旧路径关闭）:
+  <b>迁移批次</b>（每批次独立的阶段 / 进度 / 差异）
+  <table>
+    <thead><tr><th>批次</th><th>业务组</th><th>范围</th><th>阶段</th><th>epoch</th>
+      <th>进度(回填)</th><th>水位</th><th>待处理差异</th><th>操作者</th><th>操作</th></tr></thead>
+    <tbody id="batches"></tbody>
+  </table>
+</div>
+
+<div class="card">
+  <b>差异明细</b>（批次内不一致会阻止该批次切换; 范围外记录不参与比对）
+  <div id="diffs"><span class="muted">点击批次行的"差异"查看</span></div>
+</div>
+
+<div class="card">
+  <b>写入探测</b>（批次内冻结拒写 / 切换后旧路径关闭; 批次外正常读写）:
   <input id="wId" type="number" value="1" style="width:70px">
   <input id="wName" value="demo" size="10">
   <button onclick="writeOld()">写旧路径</button>
   <button onclick="writeNew()">写新路径</button>
-  <button onclick="dualRead()">双读该编号</button>
+  <button class="plain" onclick="dualRead()">双读该编号</button>
   <pre id="writeMsg" class="msg"></pre>
 </div>
 
 <div class="card">
-  <b>差异明细</b>（不一致会阻止切换）
-  <div id="diffs"></div>
-</div>
-
-<div class="card">
-  <b>审计日志</b>（操作者 / 版本 / 水位 / 差异 / 恢复原因）
+  <b>审计日志</b>（批次 / 操作者 / 版本 / 水位 / 差异 / 恢复原因）
   <table>
-    <thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>阶段</th><th>epoch</th>
+    <thead><tr><th>时间</th><th>批次</th><th>操作者</th><th>动作</th><th>阶段</th><th>epoch</th>
       <th>版本</th><th>水位</th><th>原因/差异</th></tr></thead>
     <tbody id="audit"></tbody>
   </table>
@@ -79,6 +84,7 @@
 
 <script>
 let lastDiffs = [];
+let batchCache = {};
 
 function genKey() {
   document.getElementById('idem').value = 'op-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
@@ -88,71 +94,109 @@ function idemKey() {
   if (!v) { genKey(); v = document.getElementById('idem').value; }
   return v;
 }
+function operator() { return document.getElementById('operator').value; }
 
 async function refresh() {
   const s = await (await fetch('/api/status')).json();
-  const ph = document.getElementById('phase');
-  ph.textContent = s.phase; ph.className = 'badge ' + s.phase;
-  document.getElementById('epoch').textContent = s.epoch;
-  document.getElementById('schema').textContent = s.active_schema;
-  document.getElementById('watermark').textContent = s.watermark;
-  document.getElementById('fver').textContent = s.freeze_version || '-';
   document.getElementById('aver').textContent = s.app_version;
-  document.getElementById('pdiffs').textContent = s.pending_diffs;
-  document.getElementById('btnFreeze').disabled = s.phase !== 'NORMAL';
-  document.getElementById('btnValidate').disabled = !['FROZEN','VALIDATING'].includes(s.phase);
-  document.getElementById('btnCutover').disabled = s.phase !== 'VALIDATED';
-  document.getElementById('btnRecover').disabled = ['NORMAL','DONE'].includes(s.phase);
+  batchCache = Object.fromEntries(s.batches.map(b => [b.id, b]));
+  document.getElementById('batches').innerHTML = s.batches.map(b => {
+    const p = b.progress, pct = p.total ? Math.round(100 * p.done / p.total) : 0;
+    const canFreeze = b.phase === 'NORMAL';
+    const canValidate = ['FROZEN','VALIDATING','VALIDATED'].includes(b.phase);
+    const canCutover = b.phase === 'VALIDATED';
+    const canRecover = !['NORMAL','DONE'].includes(b.phase);
+    return `<tr>
+      <td>${b.id}</td><td>${b.biz}</td><td>[${b.id_start}, ${b.id_end}]</td>
+      <td><span class="badge ${b.phase}">${b.phase}</span></td><td>${b.epoch}</td>
+      <td><div class="bar"><div style="width:${pct}%"></div></div>
+          <span class="muted">${p.done}/${p.total}</span></td>
+      <td>${b.watermark ?? '-'}</td>
+      <td>${b.pending_diffs ? `<span class="err">${b.pending_diffs} 处</span>` : '<span class="ok">0</span>'}</td>
+      <td>${b.updated_by || b.created_by}</td>
+      <td>
+        <button ${canFreeze?'':'disabled'} onclick="act('${b.id}','freeze')">冻结</button>
+        <button ${canValidate?'':'disabled'} onclick="act('${b.id}','validate')">校验</button>
+        <button ${canCutover?'':'disabled'} onclick="act('${b.id}','cutover')">切换</button>
+        <button class="danger" ${canRecover?'':'disabled'} onclick="doRecover('${b.id}')">恢复</button>
+        <button class="plain" onclick="showDiffs('${b.id}')">差异</button>
+      </td></tr>`;
+  }).join('') || '<tr><td colspan="10" class="muted">尚无批次, 请先创建</td></tr>';
   const rows = await (await fetch('/api/admin/audit?limit=50')).json();
   document.getElementById('audit').innerHTML = rows.map(r =>
-    `<tr><td>${r.ts||''}</td><td>${r.operator}</td><td>${r.action}</td>
+    `<tr><td>${r.ts||''}</td><td>${r.batch_id||''}</td><td>${r.operator}</td><td>${r.action}</td>
      <td>${r.from_phase||''} → ${r.to_phase||''}</td><td>${r.epoch??''}</td>
      <td>${r.app_version||''}</td><td>${r.watermark??''}</td>
      <td>${r.reason||''}${r.diffs?(' 差异:'+r.diffs.length+'处'):''}</td></tr>`).join('');
-  renderDiffs();
 }
 
-function renderDiffs() {
+function renderDiffs(title) {
   const el = document.getElementById('diffs');
-  if (!lastDiffs.length) { el.innerHTML = '<span class="ok">无差异</span>'; return; }
-  el.innerHTML = '<table><tr><th>记录</th><th>字段</th><th>旧值</th><th>新值</th></tr>' +
+  const head = title ? `<div class="muted">${title}</div>` : '';
+  if (!lastDiffs.length) { el.innerHTML = head + '<span class="ok">无差异</span>'; return; }
+  el.innerHTML = head + '<table><tr><th>记录</th><th>字段</th><th>旧值</th><th>新值</th></tr>' +
     lastDiffs.map(d => `<tr><td>${d.record_id}</td><td>${d.field}</td>
       <td>${JSON.stringify(d.old)}</td><td>${JSON.stringify(d.new)}</td></tr>`).join('') +
     '</table>';
 }
 
-async function act(name) {
+async function showDiffs(bid) {
+  const b = await (await fetch('/api/admin/batches/' + bid)).json();
+  lastDiffs = b.diffs || [];
+  renderDiffs(`批次 ${bid}(${b.biz}) [${b.id_start}, ${b.id_end}] 当前差异`);
+}
+
+function showMsg(ok, text) {
   const msg = document.getElementById('actionMsg');
-  const body = { operator: document.getElementById('operator').value,
-                 idempotency_key: idemKey() };
-  if (name === 'cutover') body.expected_epoch = parseInt(document.getElementById('epoch').textContent);
-  const r = await fetch('/api/admin/' + name, { method: 'POST',
+  msg.className = 'msg ' + (ok ? 'ok' : 'err');
+  msg.textContent = text;
+}
+
+async function post(url, body) {
+  const r = await fetch(url, { method: 'POST',
     headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
-  const j = await r.json();
-  if (r.ok) {
-    lastDiffs = j.diffs || [];
-    msg.className = 'msg ' + (j.ok ? 'ok' : 'err');
-    msg.textContent = (j.replayed ? '[幂等重放] ' : '') + j.detail;
+  return { status: r.status, j: await r.json() };
+}
+
+async function createBatch() {
+  const body = { operator: operator(), idempotency_key: idemKey(),
+                 biz: document.getElementById('biz').value,
+                 id_start: parseInt(document.getElementById('idStart').value),
+                 id_end: parseInt(document.getElementById('idEnd').value) };
+  const { status, j } = await post('/api/admin/batches', body);
+  if (status === 201) {
+    showMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
   } else {
-    lastDiffs = (j.detail && j.detail.diffs) || [];
-    msg.className = 'msg err';
-    msg.textContent = '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j));
+    showMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
   }
   document.getElementById('idem').value = '';
   refresh();
 }
 
-async function doRecover() {
-  const reason = prompt('请输入恢复原因(必填, 将写入审计):');
+async function act(bid, name) {
+  const body = { operator: operator(), idempotency_key: idemKey() };
+  if (name === 'cutover' && batchCache[bid]) body.expected_epoch = batchCache[bid].epoch;
+  const { status, j } = await post(`/api/admin/batches/${bid}/${name}`, body);
+  if (status === 200) {
+    lastDiffs = j.diffs || [];
+    showMsg(j.ok, (j.replayed ? '[幂等重放] ' : '') + j.detail);
+    renderDiffs(`批次 ${bid} ${name} 结果`);
+  } else {
+    lastDiffs = (j.detail && j.detail.diffs) || [];
+    showMsg(false, '被拒绝: ' + ((j.detail && j.detail.reason) || JSON.stringify(j)));
+    renderDiffs(`批次 ${bid} ${name} 被拒绝`);
+  }
+  document.getElementById('idem').value = '';
+  refresh();
+}
+
+async function doRecover(bid) {
+  const reason = prompt(`请输入批次 ${bid} 的恢复原因(必填, 将写入审计; 只清理本批次数据):`);
   if (!reason) return;
-  const r = await fetch('/api/admin/recover', { method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ operator: document.getElementById('operator').value,
-                           idempotency_key: idemKey(), reason }) });
-  const j = await r.json();
-  const msg = document.getElementById('actionMsg');
-  msg.className = 'msg ' + (r.ok ? 'ok' : 'err');
-  msg.textContent = r.ok ? j.detail : ('被拒绝: ' + ((j.detail && j.detail.reason) || ''));
+  const { status, j } = await post(`/api/admin/batches/${bid}/recover`,
+    { operator: operator(), idempotency_key: idemKey(), reason });
+  showMsg(status === 200 && j.ok, status === 200 ? j.detail
+    : ('被拒绝: ' + ((j.detail && j.detail.reason) || '')));
   document.getElementById('idem').value = '';
   refresh();
 }
@@ -172,10 +216,9 @@ async function dualRead() {
   const id = document.getElementById('wId').value;
   const r = await fetch('/api/records/' + id);
   const j = await r.json();
-  if (j.diff) lastDiffs = j.diff;
+  if (j.diff) { lastDiffs = j.diff; renderDiffs(`记录 ${id} 双读差异`); }
   document.getElementById('writeMsg').textContent =
     `GET /api/records/${id} -> HTTP ${r.status}\n` + JSON.stringify(j, null, 2);
-  renderDiffs();
 }
 
 refresh();

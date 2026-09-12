@@ -2,7 +2,7 @@ from sqlalchemy import JSON, Column, DateTime, Integer, String, func
 
 from .db import Base
 
-# 迁移阶段状态机:
+# 每个批次独立的阶段状态机:
 #   NORMAL --freeze--> FROZEN --validate--> VALIDATING --(通过)--> VALIDATED --cutover--> DONE
 #     ^                  |                      |                        |
 #     +---- recover(必须带 reason, 回到冻结前可写状态) ----+------------+
@@ -10,19 +10,27 @@ from .db import Base
 PHASES = ("NORMAL", "FROZEN", "VALIDATING", "VALIDATED", "DONE")
 
 
-class MigrationState(Base):
-    """单行表(id=1), 全局迁移状态。epoch 为栅栏令牌: 每次迁移动作 +1,
-    所有变更都带 epoch 条件更新, 防止并发管理员/重启后出现双主状态。"""
+class MigrationBatch(Base):
+    """按业务分组的迁移批次。一批覆盖一段记录 id 范围 [id_start, id_end],
+    范围之间不允许重叠, 因此任意记录至多属于一个批次。
 
-    __tablename__ = "migration_state"
+    epoch 为批次内栅栏令牌: 每次迁移动作 +1, 所有变更都带 epoch 条件更新,
+    防止并发管理员/重启后出现双主状态。批次外的记录不受任何闸门约束。"""
 
-    id = Column(Integer, primary_key=True)  # 恒为 1
+    __tablename__ = "migration_batches"
+
+    id = Column(String(32), primary_key=True)          # "B" + 随机串
+    biz = Column(String(128), nullable=False)          # 业务分组名
+    id_start = Column(Integer, nullable=False)         # 记录范围(含)
+    id_end = Column(Integer, nullable=False)           # 记录范围(含)
     phase = Column(String(32), nullable=False, default="NORMAL")
     epoch = Column(Integer, nullable=False, default=0)
     freeze_version = Column(String(64), nullable=True)   # 本次冻结窗标识
-    watermark = Column(Integer, nullable=False, default=0)  # 回填水位(已处理的最大记录 id)
+    watermark = Column(Integer, nullable=True)  # 回填水位(已处理的最大记录 id), 冻结时置为 id_start-1
     active_schema = Column(String(8), nullable=False, default="old")  # old | new
+    created_by = Column(String(128), nullable=False)
     updated_by = Column(String(128), nullable=True)
+    created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
@@ -50,14 +58,15 @@ class RecordNew(Base):
 
 
 class AuditLog(Base):
-    """只追加审计日志: 操作者、动作、阶段迁移、版本、水位、差异、恢复原因。"""
+    """只追加审计日志: 批次、操作者、动作、阶段迁移、版本、水位、差异、恢复原因。"""
 
     __tablename__ = "audit_log"
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     ts = Column(DateTime, server_default=func.now())
+    batch_id = Column(String(32), nullable=True, index=True)  # 所属批次
     operator = Column(String(128), nullable=False)
-    action = Column(String(32), nullable=False)       # freeze/validate/cutover/recover/boot
+    action = Column(String(32), nullable=False)       # create/freeze/validate/cutover/recover/boot
     from_phase = Column(String(32), nullable=True)
     to_phase = Column(String(32), nullable=True)
     epoch = Column(Integer, nullable=True)
@@ -69,7 +78,8 @@ class AuditLog(Base):
 
 
 class IdempotencyKey(Base):
-    """幂等键: 重复执行返回首次结果, 不产生二次副作用。"""
+    """幂等键: 重复执行返回首次结果, 不产生二次副作用。
+    请求哈希含动作与批次, 同键跨批次/跨动作复用会被拒绝。"""
 
     __tablename__ = "idempotency_keys"
 
