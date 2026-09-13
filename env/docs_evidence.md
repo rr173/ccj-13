@@ -369,3 +369,73 @@ invalid_reason, stats}`；INVALIDATED 依据修复后调用通过即恢复 OPEN�
 | `two_operators_required` | 归档要求两名不同操作者 | — |
 | `review_invalidated` / `review_archived` | 复核单已失效（冻结）/已归档（终态不可改） | — |
 
+
+# 异常回执争议处理 · 接口补充
+
+管理员可把一张 **PARTIAL / REJECTED** 接收回执打开为争议单（dispute）。状态机：
+
+```
+OPEN ──assign(指定处理人+处理意见+补充证据摘要)──▶ ASSIGNED
+ASSIGNED ──resolve(仅当前处理人, 提交处理结论)──▶ RESOLVED
+RESOLVED ──close(管理员确认)──▶ CLOSED(终态)
+RESOLVED ──reopen(管理员, 可改派)──▶ ASSIGNED
+```
+
+规则：
+
+- 每张回执至多一张争议单；同键重放或换键重复打开同一回执均幂等回显已有争议单，
+  CLOSED 后也不允许就同一回执重开（回显已关闭争议）。
+- 处理人不得与打开争议的管理员相同；处理人在被指定（ASSIGNED）之后才能提交结论；
+  只有分发包创建管理员能确认关闭，关闭人不得是提交结论的处理人。
+- 过期（EXPIRED）、待处理（PENDING_PROCESS）或撤销（REVOKED）的分发包不能新开
+  争议；打开时刻是唯一闸门，之后包被撤销/过期不影响在途争议继续处理/关闭。
+- 打开时固化只读依据 `receipt_snapshot`（原始回执含逐事件结果）与
+  `package_snapshot`（分发包摘要）；争议流程绝不改写原始回执、逐事件结果与
+  分发包摘要，只追加争议事件流水并向分发包事件流投影 `dispute.*` 事件。
+- 所有写动作走 `evidence.distribution.dispute.*` 幂等框架（同键回显首次结果）。
+
+### POST /api/admin/evidence/receipts/{receipt_id}/dispute · 打开争议
+`{operator, idempotency_key, assignee?, reason?, handling_opinion?, supplementary_evidence?}`。
+省略 `assignee` → OPEN；当场指定处理人 → ASSIGNED（此时处理意见与补充证据摘要必填）。
+重复打开返回同一争议单且 `deduped=true`。
+
+### POST /api/admin/evidence/disputes/{id}/assign · 指定/改派处理人
+`{operator(=打开管理员), idempotency_key, assignee(!=打开管理员),
+  handling_opinion(必填), supplementary_evidence(必填), reason?}`。
+对 RESOLVED 争议执行等同退回重派（`reopen_count+1`，清空旧结论，事件流水保留）。
+
+### POST /api/admin/evidence/disputes/{id}/resolve · 处理人提交结论
+`{operator(=当前处理人), idempotency_key, resolution(必填), reason?}` → RESOLVED。
+
+### POST /api/admin/evidence/disputes/{id}/close · 管理员确认关闭（终态）
+`{operator(=包创建管理员), idempotency_key, note?}` → CLOSED。
+
+### POST /api/admin/evidence/disputes/{id}/reopen · 退回处理
+`{operator(=包创建管理员), idempotency_key, reason(必填), new_assignee?}`。
+
+### GET /api/admin/evidence/disputes[?status_filter=&package_id=&assignee=&pending_only=&limit=]
+待处理争议目录（`pending_only=true` = 非 CLOSED）。
+
+### GET /api/admin/evidence/disputes/{id}?operator=
+争议详情：状态/打开人/当前处理人/处理意见/补充证据摘要/处理结论/关闭信息/
+事件流水（`events[]`：event/from_status/to_status/operator/ts/reason）与只读快照
+（`receipt_snapshot` 含逐事件结果、`package_snapshot`）。查看权限：包创建管理员、
+争议打开人、当前处理人、被异议回执接收方。
+
+分发包详情 `GET .../distributions/{id}` 与回执列表 `GET .../{id}/receipts`
+均嵌入 `disputes[]` / `open_dispute_count`，回执对象上附 `dispute` 摘要；
+`GET /api/status` 概览附 `evidence_disputes`（待处理争议）。
+
+| 冲突/拒绝 code | 含义 |
+| --- | --- |
+| `receipt_not_disputable` | 回执不是 PARTIAL/REJECTED（如 SIGNED） |
+| `assignee_is_opener` | 处理人与打开争议的管理员相同 |
+| `handling_detail_required` / `handling_opinion_required` / `supplementary_evidence_required` | 缺处理意见/补充证据摘要 |
+| `dispute_not_assigned` | OPEN 未指派处理人，处理人尚不能提交结论 |
+| `not_current_assignee` | 提交结论者不是当前处理人 |
+| `dispute_already_resolved` | 已提交结论，等待管理员确认（可退回后再提交） |
+| `dispute_not_resolved` | 非 RESOLVED 状态不能确认关闭/退回 |
+| `dispute_closed` | 争议已关闭（终态），拒绝一切状态变化 |
+| `package_expired` / `package_pending_process` / `package_revoked` | 分发包过期/待处理/撤销，不能新开争议 |
+| `not_distribution_admin` / `not_dispute_admin` | 非包创建管理员执行管理员动作（403） |
+| `idempotency_reuse` | 同一幂等键被不同请求复用 |

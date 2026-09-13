@@ -2176,6 +2176,105 @@ class EvidenceDistributionExtension(Base):
                              order_by="EvidenceDistributionExtensionApproval.id")
 
 
+# ---------- 异常回执争议单(在 PARTIAL/REJECTED 回执之上的处理工作流) ----------
+# 争议单状态机:
+#   OPEN(管理员打开, 可选是否当场指定处理人; 已指定处理人 -> ASSIGNED)
+#     --assign(指定/改派处理人, 记录处理意见与补充证据摘要)--> ASSIGNED
+#     --resolve(只有被指定的处理人本人可提交处理结论)--> RESOLVED
+#     --close(只有管理员确认后才关闭)--> CLOSED(终态)
+# 任一非终态动作都只追加事件; CLOSED 后不再接受任何状态变化。
+EVIDENCE_DISPUTE_STATUSES = ("OPEN", "ASSIGNED", "RESOLVED", "CLOSED")
+# 争议单事件流水的事件类型(只追加, 操作者/时间/原因齐备)
+EVIDENCE_DISPUTE_EVENTS = (
+    "dispute.open",          # 管理员打开争议(可同时指定处理人)
+    "dispute.assign",        # 管理员指定/改派处理人(记录处理意见/补充证据摘要)
+    "dispute.resolve",       # 处理人提交处理结论
+    "dispute.close",         # 管理员确认关闭
+    "dispute.reopen",        # 管理员把 RESOLVED 退回处理(回到 ASSIGNED)
+)
+
+
+class EvidenceReceiptDispute(Base):
+    """异常回执争议单: 管理员把一张 PARTIAL/REJECTED 回执打开为争议单。
+
+    - 每张回执至多一张争议单(uq 唯一约束兜底, 关闭后也不允许重开同一回执);
+    - 打开时固化回执/逐事件结果/分发包摘要快照(receipt_snapshot/package_snapshot),
+      之后即使底层数据变化, 争议单依据保持只读;
+    - 处理人不能与打开争议的管理员相同; 只有被指定的处理人(在被指定后)才能提交
+      处理结论; 管理员确认后争议单才关闭;
+    - 过期(EXPIRED/PENDING_PROCESS)或撤销(REVOKED)的分发包不能新开争议;
+    - 状态与全部操作者/时间/原因都落库, 服务重启后完整保留。"""
+
+    __tablename__ = "evidence_receipt_disputes"
+    __table_args__ = (
+        # 同一回执至多一张争议单: 重复打开幂等回显首次结果的数据库兜底
+        UniqueConstraint("receipt_id", name="uq_evidence_dispute_receipt"),
+        Index("ix_evidence_dispute_status", "status"),
+        Index("ix_evidence_dispute_dist", "distribution_id"),
+        Index("ix_evidence_dispute_assignee", "assignee"),
+    )
+
+    id = Column(String(34), primary_key=True)               # "EDC" + 随机串
+    receipt_id = Column(String(34),
+                        ForeignKey("evidence_distribution_receipts.id"),
+                        nullable=False)
+    distribution_id = Column(String(32), nullable=False, index=True)
+    assignment_id = Column(String(34), nullable=False)
+    # 回执来源固定(PARTIAL/REJECTED), 打开时固化
+    receipt_type = Column(String(16), nullable=False)
+    recipient_id = Column(String(64), nullable=False)
+    # 状态机
+    status = Column(String(16), nullable=False, default="OPEN", index=True)
+    # 打开争议的管理员(处理人不得与之相同; 关闭须由管理员确认)
+    opened_by = Column(String(128), nullable=False)
+    opened_at = Column(DateTime, default=_utcnow, index=True)
+    open_reason = Column(String(2000), nullable=True)
+    # 当前处理人(OPEN 未指派时为 None; 改派只覆盖本列, 历史在事件流水)
+    assignee = Column(String(128), nullable=True, index=True)
+    assigned_at = Column(DateTime, nullable=True)
+    # 管理员最近一次指定处理人时记录的处理意见与补充证据摘要
+    handling_opinion = Column(String(4000), nullable=True)
+    supplementary_evidence = Column(String(4000), nullable=True)
+    # 处理人提交的处理结论
+    resolution = Column(String(4000), nullable=True)
+    resolved_by = Column(String(128), nullable=True)
+    resolved_at = Column(DateTime, nullable=True)
+    # 管理员关闭确认
+    closed_by = Column(String(128), nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+    close_note = Column(String(2000), nullable=True)
+    # 退回处理次数(每次 reopen +1)
+    reopen_count = Column(Integer, nullable=False, default=0)
+    # 打开时固化的只读依据: 原始回执(含逐事件结果)与分发包摘要
+    receipt_snapshot = Column(JSON, nullable=False)
+    package_snapshot = Column(JSON, nullable=False)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    events = relationship("EvidenceReceiptDisputeEvent",
+                          cascade="all, delete-orphan",
+                          order_by="EvidenceReceiptDisputeEvent.id")
+
+
+class EvidenceReceiptDisputeEvent(Base):
+    """争议单事件流水(只追加): 打开/指定处理人/提交结论/关闭/退回,
+    每条都带操作者、时间与原因(及必要的结构化明细)。"""
+
+    __tablename__ = "evidence_receipt_dispute_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=_utcnow)
+    dispute_id = Column(String(34),
+                        ForeignKey("evidence_receipt_disputes.id"),
+                        nullable=False, index=True)
+    event = Column(String(32), nullable=False)              # EVIDENCE_DISPUTE_EVENTS
+    from_status = Column(String(16), nullable=True)
+    to_status = Column(String(16), nullable=True)
+    operator = Column(String(128), nullable=False)
+    reason = Column(String(2000), nullable=True)
+    detail = Column(JSON, nullable=True)
+
+
 class EvidenceDistributionExtensionApproval(Base):
     """延期申请的单条审批结论(只追加): APPROVED/REJECTED 为原始结论;
     INVALIDATED/SUPERSEDED 为申请失效/被拒时对其余通过记录的终态化留痕。"""

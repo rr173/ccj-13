@@ -466,3 +466,47 @@ class EvidenceDistributionRecover(BaseModel):
     new_valid_until: Optional[str] = None    # ISO 8601; 与 extend_seconds 二选一
     extend_seconds: Optional[int] = Field(default=None, ge=60, le=31_536_000)
     reason: Optional[str] = Field(default=None, max_length=500)
+
+
+# ---------- 异常回执争议处理工作流 ----------
+
+class EvidenceDisputeOpen(BaseModel):
+    operator: str = Field(min_length=1)                       # 管理员(包创建者)
+    idempotency_key: str = Field(min_length=1)
+    assignee: Optional[str] = Field(default=None,
+                                    min_length=1, max_length=64)  # 当场指定处理人
+    reason: Optional[str] = Field(default=None, max_length=2000)  # 打开原因
+    handling_opinion: Optional[str] = Field(default=None,
+                                            max_length=4000)
+    supplementary_evidence: Optional[str] = Field(default=None,
+                                                  max_length=4000)
+
+
+class EvidenceDisputeAssign(BaseModel):
+    operator: str = Field(min_length=1)                       # 打开争议的管理员
+    idempotency_key: str = Field(min_length=1)
+    assignee: str = Field(min_length=1, max_length=64)        # 不能与打开管理员相同
+    handling_opinion: str = Field(min_length=1, max_length=4000)
+    supplementary_evidence: str = Field(min_length=1, max_length=4000)
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class EvidenceDisputeResolve(BaseModel):
+    operator: str = Field(min_length=1)                       # 必须是当前处理人
+    idempotency_key: str = Field(min_length=1)
+    resolution: str = Field(min_length=1, max_length=4000)    # 处理结论(必填)
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class EvidenceDisputeClose(BaseModel):
+    operator: str = Field(min_length=1)                       # 管理员(包创建者)
+    idempotency_key: str = Field(min_length=1)
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+
+class EvidenceDisputeReopen(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=2000)        # 退回原因(必填)
+    new_assignee: Optional[str] = Field(default=None,
+                                        min_length=1, max_length=64)

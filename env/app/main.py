@@ -18,27 +18,28 @@ from .models import (
 from .plans import PlanWorker
 from .quality import QualityWorker
 from .replay import ReplayWorker
-from . import (archives, auditreplay, cleanup, distribution, evidence, plans,
-               quality, replay, reviews, service)
+from . import (archives, auditreplay, cleanup, disputes, distribution,
+               evidence, plans, quality, replay, reviews, service)
 from .schemas import (
     AdminAction, ArchiveAction, ArchiveCreate, ArchiveRetention,
     AuditEventNote, AuditSnapshotCreate, BatchCreate, CheckpointCreate, CleanupAction,
     CleanupCreate, CompensationAction, CompensationApprovalAction,
     CompensationCancelAction, CompensationCreate, CompensationRejectAction,
     CompensationRetry, CompensationWindowAction, EvidenceAssignmentCreate,
-    EvidenceDistributionAction, EvidenceDistributionCreate,
-    EvidenceDistributionRecover, EvidenceDistributionTokenIssue,
-    EvidenceDownloadIssue, EvidenceExtensionApproval,
-    EvidenceExtensionReject, EvidenceExtensionRequest,
-    EvidenceReceiptSubmit, EvidenceExportAction, EvidenceExportCreate,
-    EvidencePageQuery, EvidenceRecipientDisable, EvidenceRecipientRegister,
-    EvidenceReviewAction, EvidenceReviewConclusionSubmit,
-    EvidenceReviewCreate, EvidenceSessionCreate, PlanAction, PlanCreate,
-    PlanRejectAction, PlanWindowAction, QualityExemptionCreate,
-    QualityExemptionRevoke, QualityFixCreate, QualityRulesSave, QualityScanAction,
-    QualityScanCreate, RecordIn, RecoverAction, ReplayAction, ReplayCreate,
-    ReviewBatchAssign, ReviewBatchReview, ReviewConfirm, ReviewReopen,
-    ReviewSubmit,
+    EvidenceDisputeAssign, EvidenceDisputeClose, EvidenceDisputeOpen,
+    EvidenceDisputeReopen, EvidenceDisputeResolve, EvidenceDistributionAction,
+    EvidenceDistributionCreate, EvidenceDistributionRecover,
+    EvidenceDistributionTokenIssue, EvidenceDownloadIssue,
+    EvidenceExtensionApproval, EvidenceExtensionReject,
+    EvidenceExtensionRequest, EvidenceReceiptSubmit, EvidenceExportAction,
+    EvidenceExportCreate, EvidencePageQuery, EvidenceRecipientDisable,
+    EvidenceRecipientRegister, EvidenceReviewAction,
+    EvidenceReviewConclusionSubmit, EvidenceReviewCreate,
+    EvidenceSessionCreate, PlanAction, PlanCreate, PlanRejectAction,
+    PlanWindowAction, QualityExemptionCreate, QualityExemptionRevoke,
+    QualityFixCreate, QualityRulesSave, QualityScanAction, QualityScanCreate,
+    RecordIn, RecoverAction, ReplayAction, ReplayCreate, ReviewBatchAssign,
+    ReviewBatchReview, ReviewConfirm, ReviewReopen, ReviewSubmit,
 )
 
 APP_VERSION = service.APP_VERSION
@@ -341,6 +342,9 @@ def status(db: Session = Depends(get_db)):
         "evidence_distributions": [
             distribution.distribution_to_dict(d) for d in
             distribution.list_distributions(db, limit=20)],
+        "evidence_disputes": [
+            disputes.dispute_summary(x) for x in
+            disputes.list_disputes(db, pending_only=True, limit=20)],
     }
 
 
@@ -2334,9 +2338,16 @@ def get_evidence_distribution(package_id: str, operator: str = "system",
     """分发包详情: 接收方/有效期/事件数量/各类摘要/当前状态/事件流水。
     只有授权接收方本人或创建该包的管理员可查看。"""
     dist = _load_dist_for_view(package_id, operator, db)
-    return distribution.distribution_to_dict(dist, with_manifest=True,
-                                             with_events=with_events,
-                                             with_receipts=True)
+    out = distribution.distribution_to_dict(dist, with_manifest=True,
+                                            with_events=with_events,
+                                            with_receipts=True)
+    # 争议单(异常回执处理工作流): 摘要随分发包只读展示
+    dispute_rows = disputes.list_disputes(db, package_id=package_id, limit=200)
+    out["disputes"] = [disputes.dispute_summary(d) for d in dispute_rows]
+    out["dispute_count"] = len(dispute_rows)
+    out["open_dispute_count"] = sum(
+        1 for d in dispute_rows if d.status != "CLOSED")
+    return out
 
 
 @app.post("/api/admin/evidence/distributions/{package_id}/revoke")
@@ -2540,10 +2551,19 @@ def get_evidence_receipts(package_id: str, operator: str = "system",
     d = distribution.distribution_to_dict(dist, with_manifest=False,
                                           with_events=False,
                                           with_receipts=True)
+    # 每张回执对应的争议单(只读摘要)
+    dispute_rows = disputes.list_disputes(db, package_id=package_id, limit=200)
+    by_receipt = {x.receipt_id: disputes.dispute_summary(x)
+                  for x in dispute_rows}
+    for receipt in d["receipts"]:
+        receipt["dispute"] = by_receipt.get(receipt["receipt_id"])
     return {"package_id": package_id, "status": d["status"],
             "receipt_progress": d["receipt_progress"],
             "assignments": d["assignments"], "receipts": d["receipts"],
-            "extensions": d["extensions"]}
+            "extensions": d["extensions"],
+            "disputes": list(by_receipt.values()),
+            "open_dispute_count": sum(
+                1 for x in dispute_rows if x.status != "CLOSED")}
 
 
 @app.post("/api/admin/evidence/distributions/{package_id}/receipts",
@@ -2741,6 +2761,184 @@ def sweep_evidence_distributions(body: EvidenceDistributionAction,
     result = distribution.sweep_due_packages(db, operator=body.operator)
     result["replayed"] = False
     return result
+
+
+# ---------- 异常回执争议处理工作流 ----------
+
+def _dispute_error(e: Exception):
+    status_code = getattr(e, "status_code", 409)
+    detail = {"error": "evidence_dispute_error", "reason": str(e),
+              "code": getattr(e, "code", "dispute_conflict")}
+    extra = getattr(e, "extra", None)
+    if extra:
+        detail.update(extra)
+    raise HTTPException(status_code=status_code, detail=detail)
+
+
+def _dispute_payload(dispute, extra: dict | None = None) -> dict:
+    out = disputes.dispute_to_dict(dispute, with_events=False)
+    if extra:
+        out.update(extra)
+    return out
+
+
+@app.post("/api/admin/evidence/receipts/{receipt_id}/dispute", status_code=201)
+def open_evidence_receipt_dispute(receipt_id: str, body: EvidenceDisputeOpen,
+                                  db: Session = Depends(get_db)):
+    """管理员把一张 PARTIAL/REJECTED 回执打开为争议单。
+
+    - 同一回执重复打开幂等回显已有争议单(CLOSED 后也不允许重开同一回执);
+    - 处理人不能与打开管理员相同; 当场指定处理人 -> ASSIGNED, 否则停留 OPEN;
+    - 过期/待处理/撤销的分发包不能新开争议;
+    - 打开时刻固化原始回执(含逐事件结果)与分发包摘要为只读快照。"""
+
+    def _do(s):
+        return disputes.open_dispute(
+            s, receipt_id, operator=body.operator, assignee=body.assignee,
+            reason=body.reason, handling_opinion=body.handling_opinion,
+            supplementary_evidence=body.supplementary_evidence)
+
+    try:
+        result, replayed = disputes.run_dispute_action(
+            db, action="dispute.open", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            receipt_id=receipt_id, fn=_do)
+    except disputes.DisputeError as e:
+        db.rollback()
+        _dispute_error(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/evidence/disputes/{dispute_id}/assign")
+def assign_evidence_dispute(dispute_id: str, body: EvidenceDisputeAssign,
+                            db: Session = Depends(get_db)):
+    """管理员指定/改派处理人(OPEN/ASSIGNED 可指派, RESOLVED 指派视为退回重派),
+    必须记录处理意见与补充证据摘要; 处理人不得与打开管理员相同。"""
+
+    def _do(s):
+        return disputes.assign_dispute(
+            s, dispute_id, operator=body.operator, assignee=body.assignee,
+            handling_opinion=body.handling_opinion,
+            supplementary_evidence=body.supplementary_evidence,
+            reason=body.reason)
+
+    try:
+        result, replayed = disputes.run_dispute_action(
+            db, action="dispute.assign", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            dispute_id=dispute_id, fn=_do)
+    except disputes.DisputeError as e:
+        db.rollback()
+        _dispute_error(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/evidence/disputes/{dispute_id}/resolve")
+def resolve_evidence_dispute(dispute_id: str, body: EvidenceDisputeResolve,
+                             db: Session = Depends(get_db)):
+    """当前处理人(被指定后)提交处理结论 -> RESOLVED, 等待管理员确认。
+    非当前处理人/未指派/已提交/已关闭 -> 403/409。"""
+
+    def _do(s):
+        return disputes.resolve_dispute(
+            s, dispute_id, operator=body.operator,
+            resolution=body.resolution, reason=body.reason)
+
+    try:
+        result, replayed = disputes.run_dispute_action(
+            db, action="dispute.resolve", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            dispute_id=dispute_id, fn=_do)
+    except disputes.DisputeError as e:
+        db.rollback()
+        _dispute_error(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/evidence/disputes/{dispute_id}/close")
+def close_evidence_dispute(dispute_id: str, body: EvidenceDisputeClose,
+                           db: Session = Depends(get_db)):
+    """管理员确认处理结论后关闭争议单(终态)。
+    只有 RESOLVED 可关闭; 关闭人不得是处理人本人。"""
+
+    def _do(s):
+        return disputes.close_dispute(
+            s, dispute_id, operator=body.operator, note=body.note)
+
+    try:
+        result, replayed = disputes.run_dispute_action(
+            db, action="dispute.close", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            dispute_id=dispute_id, fn=_do)
+    except disputes.DisputeError as e:
+        db.rollback()
+        _dispute_error(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/evidence/disputes/{dispute_id}/reopen")
+def reopen_evidence_dispute(dispute_id: str, body: EvidenceDisputeReopen,
+                            db: Session = Depends(get_db)):
+    """管理员把 RESOLVED 争议退回处理(可改派处理人), 退回原因必填。"""
+
+    def _do(s):
+        return disputes.reopen_dispute(
+            s, dispute_id, operator=body.operator, reason=body.reason,
+            new_assignee=body.new_assignee)
+
+    try:
+        result, replayed = disputes.run_dispute_action(
+            db, action="dispute.reopen", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            dispute_id=dispute_id, fn=_do)
+    except disputes.DisputeError as e:
+        db.rollback()
+        _dispute_error(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.get("/api/admin/evidence/disputes/{dispute_id}")
+def get_evidence_dispute(dispute_id: str, operator: str = "system",
+                         db: Session = Depends(get_db)):
+    """争议单详情: 状态/当前处理人/处理意见/补充证据摘要/结论/关闭信息/事件流水
+    与打开时固化的只读依据(原始回执含逐事件结果 + 分发包摘要)。
+    创建管理员、处理人、被异议回执接收方可查看。"""
+    try:
+        d = disputes.get_dispute(db, dispute_id)
+    except disputes.DisputeError as e:
+        _dispute_error(e)
+    try:
+        disputes.require_dispute_view_access(db, d, operator)
+    except distribution.DistributionForbidden as e:
+        _dist_forbidden(e)
+    out = disputes.dispute_to_dict(d, with_events=True, with_snapshots=True)
+    out["view_operator"] = operator
+    return out
+
+
+@app.get("/api/admin/evidence/disputes")
+def list_evidence_disputes(status_filter: str | None = None,
+                           package_id: str | None = None,
+                           assignee: str | None = None,
+                           pending_only: bool = False,
+                           limit: int = 100,
+                           db: Session = Depends(get_db)):
+    """争议单目录: 可按状态(OPEN/ASSIGNED/RESOLVED/CLOSED)/分发包/处理人过滤;
+    pending_only=true 只返回待处理(非 CLOSED)争议。"""
+    from .models import EVIDENCE_DISPUTE_STATUSES
+    if status_filter is not None and status_filter not in EVIDENCE_DISPUTE_STATUSES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_dispute_status",
+            "reason": f"争议单状态必须是 {list(EVIDENCE_DISPUTE_STATUSES)} 之一"})
+    rows = disputes.list_disputes(
+        db, status_filter=status_filter, package_id=package_id,
+        assignee=assignee, pending_only=pending_only, limit=limit)
+    return [disputes.dispute_to_dict(d, with_events=False) for d in rows]
 
 
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------

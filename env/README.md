@@ -780,6 +780,29 @@ OPEN ─两名不同操作者对固定范围全部事件签署→ archive → AR
   issue_no+1 产生**新的 package_id 与全新回执周期**, 旧包只读保留。撤销
   (PENDING_PROCESS 也可撤销)后回执永久只读。历史包启动时自动补齐主接收方分派。
 
+### 异常回执争议处理(evidence_receipt_disputes)
+
+在 **PARTIAL / REJECTED** 回执之上, 管理员可打开争议单走独立处理工作流
+(`OPEN → ASSIGNED → RESOLVED → CLOSED`):
+
+- **打开** `POST /api/admin/evidence/receipts/{receipt_id}/dispute` 仅包创建
+  管理员可操作; 可当场指定处理人(直达 ASSIGNED, 必填处理意见与补充证据摘要),
+  也可先开为 OPEN 再 `POST .../disputes/{id}/assign {assignee, handling_opinion,
+  supplementary_evidence}` 指派。处理人不得与打开管理员相同; SIGNED 回执、
+  过期(EXPIRED)/待处理(PENDING_PROCESS)/撤销(REVOKED)的包不能新开。
+- **处理**: 只有被指定的当前处理人能 `POST .../disputes/{id}/resolve {resolution}`
+  (未指派/他人均 403; 重复提交 `dispute_already_resolved`);
+  管理员 `.../close` 确认后才 CLOSED(关闭人不得是处理人本人), 也可
+  `.../reopen {reason, new_assignee?}` 退回 ASSIGNED 补充处理。
+- **幂等与只读**: 同一回执重复打开(同键或换键)幂等回显已有争议单, CLOSED 后
+  也不重开; 打开时刻固化原始回执(含逐事件结果)与分发包摘要快照, 争议流程只写
+  争议自身表并向分发包事件流投影 `dispute.*`, **绝不改写**原始回执、逐事件结果
+  与分发包摘要。每次状态变化追加事件(操作者/时间/前后状态/原因)。
+- **展示与重启**: `GET /api/admin/evidence/disputes[?status_filter=&package_id=&
+  assignee=&pending_only=]` 列待处理争议; 详情返回当前处理人、处理意见、补充证据
+  摘要、结论、关闭信息、事件流水与只读快照; 包详情/回执列表嵌入争议摘要,
+  `/api/status` 附 `evidence_disputes`。状态全部落库, 服务重启后完整保留。
+
 ## 运行
 
 ```bash

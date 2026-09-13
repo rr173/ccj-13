@@ -446,6 +446,12 @@
     多授权接收方(各自最晚回执时间/必须确认事件范围) · 一次性下载令牌(首次兑换失效) ·
     接收回执(签收/部分异常/拒收, 校验固定 package_id/manifest_hash/content_digest) ·
     回执截止未完成自动待处理并禁止下载(恢复须重新校验; 重签产生新 package_id) · 延期双人审批 · 独立离线校验逐项指出篡改位置</span>
+  <div style="margin-top:4px;color:#6a1b9a">
+    <b>异常回执争议处理</b>:
+    <span class="muted">PARTIAL/REJECTED 回执可打开争议单(OPEN→ASSIGNED→RESOLVED→CLOSED) ·
+      处理人≠打开管理员, 处理人被指定后才能提交结论, 管理员确认后才关闭 ·
+      原始回执/逐事件结果/分发包摘要只读固化 · 过期或撤销的分发包不能新开争议(同回执重复打开幂等)</span>
+  </div>
 
   <div style="margin-top:8px">
     <b>4. 接收方名册</b>:
@@ -472,7 +478,9 @@
     <button class="plain" onclick="dstRefreshList()">刷新分发列表</button>
   </div>
   <div id="dstList" style="margin-top:6px"></div>
+  <div id="dstPendingDisputes" style="margin-top:6px"></div>
   <div id="dstDetail" style="margin-top:6px"></div>
+  <div id="dstDisputeDetail" style="margin-top:6px"></div>
 
   <div style="margin-top:10px;border-top:1px dashed #81c784;padding-top:8px">
     <b>6. 独立离线校验</b> <span class="muted">(上传任意分发包 zip, 无需身份; 重算逐行/逐文件/content/manifest/签名摘要)</span>
@@ -3244,6 +3252,7 @@ async function dstLoad(pid, operator) {
   const pending = d.status === 'PENDING_PROCESS';
   const canIssue = !revoked && !expired && !pending;
   const isAdminView = op === d.created_by;
+  dstRenderDisputes(d, op);
   const evs = (d.events||[]).slice(-20).reverse().map(e =>
     `<tr><td>${e.ts||''}</td><td>${arEscape(e.event)}</td><td>${arEscape(e.operator)}</td>
      <td class="muted">${arEscape((e.reason||'').slice(0,150))}</td></tr>`).join('');
@@ -3256,9 +3265,15 @@ async function dstLoad(pid, operator) {
       : a.status === 'REJECTED' ? '<span class="tag err">拒收</span>'
       : a.status === 'OVERDUE' ? '<span class="tag err">逾期未回</span>' : a.status;
     const rcInfo = rc ? `(${rc.receipt_type}, 确认${rc.confirmed_count}/异常${rc.anomaly_count}/拒${rc.rejected_event_count}, ${rc.submitted_by})` : '';
+    const disputable = rc && (rc.receipt_type === 'PARTIAL' || rc.receipt_type === 'REJECTED');
+    const disputeLink = (rc && rc.dispute)
+      ? ` <a href="javascript:dstLoadDispute('${rc.dispute.dispute_id}')">${dstDisputeBadge(rc.dispute.status)} ${rc.dispute.dispute_id}</a>`
+      : (disputable && isAdminView
+        ? ` <button class="plain" style="padding:0 4px" onclick="dstOpenDispute('${d.package_id}','${rc.receipt_id}')">打开争议</button>`
+        : '');
     return `<tr>
       <td><b>${arEscape(a.recipient)}</b></td>
-      <td>${badge} <span class="muted">${rcInfo}</span></td>
+      <td>${badge} <span class="muted">${rcInfo}</span>${disputeLink}</td>
       <td class="muted">${arEscape(a.receipt_due_at||'')}</td>
       <td class="muted">${a.required_scope_all ? '全部事件' : (a.required_global_seqs||[]).join(',')}</td>
     </tr>`;
@@ -3305,6 +3320,11 @@ async function dstLoad(pid, operator) {
           <tbody>${anomaliesRows}</tbody></table>` : ''}
         ${(p.unfinished_recipients||[]).length ? `<div class="muted">未完成接收方: ${
           p.unfinished_recipients.map(u=>arEscape(u.recipient)+(u.overdue?'(逾期)':'')).join('、')}</div>` : ''}
+      </div>
+
+      <div style="margin-top:6px;border-top:1px dashed #81c784;padding-top:6px">
+        <b>异常回执争议单</b> <span class="muted">(原始回执/逐事件结果/分发包摘要打开时固化只读)</span>
+        <div id="dstDisputeList-${d.package_id}"></div>
       </div>
 
       <div style="margin-top:6px">
@@ -3413,6 +3433,189 @@ async function dstSubmitReceipt(pid) {
   if (!res.ok) { dstMsg('回执被拒[' + (res.json?.detail?.code||res.status) + ']: ' + (res.json?.detail?.reason||JSON.stringify(res.json?.detail||'')), 'err'); return; }
   dstMsg(`回执 ${res.json.receipt_type} 已提交(${res.json.confirmed_count??0} 确认/${res.json.anomaly_count??0} 异常)`, 'ok');
   dstRefreshList(); dstLoad(pid, recipient);
+}
+
+// ---------- 异常回执争议处理工作流 ----------
+
+function dstDisputeBadge(status) {
+  const cls = status === 'OPEN' ? '' : status === 'ASSIGNED' ? ''
+    : status === 'RESOLVED' ? 'ok' : 'err';
+  const label = {OPEN:'待指派', ASSIGNED:'处理中', RESOLVED:'待确认关闭', CLOSED:'已关闭'}[status] || status;
+  return `<span class="tag ${cls}" style="${status==='ASSIGNED'?'background:#e3f2fd':''}">${label}</span>`;
+}
+
+async function dstRefreshPendingDisputes() {
+  const host = document.getElementById('dstPendingDisputes');
+  if (!host) return;
+  let rows = [];
+  try { rows = await (await fetch('/api/admin/evidence/disputes?pending_only=true&limit=50')).json(); }
+  catch (e) { return; }
+  if (!rows.length) { host.innerHTML = ''; return; }
+  host.innerHTML = `<div style="border:1px solid #ce93d8;background:#faf5fc;border-radius:6px;padding:6px 8px">
+    <b>待处理争议(${rows.length})</b>
+    <table style="margin-top:4px"><thead><tr><th>争议单</th><th>状态</th><th>回执</th>
+      <th>接收方</th><th>当前处理人</th><th>结论</th><th>打开人/时间</th><th></th></tr></thead><tbody>
+    ${rows.map(x => `<tr>
+      <td><a href="javascript:dstLoadDispute('${x.dispute_id}')"><b>${x.dispute_id}</b></a></td>
+      <td>${dstDisputeBadge(x.status)}</td>
+      <td class="muted">${arEscape(x.receipt_type)} ${arEscape(x.receipt_id)}</td>
+      <td>${arEscape(x.recipient)}</td>
+      <td>${arEscape(x.assignee||'-')}</td>
+      <td class="muted">${arEscape((x.resolution||'').slice(0,30))||'-'}</td>
+      <td class="muted">${arEscape(x.opened_by)}<br>${x.opened_at||''}</td>
+      <td><button class="plain" onclick="dstLoadDispute('${x.dispute_id}')">打开</button></td>
+    </tr>`).join('')}
+    </tbody></table></div>`;
+}
+
+function dstRenderDisputes(d, op) {
+  const host = document.getElementById(`dstDisputeList-${d.package_id}`);
+  if (!host) return;
+  const list = d.disputes || [];
+  if (!list.length) {
+    host.innerHTML = '<div class="muted">尚无争议单</div>';
+    return;
+  }
+  host.innerHTML = list.map(x => `<div style="margin-top:4px;padding:4px 6px;border:1px solid #e1bee7;border-radius:4px">
+    ${dstDisputeBadge(x.status)} <a href="javascript:dstLoadDispute('${x.dispute_id}')"><b>${x.dispute_id}</b></a>
+    <span class="muted">回执 ${arEscape(x.receipt_type)} ${arEscape(x.receipt_id)} · 接收方 ${arEscape(x.recipient)}
+      · 处理人 ${arEscape(x.assignee||'(未指派)')}
+      ${x.resolution?` · 结论: ${arEscape(x.resolution.slice(0,40))}`:''}
+      ${x.closed_by?` · 已由 ${arEscape(x.closed_by)} 关闭`:''}</span>
+  </div>`).join('');
+}
+
+async function dstOpenDispute(pid, receiptId) {
+  const assignee = prompt('处理人账号(留空=先打开 OPEN, 稍后指派; 不能与打开管理员相同):', '') || null;
+  let handling_opinion = null, supplementary_evidence = null, reason = null;
+  if (assignee) {
+    handling_opinion = prompt('处理意见(指派时必填):');
+    if (!handling_opinion) return;
+    supplementary_evidence = prompt('补充证据摘要(指派时必填):');
+    if (!supplementary_evidence) return;
+  }
+  reason = prompt('打开争议原因:', '接收方提交部分异常/拒收, 需核查处理') || '';
+  const res = await dstPost(`/api/admin/evidence/receipts/${receiptId}/dispute`,
+    { operator: evOp(), idempotency_key: dstKey(), assignee,
+      reason: reason || null, handling_opinion, supplementary_evidence });
+  if (!res.ok) { dstMsg('打开争议失败[' + (res.json?.detail?.code||res.status) + ']: ' + (res.json?.detail?.reason||''), 'err'); return; }
+  dstMsg(`争议单 ${res.json.dispute_id} 已${res.json.deduped?'(幂等回显已存在)':'打开'}(状态 ${res.json.status})`, 'ok');
+  dstRefreshList(); dstLoad(pid, evOp()); dstLoadDispute(res.json.dispute_id);
+}
+
+async function dstAssignDispute(did) {
+  const assignee = prompt('指定处理人账号(不能与打开管理员相同):');
+  if (!assignee) return;
+  const handling_opinion = prompt('处理意见(必填):');
+  if (!handling_opinion) return;
+  const supplementary_evidence = prompt('补充证据摘要(必填):');
+  if (!supplementary_evidence) return;
+  const res = await dstPost(`/api/admin/evidence/disputes/${did}/assign`,
+    { operator: evOp(), idempotency_key: dstKey(), assignee: assignee.trim(),
+      handling_opinion, supplementary_evidence });
+  if (!res.ok) { dstMsg('指派失败[' + (res.json?.detail?.code||res.status) + ']: ' + (res.json?.detail?.reason||''), 'err'); return; }
+  dstMsg(`争议单已分派给 ${res.json.assignee}(状态 ASSIGNED)`, 'ok');
+  dstLoadDispute(did);
+}
+
+async function dstResolveDispute(did) {
+  const resolution = prompt('处理结论(只有被指定的处理人可提交):');
+  if (!resolution) return;
+  const res = await dstPost(`/api/admin/evidence/disputes/${did}/resolve`,
+    { operator: evOp(), idempotency_key: dstKey(), resolution });
+  if (!res.ok) { dstMsg('提交结论失败[' + (res.json?.detail?.code||res.status) + ']: ' + (res.json?.detail?.reason||''), 'err'); return; }
+  dstMsg('处理结论已提交(RESOLVED), 等待管理员确认关闭', 'ok');
+  dstLoadDispute(did);
+}
+
+async function dstCloseDispute(did) {
+  if (!confirm('确认处理结论并关闭争议单? (CLOSED 为终态, 不可再变更)')) return;
+  const note = prompt('关闭备注(可选):', '') || null;
+  const res = await dstPost(`/api/admin/evidence/disputes/${did}/close`,
+    { operator: evOp(), idempotency_key: dstKey(), note });
+  if (!res.ok) { dstMsg('关闭失败[' + (res.json?.detail?.code||res.status) + ']: ' + (res.json?.detail?.reason||''), 'err'); return; }
+  dstMsg('争议单已关闭(CLOSED)', 'ok');
+  dstLoadDispute(did);
+}
+
+async function dstReopenDispute(did) {
+  const reason = prompt('退回处理原因(必填):');
+  if (!reason) return;
+  const na = prompt('改派处理人账号(留空=仍由当前处理人处理):', '') || null;
+  const res = await dstPost(`/api/admin/evidence/disputes/${did}/reopen`,
+    { operator: evOp(), idempotency_key: dstKey(), reason, new_assignee: na });
+  if (!res.ok) { dstMsg('退回失败[' + (res.json?.detail?.code||res.status) + ']: ' + (res.json?.detail?.reason||''), 'err'); return; }
+  dstMsg('争议单已退回处理(ASSIGNED)', 'ok');
+  dstLoadDispute(did);
+}
+
+async function dstLoadDispute(did) {
+  const op = evOp();
+  const r = await fetch(`/api/admin/evidence/disputes/${did}?operator=${encodeURIComponent(op)}`);
+  const host = document.getElementById('dstDisputeDetail');
+  if (!r.ok) {
+    let j=null; try{j=await r.json();}catch(e){}
+    host.innerHTML = `<div class="err">查看争议单失败[${j?.detail?.code||r.status}]: ${arEscape(j?.detail?.reason||'')}</div>`;
+    return;
+  }
+  const d = await r.json();
+  const isAdmin = op === d.opened_by;
+  const isAssignee = op === d.assignee;
+  const evRows = (d.events||[]).map(e =>
+    `<tr><td class="muted">${e.ts||''}</td><td>${arEscape(e.event)}</td>
+     <td>${arEscape(e.from_status||'-')} → ${arEscape(e.to_status||'-')}</td>
+     <td>${arEscape(e.operator)}</td><td class="muted">${arEscape(e.reason||'')}</td></tr>`).join('');
+  const rs = d.receipt_snapshot || {};
+  const ps = d.package_snapshot || {};
+  const eventRows = (rs.events||[]).map(e =>
+    `<tr><td>${e.global_seq}</td><td>${arEscape(e.result)}</td>
+     <td class="muted">${arEscape(e.note||'')}</td><td class="muted">${arEscape(e.operator)}</td></tr>`).join('');
+  host.innerHTML = `
+    <div style="border:2px solid #8e24aa;border-radius:8px;padding:8px;margin-top:6px;background:#fdfaff">
+      <div>${dstDisputeBadge(d.status)} <b>${d.dispute_id}</b>
+        <span class="muted">回执 ${arEscape(d.receipt_id)}(${arEscape(d.receipt_type)}) · 接收方 ${arEscape(d.recipient)}</span></div>
+      <div class="muted" style="margin:4px 0">
+        分发包 <a href="javascript:dstLoad('${d.package_id}', evOp())">${d.package_id}</a>
+        · 打开管理员 <b>${arEscape(d.opened_by)}</b> 于 ${d.opened_at||''}
+        ${d.open_reason?`<br>打开原因: ${arEscape(d.open_reason)}`:''}
+      </div>
+      <div class="muted">当前处理人: <b>${arEscape(d.assignee||'(未指派)')}</b>
+        ${d.assigned_at?` · 指派于 ${d.assigned_at}`:''}</div>
+      ${d.handling_opinion?`<div class="muted">处理意见: ${arEscape(d.handling_opinion)}</div>`:''}
+      ${d.supplementary_evidence?`<div class="muted">补充证据摘要: ${arEscape(d.supplementary_evidence)}</div>`:''}
+      ${d.resolution?`<div style="margin-top:4px"><b>处理结论</b>(${arEscape(d.resolved_by)}, ${d.resolved_at||''}):
+        <div style="background:#fff;border:1px solid #ce93d8;border-radius:4px;padding:4px">${arEscape(d.resolution)}</div></div>`:''}
+      ${d.closed_by?`<div class="ok" style="margin-top:4px">已由 ${arEscape(d.closed_by)} 于 ${d.closed_at} 确认关闭
+        ${d.close_note?`: ${arEscape(d.close_note)}`:''}(退回 ${d.reopen_count} 次)</div>`:''}
+      <div style="margin-top:6px">
+        <button class="plain" ${(isAdmin && d.status==='OPEN')?'':'disabled'}
+          onclick="dstAssignDispute('${d.dispute_id}')">指定处理人</button>
+        <button class="plain" ${(isAdmin && (d.status==='OPEN'||d.status==='ASSIGNED'))?'':'disabled'}
+          onclick="dstAssignDispute('${d.dispute_id}')">改派处理人</button>
+        <button ${(isAssignee && d.status==='ASSIGNED')?'':'disabled'}
+          onclick="dstResolveDispute('${d.dispute_id}')">提交处理结论</button>
+        <button ${(isAdmin && d.status==='RESOLVED')?'':'disabled'}
+          onclick="dstCloseDispute('${d.dispute_id}')">管理员确认关闭</button>
+        <button class="plain" ${(isAdmin && d.status==='RESOLVED')?'':'disabled'}
+          onclick="dstReopenDispute('${d.dispute_id}')">退回处理</button>
+      </div>
+      <details style="margin-top:6px" open><summary><b>事件流水</b> <span class="muted">(只追加: 操作者/时间/状态/原因)</span></summary>
+        <table><thead><tr><th>时间</th><th>事件</th><th>状态</th><th>操作者</th><th>原因</th></tr></thead>
+        <tbody>${evRows||'<tr><td colspan=5 class=muted>无</td></tr>'}</tbody></table></details>
+      <details><summary class="muted">只读依据: 原始回执(逐事件结果) + 分发包摘要(打开时固化)</summary>
+        <div class="muted">回执: ${arEscape(rs.receipt_type)} · 提交人 ${arEscape(rs.submitted_by||'')} · ${rs.submitted_at||''}
+          · 确认 ${rs.confirmed_count??'-'}/异常 ${rs.anomaly_count??'-'}/拒收事件 ${rs.rejected_event_count??'-'}
+          ${rs.note?`<br>说明: ${arEscape(rs.note)}`:''}</div>
+        <table style="margin-top:4px"><thead><tr><th>global_seq</th><th>结果</th><th>说明</th><th>操作者</th></tr></thead>
+        <tbody>${eventRows||'<tr><td colspan=4 class=muted>无逐事件结果</td></tr>'}</tbody></table>
+        <div class="muted" style="margin-top:4px">
+          分发包状态(打开时) <b>${arEscape(ps.status||'-')}</b> · ${arEscape(ps.redaction_policy||'-')} · 事件 ${ps.event_count??'-'}
+          <br>manifest_hash <code>${shortHash(ps.manifest_hash)}</code>
+          content_digest <code>${shortHash(ps.content_digest)}</code>
+          signature_digest <code>${shortHash(ps.signature_digest)}</code>
+          <br>复核签署摘要 <code>${shortHash(ps.review_signature_hash)}</code></div>
+      </details>
+    </div>`;
 }
 
 async function dstRequestExtension(pid) {
@@ -3524,8 +3727,9 @@ async function dstVerifyUpload() {
 
 dstRefreshRecipients();
 dstRefreshList();
+dstRefreshPendingDisputes();
 
-setInterval(refresh, 3000);
+setInterval(() => { refresh(); dstRefreshPendingDisputes(); }, 3000);
 </script>
 </body>
 </html>
