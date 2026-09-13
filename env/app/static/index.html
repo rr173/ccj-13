@@ -440,6 +440,47 @@
   <div id="rvDetail" style="margin-top:6px"></div>
 </div>
 
+<div class="card" style="background:#eefbf3;border-color:#81c784">
+  <b>证据封存分发与离线校验</b>
+  <span class="muted">只能从已归档(ARCHIVED)复核单创建 · package_id 由不可变签署摘要+接收方+脱敏策略+签发序号固定派生 ·
+    一次性下载令牌(绑定接收方, 首次兑换失效) · 撤销/过期拒绝下载 · 独立离线校验逐项指出篡改位置</span>
+
+  <div style="margin-top:8px">
+    <b>4. 接收方名册</b>:
+    账号 <input id="dstRecipient" size="14" placeholder="auditor1">
+    名称 <input id="dstName" size="10" placeholder="审计员">
+    联系方式 <input id="dstContact" size="14" placeholder="邮箱/工号">
+    <button onclick="dstRegister()">登记接收方</button>
+    <button class="plain" onclick="dstRefreshRecipients()">刷新型名册</button>
+  </div>
+  <div id="dstRecipients" style="margin-top:6px"></div>
+
+  <div style="margin-top:10px;border-top:1px dashed #81c784;padding-top:8px">
+    <b>5. 创建分发包</b>:
+    复核单 <input id="dstRid" size="12" placeholder="ER...">
+    接收方 <input id="dstTo" size="12" placeholder="auditor1">
+    脱敏
+    <select id="dstPolicy">
+      <option value="STANDARD">STANDARD(隐藏操作者/说明)</option>
+      <option value="NONE">NONE(明文)</option>
+      <option value="FULL">FULL(隐藏整段 payload)</option>
+    </select>
+    有效期(秒) <input id="dstTtl" type="number" value="604800" min="60" style="width:90px">
+    <button onclick="dstCreate()">创建分发包</button>
+    <button class="plain" onclick="dstRefreshList()">刷新分发列表</button>
+  </div>
+  <div id="dstList" style="margin-top:6px"></div>
+  <div id="dstDetail" style="margin-top:6px"></div>
+
+  <div style="margin-top:10px;border-top:1px dashed #81c784;padding-top:8px">
+    <b>6. 独立离线校验</b> <span class="muted">(上传任意分发包 zip, 无需身份; 重算逐行/逐文件/content/manifest/签名摘要)</span>
+    <input type="file" id="dstFile" accept=".zip,application/zip">
+    <button onclick="dstVerifyUpload()">上传校验</button>
+  </div>
+  <div id="dstVerify" style="margin-top:6px"></div>
+  <div id="dstMsg" class="msg"></div>
+</div>
+
 <div class="card">
   <b>审计日志</b>（批次 / 操作者 / 版本 / 水位 / 差异 / 恢复原因）
   <table>
@@ -3084,6 +3125,211 @@ async function rvArchive(rid) {
 }
 
 rvRefreshList();
+
+// ======================================================================
+// ---------- 证据封存分发与离线校验 ----------
+// ======================================================================
+function dstMsg(msg, cls='') {
+  const el = document.getElementById('dstMsg');
+  el.className = 'msg ' + cls;
+  el.textContent = msg;
+}
+function dstKey() {
+  return 'dst-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+}
+async function dstPost(url, body) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(body)});
+  let j=null; try{j=await r.json();}catch(e){}
+  return {ok:r.ok, status:r.status, json:j};
+}
+function dstBadge(status) {
+  const cls = status === 'ACTIVE' ? 'ok' : status === 'EXPIRED' ? '' : 'err';
+  return `<span class="tag ${cls}">${status}</span>`;
+}
+function shortHash(h) { return h ? arEscape(h.slice(0,16)) + '…' : '-'; }
+
+async function dstRegister() {
+  const recipient = document.getElementById('dstRecipient').value.trim();
+  if (!recipient) { dstMsg('请填写接收方账号', 'err'); return; }
+  const body = { operator: evOp(), idempotency_key: dstKey(), recipient,
+                 name: document.getElementById('dstName').value.trim() || null,
+                 contact: document.getElementById('dstContact').value.trim() || null };
+  const res = await dstPost('/api/admin/evidence/recipients', body);
+  if (!res.ok) { dstMsg('登记失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  dstMsg('接收方已登记: ' + res.json.recipient + (res.json.replayed?'(幂等重放)':''), 'ok');
+  dstRefreshRecipients();
+}
+
+async function dstRefreshRecipients() {
+  const rows = await (await fetch('/api/admin/evidence/recipients')).json();
+  document.getElementById('dstRecipients').innerHTML = rows.map(r => `
+    <span class="tag ${r.status==='ACTIVE'?'ok':'err'}" style="margin:2px">
+      <b>${arEscape(r.recipient)}</b> ${arEscape(r.name||'')}
+      <span class="muted">${r.status} · ${arEscape(r.registered_by)}</span>
+      ${r.status==='ACTIVE'?`<button class="plain" style="padding:0 4px"
+        onclick="dstDisable('${arEscape(r.recipient)}')">停用</button>`:''}
+    </span>`).join('') || '<span class="muted">尚无接收方</span>';
+}
+
+async function dstDisable(recipient) {
+  const res = await dstPost(`/api/admin/evidence/recipients/${encodeURIComponent(recipient)}/disable`,
+    { operator: evOp(), idempotency_key: dstKey(), reason: '页面停用' });
+  if (!res.ok) { dstMsg('停用失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  dstRefreshRecipients();
+}
+
+async function dstCreate() {
+  const review_id = document.getElementById('dstRid').value.trim()
+                    || rvState.currentId || '';
+  const recipient = document.getElementById('dstTo').value.trim();
+  if (!review_id) { dstMsg('请填写已归档复核单 id', 'err'); return; }
+  if (!recipient) { dstMsg('请填写接收方账号', 'err'); return; }
+  const body = { operator: evOp(), idempotency_key: dstKey(), review_id,
+                 recipient,
+                 redaction_policy: document.getElementById('dstPolicy').value,
+                 ttl_seconds: Number(document.getElementById('dstTtl').value || 604800) };
+  const res = await dstPost('/api/admin/evidence/distributions', body);
+  if (!res.ok) { dstMsg('创建被拒[' + (res.json?.detail?.code||res.status) + ']: '
+      + (res.json?.detail?.reason||''), 'err'); return; }
+  const d = res.json;
+  dstMsg(`分发包 ${d.package_id} 已${d.deduped?'幂等回显':d.reissued?'重新签发':'创建'}: `
+    + `接收方 ${d.recipient}, ${d.event_count} 个事件, 有效期至 ${d.valid_until}`, 'ok');
+  dstRefreshList(); dstLoad(d.package_id, evOp());
+}
+
+async function dstRefreshList() {
+  const rows = await (await fetch('/api/admin/evidence/distributions?limit=50')).json();
+  document.getElementById('dstList').innerHTML = rows.map(d => `
+    <div style="border:1px solid #ddd;border-radius:6px;padding:6px 8px;margin-top:4px">
+      ${dstBadge(d.status)} <a href="javascript:dstLoad('${d.package_id}', evOp())"><b>${d.package_id}</b></a>
+      <span class="muted">复核单 ${arEscape(d.review_id)} · 接收方 <b>${arEscape(d.recipient)}</b>
+        · ${arEscape(d.redaction_policy)} · 签发#${d.issue_no} · ${d.created_at}</span>
+      <div class="muted">事件 <b>${d.event_count}</b>(${d.first_global_seq??'-'}..${d.last_global_seq??'-'})
+        · 有效期至 <b>${d.valid_until}</b> · 下载 ${d.download_count} 次 · 待兑换令牌 ${d.active_token_count}</div>
+      <div class="muted">manifest <code title="${arEscape(d.manifest_hash)}">${shortHash(d.manifest_hash)}</code>
+        content <code title="${arEscape(d.content_digest)}">${shortHash(d.content_digest)}</code>
+        签名 <code title="${arEscape(d.signature_digest)}">${shortHash(d.signature_digest)}</code></div>
+    </div>`).join('') || '<div class="muted">尚无分发包</div>';
+}
+
+async function dstLoad(pid, operator) {
+  const op = (typeof operator === 'string') ? operator
+    : (document.getElementById('dstViewOp')?.value || evOp());
+  const r = await fetch(`/api/admin/evidence/distributions/${pid}`
+      + '?operator=' + encodeURIComponent(op)
+      + '&with_events=true');
+  if (!r.ok) {
+    let j=null; try{j=await r.json();}catch(e){}
+    dstMsg('查看被拒[' + (j?.detail?.code||r.status) + ']: ' + (j?.detail?.reason||''), 'err');
+    return;
+  }
+  const d = await r.json();
+  const revoked = d.status === 'REVOKED';
+  const expired = d.status === 'EXPIRED';
+  const canIssue = !revoked && !expired;
+  const evs = (d.events||[]).slice(-20).reverse().map(e =>
+    `<tr><td>${e.ts||''}</td><td>${arEscape(e.event)}</td><td>${arEscape(e.operator)}</td>
+     <td class="muted">${arEscape((e.reason||'').slice(0,150))}</td></tr>`).join('');
+  document.getElementById('dstDetail').innerHTML = `
+    <div style="border:2px solid #81c784;border-radius:8px;padding:8px;margin-top:6px">
+      <div>${dstBadge(d.status)} <b>${d.package_id}</b>
+        <span class="muted">复核单 ${arEscape(d.review_id)} · 计划 ${arEscape(d.plan_id)}</span></div>
+      <div class="muted" style="margin:4px 0">
+        接收方 <b>${arEscape(d.recipient)}</b> · 创建者 ${arEscape(d.created_by)}
+        · 脱敏 <b>${arEscape(d.redaction_policy)}</b>(${arEscape((d.redacted_fields||[]).join(', '))})
+        · 签发序号 ${d.issue_no}
+      </div>
+      <div class="muted">有效期 ${d.valid_from} ~ <b>${d.valid_until}</b>
+        ${revoked?` · <span class="err">已由 ${arEscape(d.revoked_by)} 于 ${d.revoked_at} 撤销: ${arEscape(d.revoke_reason||'')}</span>`:''}
+        ${expired?' · <span class="err">已过期</span>':''}</div>
+      <div class="muted">事件 <b>${d.event_count}</b> (${d.first_global_seq??'-'}..${d.last_global_seq??'-'})
+        · 复核签署摘要 <code>${shortHash(d.review_signature_hash)}</code></div>
+      <div class="muted">content_digest <code>${arEscape(d.content_digest)}</code><br>
+        manifest_hash <code>${arEscape(d.manifest_hash)}</code><br>
+        signature_digest <code>${arEscape(d.signature_digest)}</code></div>
+      <div style="margin-top:6px">
+        查看/下载身份
+        <input id="dstViewOp" size="12" value="${arEscape(op)}"
+          onchange="dstLoad('${d.package_id}', this.value)">
+        <span class="muted">(仅授权接收方 ${arEscape(d.recipient)} 或创建者 ${arEscape(d.created_by)})</span>
+      </div>
+      <div style="margin-top:4px">
+        <button ${canIssue?'':'disabled'} onclick="dstIssue('${d.package_id}')">签发一次性下载令牌</button>
+        <button class="plain" onclick="dstVerifyStored('${d.package_id}')">重算留存包校验</button>
+        <button class="danger" ${revoked?'disabled':''} onclick="dstRevoke('${d.package_id}')">撤销分发包</button>
+      </div>
+      <div id="dstToken-${d.package_id}" style="margin-top:4px"></div>
+      <div id="dstVerifyRes-${d.package_id}" style="margin-top:4px"></div>
+      <details style="margin-top:6px"><summary class="muted">事件流水(最近 20 条)</summary>
+        <table><thead><tr><th>时间</th><th>事件</th><th>操作者</th><th>原因</th></tr></thead>
+        <tbody>${evs}</tbody></table></details>
+    </div>`;
+}
+
+async function dstIssue(pid) {
+  const operator = document.getElementById('dstViewOp')?.value || evOp();
+  const res = await dstPost(`/api/admin/evidence/distributions/${pid}/download-token`,
+    { operator, idempotency_key: dstKey() });
+  const host = document.getElementById(`dstToken-${pid}`);
+  if (!res.ok) { host.innerHTML = `<span class="err">签发失败: ${JSON.stringify(res.json?.detail||res.json)}</span>`; return; }
+  const url = `/api/admin/evidence/distribution-downloads/${res.json.token}?operator=${encodeURIComponent(operator)}`;
+  host.innerHTML = `<div class="ok">一次性令牌(仅本次显示, 绑定 ${arEscape(res.json.bound_recipient)},
+    有效期至 ${res.json.expires_at}):<br><code style="word-break:break-all">${arEscape(res.json.token)}</code>
+    <a href="${url}">▶ 下载分发包 zip</a> <span class="muted">(首次兑换后立即失效)</span></div>`;
+}
+
+async function dstRevoke(pid) {
+  const reason = prompt('撤销原因(将连带作废未兑换令牌; 不改原始事件/复核结论/签署摘要):', '接收方权限收回');
+  if (reason === null) return;
+  const res = await dstPost(`/api/admin/evidence/distributions/${pid}/revoke`,
+    { operator: evOp(), idempotency_key: dstKey(), reason });
+  if (!res.ok) { dstMsg('撤销失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  dstMsg(`分发包 ${pid} 已撤销(作废令牌 ${res.json.revoked_tokens ?? '-'} 个)`, 'ok');
+  dstRefreshList(); dstLoad(pid, document.getElementById('dstViewOp')?.value || evOp());
+}
+
+async function dstVerifyStored(pid) {
+  const operator = document.getElementById('dstViewOp')?.value || evOp();
+  const r = await fetch(`/api/admin/evidence/distributions/${pid}/verify?operator=${encodeURIComponent(operator)}`);
+  const j = await r.json();
+  const host = document.getElementById(`dstVerifyRes-${pid}`);
+  if (!r.ok) { host.innerHTML = `<span class="err">校验请求失败: ${r.status}</span>`; return; }
+  host.innerHTML = dstRenderVerify(j);
+}
+
+function dstRenderVerify(j) {
+  if (j.valid) {
+    return `<div class="ok">✓ 校验通过: ${j.lines?.checked ?? 0} 行事件, 逐文件/内容/manifest/签名摘要全部一致
+      (状态 ${j.status||'-'}${j.known_to_server?`, 与服务端留存一致=${j.matches_server_record}`:''})</div>`;
+  }
+  const items = (j.tampering||[]).map(t =>
+    `<tr><td><span class="err">${arEscape(t.code)}</span></td><td>${arEscape(t.target)}</td>
+     <td>${arEscape(t.message)}</td>
+     <td class="muted">期望 ${arEscape(String(t.expected??'').slice(0,40))}<br>
+         实际 ${arEscape(String(t.actual??'').slice(0,40))}</td></tr>`).join('');
+  return `<div class="err">✗ 校验失败, 发现 ${(j.tampering||[]).length} 处篡改:</div>
+    <table><thead><tr><th>代码</th><th>位置</th><th>说明</th><th>期望/实际</th></tr></thead>
+    <tbody>${items}</tbody></table>`;
+}
+
+async function dstVerifyUpload() {
+  const f = document.getElementById('dstFile').files[0];
+  if (!f) { dstMsg('请先选择分发包 zip 文件', 'err'); return; }
+  const r = await fetch('/api/admin/evidence/distributions/verify', {
+    method:'POST', headers:{'Content-Type':'application/zip'}, body: f});
+  const j = await r.json();
+  document.getElementById('dstVerify').innerHTML =
+    `<div class="muted">包 ${arEscape(j.package_id||'(未知)')} · 接收方 ${arEscape(j.recipient||'-')}
+      · 复核单 ${arEscape(j.review_id||'-')} · 策略 ${arEscape(j.redaction_policy||'-')}
+      · 事件 ${j.event_count??'-'} · 有效期至 ${arEscape(j.valid_until||'-')}
+      ${j.known_to_server?` · 服务端留存=${j.matches_server_record?'一致✓':'不一致✗'}`:' · 服务端无此包记录'}</div>`
+    + dstRenderVerify(j);
+  dstMsg(j.valid ? '离线校验通过' : '离线校验发现篡改(见明细)', j.valid ? 'ok' : 'err');
+}
+
+dstRefreshRecipients();
+dstRefreshList();
 
 setInterval(refresh, 3000);
 </script>

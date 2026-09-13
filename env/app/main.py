@@ -1,5 +1,5 @@
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
@@ -17,15 +17,17 @@ from .models import (
 from .plans import PlanWorker
 from .quality import QualityWorker
 from .replay import ReplayWorker
-from . import (archives, auditreplay, cleanup, evidence, plans, quality,
-               replay, reviews, service)
+from . import (archives, auditreplay, cleanup, distribution, evidence, plans,
+               quality, replay, reviews, service)
 from .schemas import (
     AdminAction, ArchiveAction, ArchiveCreate, ArchiveRetention,
     AuditEventNote, AuditSnapshotCreate, BatchCreate, CheckpointCreate, CleanupAction,
     CleanupCreate, CompensationAction, CompensationApprovalAction,
     CompensationCancelAction, CompensationCreate, CompensationRejectAction,
-    CompensationRetry, CompensationWindowAction, EvidenceDownloadIssue,
-    EvidenceExportAction, EvidenceExportCreate, EvidencePageQuery,
+    CompensationRetry, CompensationWindowAction, EvidenceDistributionAction,
+    EvidenceDistributionCreate, EvidenceDistributionTokenIssue,
+    EvidenceDownloadIssue, EvidenceExportAction, EvidenceExportCreate,
+    EvidencePageQuery, EvidenceRecipientDisable, EvidenceRecipientRegister,
     EvidenceReviewAction, EvidenceReviewConclusionSubmit,
     EvidenceReviewCreate, EvidenceSessionCreate, PlanAction, PlanCreate,
     PlanRejectAction, PlanWindowAction, QualityExemptionCreate,
@@ -225,6 +227,7 @@ def startup():
         db.commit()
         archives.ensure_store_dir()
         evidence.ensure_store_dir()
+        distribution.ensure_store_dir()
     finally:
         db.close()
     if _worker_enabled():
@@ -319,6 +322,12 @@ def status(db: Session = Depends(get_db)):
             for rv in (db.query(EvidenceReview)
                        .order_by(EvidenceReview.created_at.desc(),
                                  EvidenceReview.id.desc()).limit(20).all())],
+        "evidence_recipients": [
+            distribution.recipient_to_dict(r) for r in
+            distribution.list_recipients(db, limit=50)],
+        "evidence_distributions": [
+            distribution.distribution_to_dict(d) for d in
+            distribution.list_distributions(db, limit=20)],
     }
 
 
@@ -2143,6 +2152,316 @@ def archive_evidence_review(review_id: str, body: EvidenceReviewAction,
         db.rollback()
         _review_conflict(e)
     result["replayed"] = replayed
+    return result
+
+
+# ---------- 证据封存分发与离线校验(仅从已归档复核单创建) ----------
+
+def _dist_not_found(e: Exception):
+    raise HTTPException(status_code=404, detail={
+        "error": "evidence_distribution_not_found", "reason": str(e)})
+
+
+def _dist_conflict(e: Exception):
+    detail = {"error": "evidence_distribution_conflict",
+              "reason": str(e), "code": getattr(e, "code", "distribution_conflict")}
+    extra = getattr(e, "extra", None)
+    if extra:
+        detail.update(extra)
+    raise HTTPException(status_code=409, detail=detail)
+
+
+def _dist_forbidden(e: Exception):
+    raise HTTPException(status_code=403, detail={
+        "error": "evidence_distribution_forbidden",
+        "reason": str(e), "code": getattr(e, "code", "recipient_forbidden")})
+
+
+def _parse_valid_until(body: EvidenceDistributionCreate) -> datetime:
+    if body.valid_until:
+        return _parse_iso(body.valid_until, "valid_until")
+    if body.ttl_seconds is not None:
+        return evidence.now_utc_naive() + timedelta(seconds=body.ttl_seconds)
+    return evidence.now_utc_naive() + timedelta(
+        seconds=distribution.default_ttl_seconds())
+
+
+@app.post("/api/admin/evidence/recipients", status_code=201)
+def register_evidence_recipient(body: EvidenceRecipientRegister,
+                                db: Session = Depends(get_db)):
+    """登记授权接收方(幂等: 已在册 ACTIVE 直接回显; DISABLED 拒绝)。"""
+
+    def _do(s):
+        r = distribution.register_recipient(
+            s, operator=body.operator, recipient=body.recipient,
+            name=body.name, contact=body.contact)
+        return distribution.recipient_to_dict(r)
+
+    try:
+        result, replayed = distribution.run_distribution_action(
+            db, action="recipient.register", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            recipient_id=body.recipient, fn=_do)
+    except distribution.DistributionStateError as e:
+        db.rollback()
+        _dist_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/evidence/recipients/{recipient}/disable")
+def disable_evidence_recipient(recipient: str,
+                               body: EvidenceRecipientDisable,
+                               db: Session = Depends(get_db)):
+    """停用接收方: 历史分发包保留, 不能再发新包/下载; 重复停用幂等。"""
+
+    def _do(s):
+        r = distribution.disable_recipient(
+            s, recipient, operator=body.operator, reason=body.reason)
+        return distribution.recipient_to_dict(r)
+
+    try:
+        result, replayed = distribution.run_distribution_action(
+            db, action="recipient.disable", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            recipient_id=recipient, fn=_do)
+    except evidence.EvidenceNotFound as e:
+        db.rollback()
+        _dist_not_found(e)
+    except distribution.DistributionStateError as e:
+        db.rollback()
+        _dist_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.get("/api/admin/evidence/recipients")
+def list_evidence_recipients(status_filter: str | None = None,
+                             db: Session = Depends(get_db)):
+    from .models import EVIDENCE_RECIPIENT_STATUSES
+    if status_filter is not None and status_filter not in EVIDENCE_RECIPIENT_STATUSES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_recipient_status",
+            "reason": f"接收方状态必须是 {list(EVIDENCE_RECIPIENT_STATUSES)} 之一"})
+    return [distribution.recipient_to_dict(r)
+            for r in distribution.list_recipients(db, status=status_filter)]
+
+
+@app.post("/api/admin/evidence/distributions", status_code=201)
+def create_evidence_distribution(body: EvidenceDistributionCreate,
+                                 db: Session = Depends(get_db)):
+    """从**已归档**复核单创建脱敏分发包: 选择接收方/脱敏策略/有效期。
+
+    package_id 由不可变签署摘要+接收方+策略+签发序号+有效期固定派生;
+    同参数有效包重复创建幂等回显; 撤销/过期后重新签发产生新 package_id(旧包保留)。"""
+    valid_until = _parse_valid_until(body)
+
+    def _do(s):
+        dist, info = distribution.create_distribution(
+            s, operator=body.operator, review_id=body.review_id,
+            recipient=body.recipient, redaction_policy=body.redaction_policy,
+            valid_until=valid_until,
+            exact_validity=bool(body.valid_until))
+        out = distribution.distribution_to_dict(dist)
+        out["deduped"] = info["deduped"]
+        out["reissued"] = info["reissued"]
+        return out
+
+    try:
+        result, replayed = distribution.run_distribution_action(
+            db, action="dist.create", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            fn=_do)
+    except evidence.EvidenceNotFound as e:
+        db.rollback()
+        _dist_not_found(e)
+    except distribution.DistributionStateError as e:
+        db.rollback()
+        _dist_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.get("/api/admin/evidence/distributions")
+def list_evidence_distributions(review_id: str | None = None,
+                                recipient: str | None = None,
+                                plan_id: str | None = None,
+                                status_filter: str | None = None,
+                                limit: int = 50,
+                                db: Session = Depends(get_db)):
+    """分发包目录: 可按复核单/接收方/计划/当前状态过滤。"""
+    allowed = ("ACTIVE", "EXPIRED", "REVOKED")
+    if status_filter is not None and status_filter not in allowed:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_distribution_status",
+            "reason": f"分发包状态必须是 {list(allowed)} 之一"})
+    rows = distribution.list_distributions(
+        db, review_id=review_id, recipient=recipient, plan_id=plan_id,
+        status_filter=status_filter, limit=limit)
+    return [distribution.distribution_to_dict(d) for d in rows]
+
+
+def _load_dist_for_view(package_id: str, operator: str,
+                        db: Session) -> distribution.EvidenceDistribution:
+    try:
+        dist = distribution.get_distribution(db, package_id)
+    except evidence.EvidenceNotFound as e:
+        _dist_not_found(e)
+    try:
+        distribution.require_view_access(dist, operator)
+    except distribution.DistributionForbidden as e:
+        _dist_forbidden(e)
+    return dist
+
+
+@app.get("/api/admin/evidence/distributions/{package_id}")
+def get_evidence_distribution(package_id: str, operator: str = "system",
+                              with_events: bool = True,
+                              db: Session = Depends(get_db)):
+    """分发包详情: 接收方/有效期/事件数量/各类摘要/当前状态/事件流水。
+    只有授权接收方本人或创建该包的管理员可查看。"""
+    dist = _load_dist_for_view(package_id, operator, db)
+    return distribution.distribution_to_dict(dist, with_manifest=True,
+                                             with_events=with_events)
+
+
+@app.post("/api/admin/evidence/distributions/{package_id}/revoke")
+def revoke_evidence_distribution(package_id: str,
+                                 body: EvidenceDistributionAction,
+                                 db: Session = Depends(get_db)):
+    """撤销分发包(终态, 幂等): 未兑换令牌连带作废;
+    不修改原始事件、复核结论或已归档签署摘要(只写分发模块自身记录)。"""
+    try:
+        dist = distribution.get_distribution(db, package_id)
+    except evidence.EvidenceNotFound as e:
+        _dist_not_found(e)
+    try:
+        # reason 不参与幂等指纹: 同一键的重复撤销就是同一请求(原因可选)
+        replay_payload = {k: v for k, v in body.model_dump().items()
+                          if k != "reason"}
+        result, replayed = distribution.run_distribution_action(
+            db, action="dist.revoke", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=replay_payload,
+            package_id=package_id,
+            fn=lambda s: distribution.revoke_distribution(
+                s, package_id, operator=body.operator, reason=body.reason))
+    except distribution.DistributionStateError as e:
+        db.rollback()
+        _dist_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/evidence/distributions/{package_id}/download-token",
+          status_code=201)
+def issue_evidence_distribution_token(package_id: str,
+                                      body: EvidenceDistributionTokenIssue,
+                                      db: Session = Depends(get_db)):
+    """签发**带接收方约束**的一次性下载令牌(仅授权接收方/包创建管理员)。
+
+    明文 token 仅本次响应返回; GET .../distribution-downloads/{token} 兑换,
+    首次兑换成功即失效。撤销/过期/接收方被停用后不能签发。"""
+    try:
+        dist = distribution.get_distribution(db, package_id)
+    except evidence.EvidenceNotFound as e:
+        _dist_not_found(e)
+
+    def _do(s):
+        dl = distribution.issue_download_token(
+            s, package_id, operator=body.operator,
+            ttl_seconds=body.ttl_seconds)
+        return {"download_id": dl.id,
+                "token": getattr(dl, "token_plain", None),
+                "expires_at": dl.expires_at.isoformat(),
+                "bound_recipient": dl.bound_recipient,
+                "one_time": True,
+                "package_id": package_id}
+
+    try:
+        result, replayed = distribution.run_distribution_action(
+            db, action="dist.download_issue", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            package_id=package_id, fn=_do)
+    except distribution.DistributionForbidden as e:
+        db.rollback()
+        _dist_forbidden(e)
+    except distribution.DistributionStateError as e:
+        db.rollback()
+        _dist_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.get("/api/admin/evidence/distribution-downloads/{token}")
+def evidence_distribution_download(token: str, operator: str = "system",
+                                   db: Session = Depends(get_db)):
+    """一次性下载分发包 zip: 令牌首次兑换成功即失效;
+    重复/过期/撤销/接收方不符/接收方停用 -> 404/403/409。"""
+    try:
+        dist, path = distribution.redeem_download_token(
+            db, token, operator=operator)
+    except evidence.EvidenceNotFound as ex:
+        db.rollback()
+        _dist_not_found(ex)
+    except distribution.DistributionForbidden as ex:
+        db.rollback()
+        _dist_forbidden(ex)
+    except distribution.DistributionStateError as ex:
+        db.rollback()
+        _dist_conflict(ex)
+    return FileResponse(
+        path, media_type="application/zip",
+        filename=f"evidence-distribution-{dist.id}.zip")
+
+
+@app.get("/api/admin/evidence/distributions/{package_id}/verify")
+def verify_evidence_distribution(package_id: str, operator: str = "system",
+                                 db: Session = Depends(get_db)):
+    """重算留存包逐行/逐文件/content_digest/manifest_hash/签名摘要并与库内
+    固定值比对, tampering 逐项指出篡改位置; 授权接收方/创建管理员可调用。
+    撤销/过期只影响能否下载, 不影响校验结论。"""
+    dist = _load_dist_for_view(package_id, operator, db)
+    return distribution.verify_stored(db, dist, operator=operator)
+
+
+@app.post("/api/admin/evidence/distributions/verify")
+async def verify_evidence_distribution_upload(request: Request,
+                                              db: Session = Depends(get_db)):
+    """独立离线校验入口: 上传分发包 zip 字节(无需任何鉴权或在册身份),
+    仅凭包内 manifest/content_digest/签名摘要重算, 返回篡改位置与包元信息。
+
+    合法但被篡改 -> 200 且 valid=false(便于离线工具读报告); 非 zip -> 200 同样报告。
+    """
+    raw = await request.body()
+    if not raw:
+        raise HTTPException(status_code=422, detail={
+            "error": "empty_package",
+            "reason": "请以 application/zip 二进制请求体上传待校验分发包"})
+    result = distribution.verify_package_bytes(raw)
+    # 若服务端恰好有同 package_id 的留存记录, 附交叉核对结论(无则跳过)
+    pid = result.get("package_id")
+    if pid:
+        dist = db.get(distribution.EvidenceDistribution, pid)
+        if dist is not None:
+            result["known_to_server"] = True
+            result["server_status"] = distribution.effective_status(dist)
+            if (result.get("recomputed_manifest_hash") == dist.manifest_hash
+                    and result.get("recomputed_content_digest")
+                    == dist.content_digest
+                    and result.get("signature_valid")
+                    and result.get("recomputed_signature_digest")
+                    == dist.signature_digest):
+                result["matches_server_record"] = True
+            else:
+                result["matches_server_record"] = False
+                result["valid"] = False
+                result["reason_code"] = "tampered"
+                result["tampering"].append(distribution._tamper(
+                    "server_record_mismatch", "package",
+                    "上传包摘要与服务端留存的固定记录不一致"))
+                result["issues"].append("上传包与服务端留存记录不一致")
+    else:
+        result["known_to_server"] = False
     return result
 
 

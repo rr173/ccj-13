@@ -690,6 +690,52 @@ OPEN ─两名不同操作者对固定范围全部事件签署→ archive → AR
   evidence_reviews* 自身表)。页面"证据复核与签署归档"区提供创建/签署/重新校验/归档操作。
 - 接口文档见 [`docs_evidence.md`](docs_evidence.md) 第 5–6 节。
 
+### 证据封存分发与离线校验(evidence_distributions / evidence_recipients)
+
+在**已归档(ARCHIVED)**复核单之上向外部接收方分发脱敏、不可变、可离线校验的证据包:
+
+- 接收方名册: `POST /api/admin/evidence/recipients` 登记(幂等; 账号限字母数字与
+  `._@-`)、`POST .../recipients/{id}/disable` 停用(历史包保留, 不能再发新包/下载)、
+  `GET .../recipients` 列表。未登记/已停用接收方创建分发包 → 409
+  (`recipient_not_registered`/`recipient_disabled`)。
+- `POST /api/admin/evidence/distributions {review_id, recipient, redaction_policy,
+  valid_until|ttl_seconds}`: 仅 ARCHIVED 复核单可创建(否则 409
+  `review_not_archived`); 创建时与归档 scope_fingerprint/事件数交叉核对, 只打包
+  **该复核单固定范围内**的事件, 与原复核单此后变化完全解耦。脱敏策略:
+  `NONE` 明文 / `STANDARD`(默认)隐藏事件操作者与 payload 中 reason/note/detail/
+  message/comment/description 等说明类字段及签署人(包内为稳定假名 signer-\<hex\>)/
+  `FULL` 再隐藏整段 payload。
+- **固定标识与摘要**: `package_id="EDP"+sha256(签署摘要+接收方+策略+签发序号+
+  valid_from/valid_until)[:24]`, 不含随机量; 包内 `events.jsonl`(逐行 line_digest)、
+  `signature.json`(逐事件双签明细+复核签署摘要锚点)、`metadata.json`、
+  `manifest.json`; 另生成 `content_digest`(逐文件 sha256 有序拼接)、`manifest_hash`
+  与**带接收方约束**的 `signature_digest`(HMAC-SHA256, 密钥仅服务端,
+  `EVIDENCE_DISTRIBUTION_SIGNING_KEY` 可配)。页面/接口展示接收方、有效期、事件数量、
+  三类摘要与派生当前状态 **ACTIVE/EXPIRED/REVOKED**。
+- **幂等**: 同 idempotency_key 重放回显首次结果(不同请求体复用 → 409
+  `idempotency_reuse`); 同(复核单,接收方,策略)已有有效包时相对 TTL 请求自然去重;
+  撤销 `POST .../distributions/{id}/revoke`(幂等, 连带作废未兑换令牌)与撤销后
+  重新签发均幂等 —— 重新签发 issue_no+1 得到**新 package_id**, 旧包记录/文件/流水
+  原样保留; 撤销不改原始事件、复核结论或已归档签署摘要(仅写 evidence_distribution* 表)。
+- **一次性下载令牌**: `POST .../distributions/{id}/download-token`(仅授权接收方或
+  包创建管理员, 其他人 403)返回仅本次可见的明文 token;
+  `GET /api/admin/evidence/distribution-downloads/{token}?operator=`
+  首次兑换成功即失效, 重复 → 409 `token_already_redeemed`, 令牌过期
+  `token_expired`、包过期 `package_expired`、已撤销 `package_revoked`、
+  操作者非绑定接收方 409 `recipient_mismatch`、接收方停用 `recipient_disabled`。
+  查看详情/留存校验同样仅授权接收方或创建管理员可访问。
+- **离线校验**:
+  - `GET .../distributions/{id}/verify?operator=` 重算服务端留存包并与库内固定摘要
+    交叉比对;
+  - `POST /api/admin/evidence/distributions/verify`(请求体为 zip 二进制, 无需身份)
+    纯离线重算逐行/逐文件/content/manifest/签名摘要, 返回 `valid` 与 **tampering[]**
+    (`code` + `target` 精确定位, 如 `events.jsonl#seq2`、`metadata.json`、
+    `manifest.manifest_hash`; 含 line_digest/file_digest/content_digest/
+    manifest_hash/signature_digest/redaction_bypass/subject_mismatch 等),
+    撤销/过期只影响能否下载, 不影响密码学结论。
+- 页面"证据封存分发与离线校验"区提供名册管理、创建/撤销、令牌签发下载、留存校验与
+  上传 zip 离线校验。
+
 ## 运行
 
 ```bash
@@ -851,6 +897,21 @@ POST /api/admin/evidence/reviews/{id}/reverify {operator, idempotency_key}
                                                       重新校验固定依据(链/范围指纹/manifest_hash/包)
 POST /api/admin/evidence/reviews/{id}/archive {operator, idempotency_key}
                                                       双人签全后归档(不可变签署摘要; 终态禁止修改)
+
+# ---- 证据封存分发与离线校验 ----
+POST /api/admin/evidence/recipients        {operator, idempotency_key, recipient, name?, contact?}
+POST /api/admin/evidence/recipients/{recipient}/disable  {operator, idempotency_key, reason?}
+GET  /api/admin/evidence/recipients[?status_filter=]
+POST /api/admin/evidence/distributions     {operator, idempotency_key, review_id, recipient,
+                                            redaction_policy=NONE|STANDARD|FULL, valid_until?|ttl_seconds?}
+                                            仅已归档复核单; 返回固定 package_id/manifest/content/签名摘要
+GET  /api/admin/evidence/distributions[?review_id=&recipient=&plan_id=&status_filter=ACTIVE|EXPIRED|REVOKED]
+GET  /api/admin/evidence/distributions/{package_id}[?operator=](仅授权接收方/创建管理员)
+POST /api/admin/evidence/distributions/{package_id}/revoke {operator, idempotency_key, reason?}
+POST /api/admin/evidence/distributions/{package_id}/download-token {operator, idempotency_key, ttl_seconds?}
+GET  /api/admin/evidence/distribution-downloads/{token}?operator=   一次性, 绑定接收方
+GET  /api/admin/evidence/distributions/{package_id}/verify?operator= 重算留存包(逐项篡改位置)
+POST /api/admin/evidence/distributions/verify   (body=zip 二进制, 无身份; 独立离线校验)
 ```
 
 幂等：所有管理动作要求 `idempotency_key`，重复执行返回首次结果（`replayed: true`），无副作用；

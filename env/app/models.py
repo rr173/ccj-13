@@ -1814,3 +1814,162 @@ class EvidenceReviewEvent(Base):
     operator = Column(String(128), nullable=False)
     reason = Column(String(500), nullable=True)
     detail = Column(JSON, nullable=True)
+
+
+# ======================================================================
+# ---------- 证据封存分发与离线校验 ----------
+# ======================================================================
+
+# 分发接收方状态: ACTIVE 可接收/查看/下载; DISABLED 被停用(历史包保留, 不能再发新包)
+EVIDENCE_RECIPIENT_STATUSES = ("ACTIVE", "DISABLED")
+# 分发包状态机:
+#   ACTIVE   有效(未撤销; 是否可下载还看有效期与令牌)
+#   EXPIRED  有效期已过(派生状态, 库内仍为 ACTIVE, 由 valid_until 实时判定)
+#   REVOKED  被管理员撤销(终态; 不可下载, 但可离线校验; 可撤销后重新签发新包)
+EVIDENCE_DISTRIBUTION_STATUSES = ("ACTIVE", "REVOKED")
+# 脱敏策略:
+#   NONE     不脱敏(包内事件保持规范化原貌)
+#   STANDARD 隐藏操作者与事件说明类字段(operator / payload.reason /
+#            payload.note / payload.detail, 复核结论 note 与签署人)
+#   FULL     在 STANDARD 基础上进一步隐藏整段 payload / reason / 复核 verdict
+EVIDENCE_REDACTION_POLICIES = ("NONE", "STANDARD", "FULL")
+# 分发流水事件(只追加)
+EVIDENCE_DISTRIBUTION_EVENTS = (
+    "dist.create", "dist.idempotent_replay", "dist.reissue",
+    "dist.revoke", "dist.download.issue", "dist.download.redeem",
+    "dist.download.denied", "dist.verify.ok", "dist.verify.failed",
+)
+
+
+class EvidenceRecipient(Base):
+    """授权接收方名册: 只有登记且 ACTIVE 的接收方才能被选为分发包接收方、
+    查看/下载属于自己的包。停用(DISABLED)是软状态: 历史分发包与流水保留。"""
+
+    __tablename__ = "evidence_recipients"
+
+    id = Column(String(64), primary_key=True)             # 接收方账号(规范化后)
+    name = Column(String(128), nullable=True)             # 展示名
+    contact = Column(String(200), nullable=True)          # 联系方式(可选)
+    status = Column(String(16), nullable=False, default="ACTIVE", index=True)
+    registered_by = Column(String(128), nullable=False)
+    disabled_at = Column(DateTime, nullable=True)
+    disabled_by = Column(String(128), nullable=True)
+    disable_reason = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class EvidenceDistribution(Base):
+    """证据封存分发包: 管理员只能从一张**已归档(ARCHIVED)**复核单创建。
+
+    - package_id 为固定标识: 由复核单不可变签署摘要(signature_hash)+接收方+
+      脱敏策略+签发序号派生(sha256 前 24 位), 不含任何时间随机量 ——
+      同一请求(含同幂等键)永远得到同一 package_id; 撤销后重新签发因 issue_no+1
+      得到新 package_id, 旧包记录原样保留。
+    - 包内容在创建时刻一次性固化: 只含该复核单固定范围内的事件(按归档时的
+      scope_fingerprint 与事件数核对), 经脱敏后逐行落包并生成
+      manifest / content_digest / signature_digest, 之后原复核单、事件链的
+      任何变化都不会改变本包(撤销/重新签发也不会)。
+    - signature_digest 为带接收方约束的 HMAC-SHA256 签名摘要(密钥只在服务端),
+      离线校验可证明包由本服务签给该接收方、且未被篡改。"""
+
+    __tablename__ = "evidence_distributions"
+    __table_args__ = (
+        Index("ix_evidence_dist_review", "review_id"),
+        Index("ix_evidence_dist_recipient", "recipient_id"),
+        Index("ix_evidence_dist_plan", "plan_id"),
+    )
+
+    id = Column(String(32), primary_key=True)              # "EDP" + 24hex
+    review_id = Column(String(32), ForeignKey("evidence_reviews.id"),
+                       nullable=False, index=True)
+    session_id = Column(String(32), nullable=False)
+    export_id = Column(String(32), nullable=False)
+    plan_id = Column(String(32), nullable=False)
+    recipient_id = Column(String(64), ForeignKey("evidence_recipients.id"),
+                          nullable=False, index=True)
+    # 创建时固定的归档锚点(之后复核单即使因任何原因变化也不影响本包)
+    review_signature_hash = Column(String(64), nullable=False)
+    review_archived_by = Column(String(128), nullable=True)
+    review_archived_at = Column(DateTime, nullable=True)
+    scope_fingerprint = Column(String(64), nullable=False)
+    scope_version = Column(Integer, nullable=False, default=1)
+    start_global_seq = Column(Integer, nullable=False, default=0)
+    fixed_upper_global_seq = Column(Integer, nullable=False)
+    first_global_seq = Column(Integer, nullable=True)
+    last_global_seq = Column(Integer, nullable=True)
+    total_events = Column(Integer, nullable=False, default=0)
+    # 脱敏与有效期
+    redaction_policy = Column(String(16), nullable=False, default="NONE")
+    redacted_fields = Column(JSON, nullable=False, default=list)
+    valid_from = Column(DateTime, nullable=False)
+    valid_until = Column(DateTime, nullable=False, index=True)
+    # 同一(复核单,接收方,策略)下的签发序号: 首次 1, 撤销/过期后重新签发 +1。
+    # 参与 package_id 派生, 保证重新签发得到新的固定 id。
+    issue_no = Column(Integer, nullable=False, default=1)
+    # 状态
+    status = Column(String(16), nullable=False, default="ACTIVE", index=True)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+    revoked_at = Column(DateTime, nullable=True)
+    revoked_by = Column(String(128), nullable=True)
+    revoke_reason = Column(String(500), nullable=True)
+    # 包产物
+    package_path = Column(String(500), nullable=False)
+    package_size = Column(Integer, nullable=False, default=0)
+    manifest = Column(JSON, nullable=False)
+    content_digest = Column(String(64), nullable=False)
+    manifest_hash = Column(String(64), nullable=False)
+    signature_digest = Column(String(64), nullable=False)
+    download_count = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    review = relationship("EvidenceReview")
+    recipient = relationship("EvidenceRecipient")
+    events = relationship("EvidenceDistributionEvent",
+                          cascade="all, delete-orphan",
+                          order_by="EvidenceDistributionEvent.id")
+    downloads = relationship("EvidenceDistributionDownload",
+                             cascade="all, delete-orphan",
+                             order_by="desc(EvidenceDistributionDownload.id)")
+
+
+class EvidenceDistributionEvent(Base):
+    """分发包事件流水(只追加): 创建/幂等重放/重新签发/撤销/令牌签发/兑换/
+    拒绝下载(过期/撤销/重复/接收方不符)/校验通过/校验失败(含篡改位置)。"""
+
+    __tablename__ = "evidence_distribution_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=_utcnow)
+    distribution_id = Column(String(32),
+                             ForeignKey("evidence_distributions.id"),
+                             nullable=False, index=True)
+    event = Column(String(48), nullable=False)
+    operator = Column(String(128), nullable=False)
+    reason = Column(String(500), nullable=True)
+    detail = Column(JSON, nullable=True)
+
+
+class EvidenceDistributionDownload(Base):
+    """分发包一次性下载令牌(带接收方约束):
+
+    - 令牌只存 sha256(token), 明文仅签发当次响应返回;
+    - bound_recipient 固定接收方: 兑换时操作者必须是该接收方(或包创建管理员);
+    - 首次兑换成功置 used_at/used_by 后立即失效;
+      过期(自身 expires_at 或超过包 valid_until)/包撤销后不能下载。"""
+
+    __tablename__ = "evidence_distribution_downloads"
+
+    id = Column(String(48), primary_key=True)               # "EDD" + 随机串
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    distribution_id = Column(String(32),
+                             ForeignKey("evidence_distributions.id"),
+                             nullable=False, index=True)
+    bound_recipient = Column(String(64), nullable=False)
+    issued_by = Column(String(128), nullable=False)
+    issued_at = Column(DateTime, default=_utcnow)
+    expires_at = Column(DateTime, nullable=False)
+    used_at = Column(DateTime, nullable=True)
+    used_by = Column(String(128), nullable=True)
+    revoked_at = Column(DateTime, nullable=True)           # 包撤销时连带作废

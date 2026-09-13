@@ -371,3 +371,42 @@ class EvidenceReviewConclusionSubmit(BaseModel):
 class EvidenceReviewAction(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+
+
+# ---------- 证据封存分发与离线校验 ----------
+
+class EvidenceRecipientRegister(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    recipient: str = Field(min_length=1, max_length=64)     # 接收方账号
+    name: Optional[str] = Field(default=None, max_length=128)
+    contact: Optional[str] = Field(default=None, max_length=200)
+
+
+class EvidenceRecipientDisable(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class EvidenceDistributionCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    review_id: str = Field(min_length=1)                    # 必须已归档
+    recipient: str = Field(min_length=1, max_length=64)     # 必须为在册 ACTIVE
+    redaction_policy: str = Field(default="STANDARD",
+                                  min_length=1, max_length=16)
+    valid_until: Optional[str] = None                       # ISO 8601; 与 ttl_seconds 二选一
+    ttl_seconds: Optional[int] = Field(default=None, ge=60, le=31_536_000)
+
+
+class EvidenceDistributionAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class EvidenceDistributionTokenIssue(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    ttl_seconds: Optional[int] = Field(default=None, ge=30, le=86_400)
