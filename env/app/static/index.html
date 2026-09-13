@@ -48,6 +48,8 @@
   .EV_FAILED { background: #c62828; } .EV_COMPLETED { background: #2e7d32; }
   .EV_CANCELED { background: #546e7a; } .EV_QUEUED { background: #78909c; }
   .EV_RUNNING { background: #1565c0; }
+  .EV_OPEN { background: #6a1b9a; } .EV_INVALIDATED { background: #c62828; }
+  .EV_ARCHIVED { background: #2e7d32; }
   .tag { display: inline-block; background: #eceff1; border: 1px solid #b0bec5;
          color: #37474f; border-radius: 10px; padding: 1px 8px; font-size: 11px;
          margin: 1px 2px 1px 0; }
@@ -420,6 +422,22 @@
   </div>
   <div id="evExports" style="margin-top:6px"></div>
   <div id="evMsg" class="msg"></div>
+</div>
+
+<div class="card" style="background:#f6f0ff;border-color:#b39ddb">
+  <b>证据复核与签署归档</b>
+  <span class="muted">从已翻完(CLOSED)会话 + COMPLETED 导出包创建复核单 · 固定筛选条件/起止 global_seq/manifest_hash ·
+    两名不同操作者逐事件签署(确认/存疑/排除) · If-Match 版本栅栏 · 依据变化自动 INVALIDATED · 双人签全后生成不可变签署摘要</span>
+
+  <div style="margin-top:8px">
+    <b>3. 创建复核单</b>:
+    会话 <input id="rvSid" size="12" placeholder="ES...">
+    导出(可空) <input id="rvEid" size="12" placeholder="EE...">
+    <button onclick="rvCreate()">创建复核单</button>
+    <button class="plain" onclick="rvRefreshList()">刷新复核单列表</button>
+  </div>
+  <div id="rvList" style="margin-top:6px"></div>
+  <div id="rvDetail" style="margin-top:6px"></div>
 </div>
 
 <div class="card">
@@ -2902,6 +2920,170 @@ setInterval(() => {
   const host = document.getElementById('evExports');
   if (host && host.querySelector('.EV_RUNNING,.EV_QUEUED')) evRefreshExports();
 }, 3000);
+
+// ======================================================================
+// ---------- 证据复核与签署归档 ----------
+// ======================================================================
+let rvState = { currentId: null, version: 0, detail: null };
+
+function rvKey() {
+  return 'rv-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+}
+function rvBadge(status) { return `<span class="badge EV_${status}">${status}</span>`; }
+function rvVerdictBadge(v) {
+  const cls = v === 'CONFIRMED' ? 'ok' : v === 'QUESTIONED' ? 'err' : '';
+  const label = v === 'CONFIRMED' ? '确认' : v === 'QUESTIONED' ? '存疑' : v === 'EXCLUDED' ? '排除' : v;
+  return `<span class="tag ${cls}">${label}</span>`;
+}
+
+async function rvCreate() {
+  const sid = document.getElementById('rvSid').value.trim()
+              || evState.session?.session_id || '';
+  if (!sid) { evMsg('请填写会话 id', 'err'); return; }
+  const body = { operator: evOp(), idempotency_key: rvKey(), session_id: sid };
+  const eid = document.getElementById('rvEid').value.trim();
+  if (eid) body.export_id = eid;
+  const res = await evPost('/api/admin/evidence/reviews', body);
+  if (!res.ok) { evMsg('创建复核单失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  rvState.currentId = res.json.review_id;
+  evMsg('复核单已创建: ' + res.json.review_id + ', 固定 ' + res.json.fixed.total_events
+        + ' 个事件, 待处理 ' + res.json.pending_count, 'ok');
+  document.getElementById('rvSid').value = sid;
+  rvLoad(res.json.review_id);
+  rvRefreshList();
+}
+
+async function rvRefreshList() {
+  const rows = await (await fetch('/api/admin/evidence/reviews?limit=50')).json();
+  document.getElementById('rvList').innerHTML = rows.map(r => `
+    <div style="border:1px solid #ddd;border-radius:6px;padding:6px 8px;margin-top:4px">
+      ${rvBadge(r.status)} <a href="javascript:rvLoad('${r.review_id}')"><b>${r.review_id}</b></a>
+      <span class="muted">会话 ${arEscape(r.session_id)} · 导出 ${arEscape(r.export_id)} · v${r.version}/依据v${r.scope_version} · ${r.created_at}</span>
+      <span class="muted"> · 事件 ${r.fixed.total_events}, 待处理 <b>${r.pending_count}</b>, 签署 ${r.stats.conclusion_count}, 操作者 ${r.stats.operator_count}</span>
+      ${r.signature_hash?`<div class="muted">签署摘要 <code>${arEscape(r.signature_hash.slice(0,20))}…</code></div>`:''}
+    </div>`).join('') || '<div class="muted">暂无复核单</div>';
+}
+
+async function rvLoad(rid) {
+  rvState.currentId = rid;
+  const d = await (await fetch('/api/admin/evidence/reviews/' + rid)).json();
+  rvState.detail = d;
+  rvState.version = d.version;
+  rvRender(d);
+}
+
+function rvRender(d) {
+  const f = d.fixed;
+  const invalid = d.invalid_reason ? `
+    <pre class="msg err" style="margin:6px 0">复核单已失效[${d.invalid_reason.code}]: ${arEscape(d.invalid_reason.message)}
+${(d.invalid_reason.breaks||[]).slice(0,5).map(b=>'  - ['+b.code+'] '+b.message).join('\n')}</pre>` : '';
+  const archived = d.signed_summary ? `
+    <details style="margin-top:6px" open><summary><b>不可变签署摘要</b> <code>${arEscape((d.signature_hash||'').slice(0,20))}…</code></summary>
+      <div class="muted">归档人 ${arEscape(d.archived_by)} · ${d.archived_at} · 操作者 ${arEscape((d.signed_summary.operators||[]).join(', '))}</div>
+      <div class="muted">结论统计: 确认 ${d.signed_summary.conclusion_stats.by_verdict.CONFIRMED},
+        存疑 ${d.signed_summary.conclusion_stats.by_verdict.QUESTIONED},
+        排除 ${d.signed_summary.conclusion_stats.by_verdict.EXCLUDED}
+        · 事件 ${d.signed_summary.event_range.first_global_seq}..${d.signed_summary.event_range.last_global_seq}
+        (${d.signed_summary.event_range.total_events})
+        · manifest_hash <code>${arEscape((f.export_manifest_hash||'').slice(0,16))}…</code></div>
+    </details>` : '';
+  const rows = d.items.map(it => {
+    const e = it.event;
+    const sigs = it.signatures.map(s => `
+      <div>${rvVerdictBadge(s.verdict)} <b>${arEscape(s.operator)}</b>
+        <span class="muted">@v${s.review_version}/依据v${s.scope_version} ${s.created_at||''}</span>
+        ${s.note?`<div class="muted">说明: ${arEscape(s.note)}</div>`:''}</div>`).join('');
+    const canSign = d.status === 'OPEN';
+    return `<tr>
+      <td>${e.global_seq}<br><span class="muted">${arEscape(e.stream_key)}#${e.stream_seq}</span></td>
+      <td>${arEscape(e.event_type)}<br><span class="muted">${arEscape(e.operator)}/${arEscape(e.source)}</span></td>
+      <td title="${arEscape(JSON.stringify(e.payload))}">${arEscape((e.stream_hash||'').slice(0,10))}…</td>
+      <td style="min-width:180px">${sigs || '<span class="muted">待签署</span>'}
+        ${it.pending?`<div class="muted">缺 ${2 - it.signature.length} 名签署</div>`:'<div class="ok">已双签</div>'}</td>
+      <td>${canSign?`
+        <select id="v-${e.global_seq}">
+          <option value="CONFIRMED">确认</option>
+          <option value="QUESTIONED">存疑</option>
+          <option value="EXCLUDED">排除</option>
+        </select>
+        <input id="vn-${e.global_seq}" size="14" placeholder="存疑/排除说明">
+        <button onclick="rvSign(${e.global_seq})">签署</button>`:''}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('rvDetail').innerHTML = `
+    <div style="border:2px solid #b39ddb;border-radius:8px;padding:8px;margin-top:6px">
+      <div>${rvBadge(d.status)} <b>${d.review_id}</b>
+        <span class="muted">${arEscape(d.plan_id)} · 创建者 ${arEscape(d.created_by)} · ${d.created_at}</span></div>
+      <div class="muted" style="margin:4px 0">
+        固定范围 global_seq ${f.start_global_seq}..<b>${f.upper_global_seq}</b>
+        (首 ${f.first_global_seq??'−'}, 尾 ${f.last_global_seq??'−'}, 共 <b>${f.total_events}</b>)
+        · 版本 <b id="rvVersion">${d.version}</b> · 依据版本 ${d.scope_version}
+        · 待处理 <b>${d.pending_count}</b>/${f.total_events}
+        · 已双签事件 ${d.stats.signed_events} · 操作者 ${d.stats.operator_count}
+      </div>
+      <div class="muted">固定筛选: 流 ${(f.filters.streams||[]).map(x=>`<span class="tag">${arEscape(x)}</span>`).join('')}
+        类型 ${arEscape((f.filters.event_types||[]).join(',')||'全部')} · 来源 ${arEscape((f.filters.sources||[]).join(',')||'全部')}</div>
+      <div class="muted">导出 ${arEscape(d.export_id)} · manifest_hash <code>${arEscape(f.export_manifest_hash)}</code>
+        · 范围指纹 <code>${arEscape((f.scope_fingerprint||'').slice(0,20))}…</code></div>
+      ${invalid}
+      <div style="margin-top:6px">
+        <button onclick="rvReverify('${d.review_id}')">重新校验固定依据</button>
+        <button onclick="rvArchive('${d.review_id}')" ${d.status==='OPEN'?'':'disabled'}>双人签全后归档</button>
+        <span class="muted">提交均带 If-Match=当前版本(签署成功后版本+1)</span>
+      </div>
+      <table style="margin-top:6px"><thead><tr>
+        <th>global_seq/流</th><th>类型/操作者</th><th>stream_hash</th><th>结论/说明/操作者/版本</th><th>签署</th>
+      </tr></thead><tbody>${rows}</tbody></table>
+      ${archived}
+      ${d.history && d.history.length?`<details style="margin-top:6px"><summary class="muted">历史依据版本签署(${d.history.length})</summary>
+        <table><tbody>${d.history.map(h=>`<tr><td>${h.global_seq}</td><td>${rvVerdictBadge(h.verdict)}</td>
+          <td>${arEscape(h.operator)}</td><td class="muted">依据v${h.scope_version}</td><td>${arEscape(h.note||'')}</td></tr>`).join('')}
+        </tbody></table></details>`:''}
+    </div>`;
+}
+
+async function rvSign(gs) {
+  const verdict = document.getElementById('v-' + gs).value;
+  const note = document.getElementById('vn-' + gs).value.trim();
+  const body = { operator: evOp(), idempotency_key: rvKey(),
+                 global_seq: gs, verdict: verdict };
+  if (note) body.note = note;
+  const r = await fetch('/api/admin/evidence/reviews/' + rvState.currentId + '/conclusions',
+    { method: 'POST', headers: {'Content-Type': 'application/json',
+                                'If-Match': String(rvState.version)},
+      body: JSON.stringify(body) });
+  const j = await r.json();
+  if (!r.ok) {
+    evMsg('签署被拒[' + (j.detail?.code||r.status) + ']: ' + (j.detail?.reason||''), 'err');
+    if (j.detail?.code === 'review_invalidated' || j.detail?.code === 'chain_broken'
+        || j.detail?.code === 'scope_changed' || j.detail?.code === 'package_verification_failed'
+        || j.detail?.code === 'manifest_hash_mismatch') rvLoad(rvState.currentId);
+    return;
+  }
+  rvState.version = j.version;
+  evMsg(`已签署 global_seq=${gs}: ${verdict}(版本 ${j.version}), 待处理 ${j.stats.pending_count}`, 'ok');
+  rvLoad(rvState.currentId);
+}
+
+async function rvReverify(rid) {
+  const res = await evPost('/api/admin/evidence/reviews/' + rid + '/reverify',
+    { operator: evOp(), idempotency_key: rvKey() });
+  if (!res.ok) { evMsg('重新校验失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  evMsg(res.json.valid
+    ? `固定依据校验通过(状态 ${res.json.status}, 依据版本 ${res.json.scope_version})`
+    : `校验仍失败: ${res.json.invalid_reason?.code}`, res.json.valid ? 'ok' : 'err');
+  rvLoad(rid); rvRefreshList();
+}
+
+async function rvArchive(rid) {
+  const res = await evPost('/api/admin/evidence/reviews/' + rid + '/archive',
+    { operator: evOp(), idempotency_key: rvKey() });
+  if (!res.ok) { evMsg('归档被拒: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  evMsg('已归档, signature_hash=' + (res.json.signature_hash||'').slice(0,20) + '…', 'ok');
+  rvLoad(rid); rvRefreshList();
+}
+
+rvRefreshList();
 
 setInterval(refresh, 3000);
 </script>

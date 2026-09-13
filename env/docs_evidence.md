@@ -247,3 +247,125 @@ manifest.json                 段清单 / 每条流摘要 / 逐文件 sha256 / c
 
 包文件目录：`${EVIDENCE_STORE_DIR}/<export_id>/segments/segment-*.jsonl` 与
 `${EVIDENCE_STORE_DIR}/<export_id>/evidence-<export_id>.zip`。
+
+---
+
+# 证据复核与签署归档 · 接口补充
+
+在固定边界会话与已完成证据包之上提供**双人逐事件复核 → 不可变签署归档**流程。
+复核单创建时**固定依据**(筛选条件、起止 global_seq、范围指纹、导出 manifest_hash)；
+底层事件链、查询结果(会话/页面)与已完成导出包全程**只读**。
+
+状态机：
+
+```
+OPEN ─两名不同操作者对全部事件签完→ archive ─→ ARCHIVED(终态, 签署摘要不可变, 禁止修改)
+  │  ▲                                                  
+  │  └ reverify 通过(依据修复, scope_version+1, 旧结论留史)
+  └─ 提交/归档/reverify 发现依据变化 ─→ INVALIDATED(冻结提交与归档, 机器可读原因)
+```
+
+- 逐事件结论：`CONFIRMED`（确认）/`QUESTIONED`（存疑，**说明必填**）/
+  `EXCLUDED`（排除，**说明必填**）；结论只能引用固定会话范围内的事件（按
+  `global_seq` 定位，越界 409 `event_out_of_scope`）。
+- 版本栅栏：每次成功提交结论复核单 `version` +1；提交必须携带
+  **`If-Match: <version>`** 请求头（过期/缺失/非法 → 409
+  `version_conflict`/`if_match_required`/`if_match_invalid`，后写不覆盖先写）。
+- 去重：同一依据版本下 `(event, operator)` 唯一；同操作者重复签署 → 409
+  `duplicate_signature`（不覆盖）；归档要求每个事件都有**两名不同操作者**的
+  当前版本结论（缺签 409 `signatures_incomplete`，仅一人 409 `two_operators_required`）。
+- 依据再校验：每次提交结论、归档以及显式 reverify 都重新
+  ① 全量重算固定范围哈希链；② 重算范围指纹（数量/内容/顺序）；
+  ③ 比对固定 `manifest_hash`；④ 回读 zip 包重算摘要（只读，不改导出任务状态）。
+  任一不一致 → 复核单转 **INVALIDATED** 并记录 `invalid_reason`
+  （原因码 `chain_broken` / `scope_changed` / `manifest_hash_mismatch` /
+  `package_verification_failed`，带 `breaks`/`detail` 定位信息），提交与归档冻结。
+- 修复后重新校验通过：`scope_version+1`，旧结论作为**历史保留**（详情 `history[]`），
+  当前签署集合清空，需要基于新版本重新逐事件签署。
+
+## 5. 复核单接口
+
+### POST /api/admin/evidence/reviews · 创建复核单（固定依据）
+```json
+{ "operator": "alice", "idempotency_key": "rv-1",
+  "session_id": "ESab12…", "export_id": "EE…(可空, 默认取最近 COMPLETED 包)" }
+```
+- 前置：会话必须 **CLOSED**（翻到固定边界）且未 BROKEN；必须存在属于该会话的
+  **COMPLETED** 导出包（否则 409 `session_not_closed`/`session_broken`/
+  `export_not_completed`/`export_session_mismatch`）；仅会话创建者可创建。
+- 创建即做一次完整依据校验；同一(会话,导出)重复创建幂等回显未归档复核单；
+  已归档后禁止再建（409 `review_already_archived`）。
+- 响应固定依据：`fixed.filters`（筛选条件快照）、`fixed.start_global_seq`、
+  `fixed.upper_global_seq`、`fixed.first/last_global_seq`、`fixed.total_events`、
+  `fixed.scope_fingerprint`（逐行规范化事件有序拼接的 sha256）、
+  `fixed.export_manifest_hash`/`export_content_digest`；
+  另含 `version`（If-Match 版本）、`scope_version`（依据版本）、`pending_count`、
+  `stats`（签署统计）与 `items[]`（事件详情 + 当前签署）。
+
+### GET /api/admin/evidence/reviews[?session_id=&export_id=&plan_id=&status_filter=&limit=]
+复核单列表（状态必须是 `OPEN/INVALIDATED/ARCHIVED`，非法 422）。
+
+### GET /api/admin/evidence/reviews/{id}[?pending_only=&limit=&offset=&with_history=&with_events=]
+复核单页面数据：固定依据、版本、待处理数量、**每个事件的详情
+（`items[].event`）与结论/说明/操作者/版本（`items[].signatures[]`）**、
+失效原因（`invalid_reason`）、事件流水（`events[]`）、历史依据版本签署
+（`history[]`）与归档后的不可变 `signed_summary`。
+
+### POST /api/admin/evidence/reviews/{id}/conclusions · 逐事件提交结论
+请求头 **`If-Match: <当前 version>`**：
+```json
+{ "operator": "bob", "idempotency_key": "c-1",
+  "global_seq": 231, "verdict": "QUESTIONED", "note": "时间戳与工单不一致" }
+```
+- 越界引用 / 重复签署 / 缺说明 / 非法结论 / 依据变化 / 已归档 → 409（机器可读
+  `detail.code`）；成功返回新 `version` 与 `stats`（含待处理数量）。同幂等键
+  重放返回首次结果（`replayed:true`），不产生第二条结论。
+
+### POST /api/admin/evidence/reviews/{id}/reverify · 显式重新校验固定依据
+`{operator, idempotency_key}`。返回 `{valid, status, scope_version,
+invalid_reason, stats}`；INVALIDATED 依据修复后调用通过即恢复 OPEN（依据版本+1，
+旧结论留史）；ARCHIVED 单拒绝（409）。
+
+### POST /api/admin/evidence/reviews/{id}/archive · 归档（不可变签署摘要）
+`{operator, idempotency_key}`。全部事件两名不同操作者签署且归档前依据再校验通过
+才可归档。归档产物 `signed_summary`：
+```json
+{
+  "review_id": "ER…", "session_id": "ES…", "export_id": "EE…", "plan_id": "P…",
+  "scope_version": 1,
+  "fixed_filters": { "…固定筛选条件快照…" },
+  "event_range": {
+    "start_global_seq": 0, "upper_global_seq": 1432,
+    "first_global_seq": 1, "last_global_seq": 1432, "total_events": 120,
+    "scope_fingerprint": "sha256…"
+  },
+  "manifest_hash": "…(固定的导出包摘要)", "content_digest": "…",
+  "operators": ["bob", "carol"], "operator_count": 2,
+  "conclusion_stats": { "total": 240, "events_signed": 120,
+    "by_verdict": { "CONFIRMED": 238, "QUESTIONED": 1, "EXCLUDED": 1 } },
+  "events": [{ "global_seq": 231, "signers": ["bob", "carol"],
+               "verdicts": ["CONFIRMED", "QUESTIONED"] }],
+  "archived_by": "dave", "archived_at": "…",
+  "signature_hash": "sha256(除 signature_hash 外全部字段的规范化 JSON)"
+}
+```
+归档后提交结论/重新校验/再次创建均被拒绝；重复归档：同键幂等回显，
+换键返回 `already_in_state:true` 且无副作用。`signature_hash` 可离线复算
+（删除该键后 sort_keys 规范化 sha256，与 `manifest_hash` 同一算法约定）。
+
+## 6. 失效原因码（`invalid_reason.code` / 冲突 `detail.code`）
+
+| code | 含义 | 关键定位字段 |
+| --- | --- | --- |
+| `chain_broken` | 固定范围哈希链重新校验不一致 | `breaks[]`（复用分页断链原因码） |
+| `scope_changed` | 固定范围事件数/内容/顺序指纹变化 | `detail.expected_events/actual_events/*_fingerprint` |
+| `manifest_hash_mismatch` | 导出 manifest_hash 与固定值不一致 | `detail.expected/actual_manifest_hash` |
+| `package_verification_failed` | zip 包回读重算摘要失败（缺失/损坏/篡改） | `detail.reason_code/issues` |
+| `event_out_of_scope` | 结论引用的事件不在固定会话范围内 | `global_seq`, `upper_global_seq`, `streams` |
+| `version_conflict` | If-Match 过期（乐观并发失败） | `expected`, `supplied` |
+| `if_match_required` / `if_match_invalid` | 缺 If-Match 头 / 版本号非法 | — |
+| `duplicate_signature` | 同操作者对同事件在当前依据版本已签署 | `existing_verdict` |
+| `signatures_incomplete` | 归档时仍有事件未集齐两名签署 | `pending_count`, `pending_global_seqs` |
+| `two_operators_required` | 归档要求两名不同操作者 | — |
+| `review_invalidated` / `review_archived` | 复核单已失效（冻结）/已归档（终态不可改） | — |
+

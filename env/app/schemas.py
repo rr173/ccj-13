@@ -348,3 +348,26 @@ class EvidenceExportAction(BaseModel):
 class EvidenceDownloadIssue(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+
+
+# ---------- 证据复核与签署归档 ----------
+
+class EvidenceReviewCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    export_id: Optional[str] = None               # 省略取该会话最近 COMPLETED 包
+
+
+class EvidenceReviewConclusionSubmit(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    global_seq: int = Field(ge=1)                 # 必须落在固定会话范围内
+    verdict: str = Field(min_length=1)            # CONFIRMED | QUESTIONED | EXCLUDED
+    note: Optional[str] = Field(default=None, max_length=2000)
+    # 乐观版本: 必须等于复核单当前 version(等价于 If-Match, 也可由请求头携带)
+
+
+class EvidenceReviewAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)

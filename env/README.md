@@ -652,6 +652,44 @@ QUEUED ─claim→ RUNNING ─全部分段+清单完成→ COMPLETED(终态, 包
   (默认 600)、`EVIDENCE_CURSOR_SECRET`(游标 HMAC 密钥)。
 - 接口文档见 [`docs_evidence.md`](docs_evidence.md)。
 
+### 证据复核与签署归档(evidence_reviews / evidence_review_conclusions)
+
+在已翻完(CLOSED)且未断链的查询会话与 **COMPLETED** 证据包之上做**双人逐事件复核**:
+
+```
+OPEN ─两名不同操作者对固定范围全部事件签署→ archive → ARCHIVED(终态, 签署摘要不可变)
+  │  ▲
+  │  └ reverify 通过(依据修复; scope_version+1, 旧结论留史, 当前签署清空重签)
+  └─ 提交/归档/reverify 发现依据变化 → INVALIDATED(冻结提交与归档, 机器可读原因)
+```
+
+- `POST /api/admin/evidence/reviews {session_id, export_id?}` 创建即**固定依据**(仅会话
+  创建者; 会话须 CLOSED 且有 COMPLETED 包): 筛选条件快照、起止 global_seq、范围内
+  事件数、**范围指纹**(逐行规范化事件有序拼接 sha256)、导出 id 与 **manifest_hash**。
+  同(会话,导出)重复创建幂等回显; 已归档后禁止再建。
+- 逐事件结论 `POST .../reviews/{id}/conclusions` 带 **`If-Match: <version>`** 头:
+  `CONFIRMED/QUESTIONED/EXCLUDED`(存疑·排除说明必填), 只能引用固定会话范围内事件
+  (越界 409 `event_out_of_scope`)。每次成功提交 version+1; 过期/缺失 If-Match → 409
+  (`version_conflict`/`if_match_required`, 后写不覆盖先写); 同一依据版本
+  (event, operator) 唯一, 重复签署 409 `duplicate_signature` 不覆盖; 同键重放幂等。
+- **依据再校验**: 每次提交/归档/显式 `POST .../reviews/{id}/reverify` 都重新
+  全量重算哈希链、范围指纹、manifest_hash 固定值比对并回读 zip 包重算摘要(只读,
+  不改会话/导出/事件)。不一致 → 复核单 **INVALIDATED**, `invalid_reason` 记录
+  `chain_broken/scope_changed/manifest_hash_mismatch/package_verification_failed`
+  及定位明细; 修复后 reverify 通过 → OPEN(scope_version+1, 历史结论在 `history[]` 保留)。
+- **归档** `POST .../reviews/{id}/archive`: 每个固定范围内事件均有两名不同操作者的
+  当前版本结论(缺签 `signatures_incomplete`, 仅一人 `two_operators_required`)且归档前
+  依据再校验通过; 生成不可变**签署摘要** `signed_summary`(结论统计 by_verdict、
+  事件范围 first/last/upper global_seq 与 scope_fingerprint、操作者列表、
+  manifest_hash、逐事件签署明细)与可离线复算的 `signature_hash`。归档后提交/重新
+  校验/再创建一律拒绝; 重复归档幂等(`already_in_state`)。
+- 页面/接口展示: 复核单详情含固定依据、`version`/`scope_version`、**待处理数量
+  pending_count**、每个事件详情与其结论/说明/操作者/签署版本、失效原因、事件流水、
+  历史版本签署与归档签署摘要; 列表支持 session/export/plan/status 过滤。
+- 严格只读: 事件链、查询会话/页面与已完成导出包不被本流程修改(仅写
+  evidence_reviews* 自身表)。页面"证据复核与签署归档"区提供创建/签署/重新校验/归档操作。
+- 接口文档见 [`docs_evidence.md`](docs_evidence.md) 第 5–6 节。
+
 ## 运行
 
 ```bash
@@ -799,6 +837,20 @@ GET  /api/admin/evidence/exports/{id}/verify?operator= 回读包重算逐文件/
 POST /api/admin/evidence/exports/{id}/download-token {operator, idempotency_key}
                                                       签发一次性下载令牌(仅会话创建者, 明文仅此返回)
 GET  /api/admin/evidence/downloads/{token}?operator=  兑换一次性下载(zip; 重复/过期 409/404)
+
+# ---- 证据复核与签署归档 ----
+POST /api/admin/evidence/reviews        {operator, idempotency_key, session_id, export_id?}
+                                                      从 CLOSED 会话+COMPLETED 包创建复核单(固定依据)
+GET  /api/admin/evidence/reviews[?session_id=&export_id=&plan_id=&status_filter=]
+GET  /api/admin/evidence/reviews/{id}[?pending_only=&limit=&offset=&with_history=&with_events=]
+                                                      复核单页面: 事件详情/结论/说明/操作者/版本/待处理量
+POST /api/admin/evidence/reviews/{id}/conclusions (If-Match: <version>)
+                   {operator, idempotency_key, global_seq, verdict: CONFIRMED|QUESTIONED|EXCLUDED, note?}
+                                                      逐事件签署(越界/过期/重复签署 409; 依据变化→INVALIDATED)
+POST /api/admin/evidence/reviews/{id}/reverify {operator, idempotency_key}
+                                                      重新校验固定依据(链/范围指纹/manifest_hash/包)
+POST /api/admin/evidence/reviews/{id}/archive {operator, idempotency_key}
+                                                      双人签全后归档(不可变签署摘要; 终态禁止修改)
 ```
 
 幂等：所有管理动作要求 `idempotency_key`，重复执行返回首次结果（`replayed: true`），无副作用；
@@ -808,7 +860,7 @@ GET  /api/admin/evidence/downloads/{token}?operator=  兑换一次性下载(zip;
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 293 个用例(含审计证据查询与一致性证明 36 个):
+python3 -m pytest tests/ -q   # 315 个用例(含审计证据查询与一致性证明 36 个、证据复核与签署归档 22 个):
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
 # 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
@@ -895,4 +947,11 @@ python3 -m pytest tests/ -q   # 293 个用例(含审计证据查询与一致性�
 #           一次性下载令牌(单次使用/重放/未知 404/未完成拒绝)/仅创建者权限/未知计划 404/非法过滤 422/
 #           会话与控制幂等(同键重放/跨请求体 409)/重启 RUNNING 回 QUEUED 续跑/
 #           高风险计划审批+撤销+窗口与证据接口共存/补偿列表与撤销接口不回归
+# 证据复核与签署归档(22): 创建固定依据(筛选/起止 global_seq/manifest_hash/范围指纹)/
+#           须 CLOSED 会话+COMPLETED 包/创建者权限/不存在与跨会话导出拒绝/幂等创建与列表过滤/
+#           页面展示事件详情+结论+说明+操作者+版本+待处理量/存疑排除须带说明/双签后待处理下降/
+#           If-Match 缺失非法过期冲突不覆盖/引用会话范围外事件拒绝/同操作者重复签署去重/同键重放不重复/
+#           双人双签才允许归档(缺签/仅一人拒绝)/归档不可变签署摘要可离线复算/归档后禁止提交重校重建(幂等回显)/
+#           混合结论统计与重启保留/链变化 INVALIDATED 机器可读原因且禁止提交归档/修复后重校 scope_version+1 旧结论留史重签归档/
+#           证据包被篡改失效/分页导出下载校验与补偿审批窗口接口不回归
 ```

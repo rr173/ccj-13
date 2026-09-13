@@ -1687,3 +1687,130 @@ class EvidenceDownload(Base):
     used_at = Column(DateTime, nullable=True)
     used_by = Column(String(128), nullable=True)
     expires_at = Column(DateTime, nullable=True)
+
+
+# 证据复核单状态机:
+#   OPEN       可逐事件提交结论/重新校验; 待处理量 pending_count>0
+#   INVALIDATED 固定依据(会话事件链或导出 manifest_hash)重新校验不一致;
+#               冻结提交与归档; 依据修复并重新校验通过后回到 OPEN
+#   ARCHIVED   两名不同操作者完成签署后归档(终态); 签署摘要不可变, 禁止一切修改
+EVIDENCE_REVIEW_STATUSES = ("OPEN", "INVALIDATED", "ARCHIVED")
+# 逐事件复核结论:
+#   CONFIRMED 确认(事件与结论一致)
+#   QUESTIONED 存疑(必须带说明)
+#   EXCLUDED   排除(必须带说明)
+EVIDENCE_REVIEW_VERDICTS = ("CONFIRMED", "QUESTIONED", "EXCLUDED")
+# 复核失效原因(机器可读):
+#   chain_broken             固定会话范围内哈希链重新校验不一致
+#   scope_changed            固定边界/筛选/事件范围指纹与创建时不一致
+#   manifest_hash_mismatch   导出包 manifest_hash 与创建时固定值不一致
+#   package_verification_failed 导出包重新回读校验失败(包缺失/损坏/摘要失配)
+EVIDENCE_REVIEW_INVALID_REASONS = (
+    "chain_broken", "scope_changed", "manifest_hash_mismatch",
+    "package_verification_failed",
+)
+
+
+class EvidenceReview(Base):
+    """证据复核与签署归档单: 从一个已完成且校验通过的证据查询会话(及其
+    COMPLETED 导出包)创建。
+
+    - 创建时**固定依据**: 会话筛选条件快照、起始/结束 global_seq、范围内事件数、
+      范围指纹(scope_fingerprint)、导出 id 与 manifest_hash/content_digest。
+      复核结论只能引用固定范围内的事件。
+    - version 为乐观并发版本(If-Match): 初始 0, 每次成功提交结论 +1; 过期版本
+      或重复写入(同操作者同事件已有当前版本结论)一律 409 拒绝。
+    - 每次提交结论/归档前都重新校验固定依据: 事件链或导出摘要不一致 ->
+      INVALIDATED(冻结), 记录机器可读原因; 修复后重新校验通过回到 OPEN,
+      此时 scope_version+1(旧结论作为历史保留, 当前签署集合清空, 重新逐事件复核)。
+    - 全部范围内事件都有**两名不同操作者**的当前版本结论后才允许归档;
+      归档生成不可变签署摘要(结论统计/事件范围/操作者/manifest_hash/scope 指纹)。"""
+
+    __tablename__ = "evidence_reviews"
+    __table_args__ = (
+        Index("ix_evidence_reviews_session", "session_id"),
+        Index("ix_evidence_reviews_export", "export_id"),
+    )
+
+    id = Column(String(32), primary_key=True)               # "ER" + 随机串
+    session_id = Column(String(32), ForeignKey("evidence_sessions.id"),
+                        nullable=False)
+    export_id = Column(String(32), ForeignKey("evidence_exports.id"),
+                       nullable=False)
+    plan_id = Column(String(32), nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="OPEN", index=True)
+    # 固定依据(创建时快照, 永不变更)
+    fixed_filters = Column(JSON, nullable=False, default=dict)
+    fixed_upper_global_seq = Column(Integer, nullable=False)
+    start_global_seq = Column(Integer, nullable=False, default=0)
+    first_global_seq = Column(Integer, nullable=True)
+    last_global_seq = Column(Integer, nullable=True)
+    total_events = Column(Integer, nullable=False, default=0)
+    scope_fingerprint = Column(String(64), nullable=False)
+    export_manifest_hash = Column(String(64), nullable=False)
+    export_content_digest = Column(String(64), nullable=True)
+    # 乐观并发版本: 每次成功提交结论 +1(提交必须 If-Match 当前值)
+    version = Column(Integer, nullable=False, default=0)
+    # 依据版本: 失效后修复重新校验通过 +1(旧结论保留为历史, 当前签署清空重签)
+    scope_version = Column(Integer, nullable=False, default=1)
+    # 失效证据(机器可读): {code, message, breaks?, detail?}
+    invalid_reason = Column(JSON, nullable=True)
+    invalidated_at = Column(DateTime, nullable=True)
+    # 归档产物: 不可变签署摘要与其哈希
+    signed_summary = Column(JSON, nullable=True)
+    signature_hash = Column(String(64), nullable=True, index=True)
+    archived_by = Column(String(128), nullable=True)
+    archived_at = Column(DateTime, nullable=True)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    conclusions = relationship("EvidenceReviewConclusion",
+                               cascade="all, delete-orphan",
+                               order_by="EvidenceReviewConclusion.id")
+    events = relationship("EvidenceReviewEvent", cascade="all, delete-orphan",
+                          order_by="EvidenceReviewEvent.id")
+
+
+class EvidenceReviewConclusion(Base):
+    """复核单逐事件签署结论(只追加): 同一 scope_version 下
+    (event_global_seq, operator) 唯一 —— 每名操作者对每个事件只能有一条当前
+    结论, 重复签署拒绝(不覆盖); scope_version 推进后旧行保留为历史, 可重新签署。"""
+
+    __tablename__ = "evidence_review_conclusions"
+    __table_args__ = (
+        UniqueConstraint("review_id", "scope_version", "event_global_seq",
+                         "operator", name="uq_evidence_review_signature"),
+        Index("ix_erc_review_event", "review_id", "event_global_seq"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    review_id = Column(String(32), ForeignKey("evidence_reviews.id"),
+                       nullable=False, index=True)
+    scope_version = Column(Integer, nullable=False, default=1)
+    event_global_seq = Column(Integer, nullable=False, index=True)
+    # 提交时固定的事件定位冗余(便于离线展示, 权威事件详情以事件表/导出包为准)
+    event_stream_key = Column(String(64), nullable=False)
+    event_stream_seq = Column(Integer, nullable=False)
+    event_type = Column(String(32), nullable=False)
+    verdict = Column(String(16), nullable=False)          # CONFIRMED|QUESTIONED|EXCLUDED
+    note = Column(String(2000), nullable=True)
+    operator = Column(String(128), nullable=False)
+    # 提交该结论时复核单的乐观版本(留痕)
+    review_version = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class EvidenceReviewEvent(Base):
+    """复核单事件流水(只追加): 创建/提交结论/失效/重新校验通过/归档。"""
+
+    __tablename__ = "evidence_review_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=_utcnow)
+    review_id = Column(String(32), ForeignKey("evidence_reviews.id"),
+                       nullable=False, index=True)
+    event = Column(String(48), nullable=False)
+    operator = Column(String(128), nullable=False)
+    reason = Column(String(500), nullable=True)
+    detail = Column(JSON, nullable=True)

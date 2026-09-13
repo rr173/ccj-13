@@ -1,7 +1,7 @@
 import os
 from datetime import datetime
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -9,15 +9,16 @@ from sqlalchemy.orm import Session
 from .db import Base, SessionLocal, engine
 from .models import (
     REVIEW_STATUSES, ArchiveCleanupPlan, AuditLog, AuditSnapshot,
-    CompensationTask, EvidenceExport, EvidenceSession, MigrationBatch,
-    MigrationPlan, QUALITY_ISSUE_STATUSES, QUALITY_SCAN_STATUSES, QualityScan,
-    RecordNew, RecordOld, ReplayArchive, ReplayBatchOp, ReplayCheckpoint,
-    ReplayTask,
+    CompensationTask, EvidenceExport, EvidenceReview, EvidenceSession,
+    MigrationBatch, MigrationPlan, QUALITY_ISSUE_STATUSES,
+    QUALITY_SCAN_STATUSES, QualityScan, RecordNew, RecordOld, ReplayArchive,
+    ReplayBatchOp, ReplayCheckpoint, ReplayTask,
 )
 from .plans import PlanWorker
 from .quality import QualityWorker
 from .replay import ReplayWorker
-from . import archives, auditreplay, cleanup, evidence, plans, quality, replay, service
+from . import (archives, auditreplay, cleanup, evidence, plans, quality,
+               replay, reviews, service)
 from .schemas import (
     AdminAction, ArchiveAction, ArchiveCreate, ArchiveRetention,
     AuditEventNote, AuditSnapshotCreate, BatchCreate, CheckpointCreate, CleanupAction,
@@ -25,7 +26,8 @@ from .schemas import (
     CompensationCancelAction, CompensationCreate, CompensationRejectAction,
     CompensationRetry, CompensationWindowAction, EvidenceDownloadIssue,
     EvidenceExportAction, EvidenceExportCreate, EvidencePageQuery,
-    EvidenceSessionCreate, PlanAction, PlanCreate,
+    EvidenceReviewAction, EvidenceReviewConclusionSubmit,
+    EvidenceReviewCreate, EvidenceSessionCreate, PlanAction, PlanCreate,
     PlanRejectAction, PlanWindowAction, QualityExemptionCreate,
     QualityExemptionRevoke, QualityFixCreate, QualityRulesSave, QualityScanAction,
     QualityScanCreate, RecordIn, RecoverAction, ReplayAction, ReplayCreate,
@@ -311,6 +313,12 @@ def status(db: Session = Depends(get_db)):
                       .order_by(EvidenceExport.created_at.desc(),
                                 EvidenceExport.id.desc()).limit(20).all())],
         "evidence_concurrency": evidence.max_concurrency(),
+        "evidence_reviews": [
+            reviews.review_to_dict(db, rv, with_history=False,
+                                   with_events_detail=False, limit=1)
+            for rv in (db.query(EvidenceReview)
+                       .order_by(EvidenceReview.created_at.desc(),
+                                 EvidenceReview.id.desc()).limit(20).all())],
     }
 
 
@@ -1953,6 +1961,189 @@ def evidence_download(token: str, operator: str = "system",
     return FileResponse(
         path, media_type="application/zip",
         filename=f"evidence-{e.id}-plan-{e.plan_id}.zip")
+
+
+# ---------- 证据复核与签署归档(双人逐事件签署 / 固定依据再校验 / 不可变签署摘要) ----------
+
+def _review_not_found(e: Exception):
+    raise HTTPException(status_code=404, detail={
+        "error": "evidence_review_not_found", "reason": str(e)})
+
+
+def _review_conflict(e: Exception):
+    detail = {"error": "evidence_review_conflict",
+             "reason": str(e), "code": getattr(e, "code", "review_conflict")}
+    for k in ("expected", "supplied"):
+        if hasattr(e, k):
+            detail[k] = getattr(e, k)
+    extra = getattr(e, "extra", None)
+    if extra:
+        detail.update(extra)
+    raise HTTPException(status_code=409, detail=detail)
+
+
+@app.post("/api/admin/evidence/reviews", status_code=201)
+def create_evidence_review(body: EvidenceReviewCreate,
+                           db: Session = Depends(get_db)):
+    """从已完成且校验通过的查询会话(CLOSED + COMPLETED 导出包)创建复核单。
+
+    创建时固定筛选条件、起止 global_seq、范围指纹与导出 manifest_hash;
+    同(会话,导出)重复创建幂等回显未归档复核单; 已归档后禁止再建。"""
+
+    def _do(s):
+        rv = reviews.create_review(
+            s, operator=body.operator, session_id=body.session_id,
+            export_id=body.export_id)
+        out = reviews.review_to_dict(s, rv, with_history=False,
+                                     with_events_detail=True, limit=1)
+        out["status"] = rv.status
+        return out
+
+    try:
+        result, replayed = reviews.run_review_action(
+            db, action="review.create", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            fn=_do)
+    except evidence.EvidenceNotFound as e:
+        db.rollback()
+        _review_not_found(e)
+    except evidence.EvidenceStateError as e:
+        db.rollback()
+        _evidence_conflict(e)
+    except reviews.ReviewStateError as e:
+        db.rollback()
+        _review_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.get("/api/admin/evidence/reviews")
+def list_evidence_reviews(session_id: str | None = None,
+                          export_id: str | None = None,
+                          plan_id: str | None = None,
+                          status_filter: str | None = None,
+                          limit: int = 50, db: Session = Depends(get_db)):
+    from .models import EVIDENCE_REVIEW_STATUSES
+    if status_filter and status_filter not in EVIDENCE_REVIEW_STATUSES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_review_status",
+            "reason": f"复核单状态必须是 {list(EVIDENCE_REVIEW_STATUSES)} 之一"})
+    rows = reviews.list_reviews(
+        db, session_id=session_id, export_id=export_id, plan_id=plan_id,
+        status_filter=status_filter, limit=limit)
+    return [reviews.review_to_dict(db, r, with_history=False,
+                                   with_events_detail=False, limit=1)
+            for r in rows]
+
+
+@app.get("/api/admin/evidence/reviews/{review_id}")
+def get_evidence_review(review_id: str, pending_only: bool = False,
+                        limit: int | None = None, offset: int = 0,
+                        with_history: bool = True,
+                        with_events: bool = True,
+                        db: Session = Depends(get_db)):
+    """复核单页面数据: 固定依据、事件详情与每条事件的结论/说明/操作者/版本、
+    待处理数量(pending_count)、失效原因或已归档签署摘要。"""
+    try:
+        rv = reviews.get_review(db, review_id)
+    except evidence.EvidenceNotFound as e:
+        _review_not_found(e)
+    return reviews.review_to_dict(db, rv, with_events_detail=with_events,
+                                  pending_only=pending_only, limit=limit,
+                                  offset=offset, with_history=with_history)
+
+
+@app.post("/api/admin/evidence/reviews/{review_id}/conclusions")
+def submit_evidence_review_conclusion(
+        review_id: str, body: EvidenceReviewConclusionSubmit,
+        request: Request, db: Session = Depends(get_db)):
+    """对固定范围内单个事件提交一名操作者的签署结论。
+
+    必须携带 If-Match: <version>(请求头或等价版本); 过期/缺失 -> 409;
+    引用会话外事件/重复签署/复核单失效或已归档 -> 409。"""
+    header = request.headers.get("if-match")
+    expected: int | None
+    if header is not None:
+        header = header.strip().strip('"')
+        try:
+            expected = int(header)
+        except ValueError:
+            raise HTTPException(status_code=409, detail={
+                "error": "evidence_review_conflict",
+                "code": "if_match_invalid",
+                "reason": f"If-Match 必须是整数版本号(收到 {header!r})"})
+    else:
+        # 头与体都未提供版本时由 service 层报 if_match_required
+        expected = None
+
+    def _do(s):
+        return reviews.submit_conclusion(
+            s, review_id, operator=body.operator,
+            global_seq=body.global_seq, verdict=body.verdict, note=body.note,
+            expected_version=expected)
+
+    try:
+        result, replayed = reviews.run_review_action(
+            db, action="conclusion.submit", operator=body.operator,
+            idempotency_key=body.idempotency_key,
+            payload={**body.model_dump(), "if_match": expected},
+            review_id=review_id, fn=_do)
+    except evidence.EvidenceNotFound as e:
+        db.rollback()
+        _review_not_found(e)
+    except (reviews.ReviewStateError, reviews.ReviewVersionConflict) as e:
+        db.rollback()
+        _review_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/evidence/reviews/{review_id}/reverify")
+def reverify_evidence_review(review_id: str, body: EvidenceReviewAction,
+                             db: Session = Depends(get_db)):
+    """显式重新校验固定依据: 链变化/摘要不一致 -> INVALIDATED(机器可读原因);
+    修复后再调用通过则恢复 OPEN(scope_version+1, 旧结论留史, 重新签署)。"""
+
+    def _do(s):
+        return reviews.reverify(s, review_id, operator=body.operator)
+
+    try:
+        result, replayed = reviews.run_review_action(
+            db, action="review.reverify", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            review_id=review_id, fn=_do)
+    except evidence.EvidenceNotFound as e:
+        db.rollback()
+        _review_not_found(e)
+    except reviews.ReviewStateError as e:
+        db.rollback()
+        _review_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/evidence/reviews/{review_id}/archive")
+def archive_evidence_review(review_id: str, body: EvidenceReviewAction,
+                            db: Session = Depends(get_db)):
+    """归档复核单: 全部事件两名不同操作者签署完成且固定依据再校验通过后,
+    生成不可变签署摘要(结论统计/事件范围/操作者/manifest_hash)。已归档幂等回显。"""
+
+    def _do(s):
+        return reviews.archive_review(s, review_id, operator=body.operator)
+
+    try:
+        result, replayed = reviews.run_review_action(
+            db, action="review.archive", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            review_id=review_id, fn=_do)
+    except evidence.EvidenceNotFound as e:
+        db.rollback()
+        _review_not_found(e)
+    except reviews.ReviewStateError as e:
+        db.rollback()
+        _review_conflict(e)
+    result["replayed"] = replayed
+    return result
 
 
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------
