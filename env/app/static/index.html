@@ -443,7 +443,9 @@
 <div class="card" style="background:#eefbf3;border-color:#81c784">
   <b>证据封存分发与离线校验</b>
   <span class="muted">只能从已归档(ARCHIVED)复核单创建 · package_id 由不可变签署摘要+接收方+脱敏策略+签发序号固定派生 ·
-    一次性下载令牌(绑定接收方, 首次兑换失效) · 撤销/过期拒绝下载 · 独立离线校验逐项指出篡改位置</span>
+    多授权接收方(各自最晚回执时间/必须确认事件范围) · 一次性下载令牌(首次兑换失效) ·
+    接收回执(签收/部分异常/拒收, 校验固定 package_id/manifest_hash/content_digest) ·
+    回执截止未完成自动待处理并禁止下载(恢复须重新校验; 重签产生新 package_id) · 延期双人审批 · 独立离线校验逐项指出篡改位置</span>
 
   <div style="margin-top:8px">
     <b>4. 接收方名册</b>:
@@ -3144,8 +3146,11 @@ async function dstPost(url, body) {
   return {ok:r.ok, status:r.status, json:j};
 }
 function dstBadge(status) {
-  const cls = status === 'ACTIVE' ? 'ok' : status === 'EXPIRED' ? '' : 'err';
-  return `<span class="tag ${cls}">${status}</span>`;
+  const cls = (status === 'ACTIVE' || status === 'RECOVERED') ? 'ok'
+    : (status === 'EXPIRED' || status === 'PENDING_PROCESS') ? '' : 'err';
+  const label = status === 'PENDING_PROCESS' ? '待处理'
+    : status === 'RECOVERED' ? '已恢复' : status;
+  return `<span class="tag ${cls}">${label}</span>`;
 }
 function shortHash(h) { return h ? arEscape(h.slice(0,16)) + '…' : '-'; }
 
@@ -3200,17 +3205,26 @@ async function dstCreate() {
 
 async function dstRefreshList() {
   const rows = await (await fetch('/api/admin/evidence/distributions?limit=50')).json();
-  document.getElementById('dstList').innerHTML = rows.map(d => `
+  document.getElementById('dstList').innerHTML = rows.map(d => {
+    const p = d.receipt_progress || {};
+    const rcpt = (d.recipient_count ?? 1) > 0
+      ? `回执 ${p.completed||0}/${p.recipient_count||0}`
+        + (p.anomaly_count ? ` <span class="err">异常${p.anomaly_count}</span>` : '')
+        + (p.unfinished ? ` <span class="muted">待回${p.unfinished}</span>` : '')
+      : '';
+    return `
     <div style="border:1px solid #ddd;border-radius:6px;padding:6px 8px;margin-top:4px">
       ${dstBadge(d.status)} <a href="javascript:dstLoad('${d.package_id}', evOp())"><b>${d.package_id}</b></a>
       <span class="muted">复核单 ${arEscape(d.review_id)} · 接收方 <b>${arEscape(d.recipient)}</b>
         · ${arEscape(d.redaction_policy)} · 签发#${d.issue_no} · ${d.created_at}</span>
       <div class="muted">事件 <b>${d.event_count}</b>(${d.first_global_seq??'-'}..${d.last_global_seq??'-'})
         · 有效期至 <b>${d.valid_until}</b> · 下载 ${d.download_count} 次 · 待兑换令牌 ${d.active_token_count}</div>
+      <div class="muted">${rcpt}${d.pending_process?' · <span class="err">待处理: 到期未完成回执, 已禁止下载</span>':''}${d.recovered?' · <span class="ok">已恢复</span>':''}</div>
       <div class="muted">manifest <code title="${arEscape(d.manifest_hash)}">${shortHash(d.manifest_hash)}</code>
         content <code title="${arEscape(d.content_digest)}">${shortHash(d.content_digest)}</code>
         签名 <code title="${arEscape(d.signature_digest)}">${shortHash(d.signature_digest)}</code></div>
-    </div>`).join('') || '<div class="muted">尚无分发包</div>';
+    </div>`;
+  }).join('') || '<div class="muted">尚无分发包</div>';
 }
 
 async function dstLoad(pid, operator) {
@@ -3227,44 +3241,224 @@ async function dstLoad(pid, operator) {
   const d = await r.json();
   const revoked = d.status === 'REVOKED';
   const expired = d.status === 'EXPIRED';
-  const canIssue = !revoked && !expired;
+  const pending = d.status === 'PENDING_PROCESS';
+  const canIssue = !revoked && !expired && !pending;
+  const isAdminView = op === d.created_by;
   const evs = (d.events||[]).slice(-20).reverse().map(e =>
     `<tr><td>${e.ts||''}</td><td>${arEscape(e.event)}</td><td>${arEscape(e.operator)}</td>
      <td class="muted">${arEscape((e.reason||'').slice(0,150))}</td></tr>`).join('');
+  const p = d.receipt_progress || {};
+  const assignmentsRows = (d.assignments||[]).map(a => {
+    const rc = a.receipt;
+    const badge = a.status === 'PENDING' ? (a.overdue ? '<span class="tag err">逾期未回</span>' : '<span class="tag">待回执</span>')
+      : a.status === 'SIGNED' ? '<span class="tag ok">已签收</span>'
+      : a.status === 'PARTIAL' ? '<span class="tag" style="background:#fff3cd">部分异常</span>'
+      : a.status === 'REJECTED' ? '<span class="tag err">拒收</span>'
+      : a.status === 'OVERDUE' ? '<span class="tag err">逾期未回</span>' : a.status;
+    const rcInfo = rc ? `(${rc.receipt_type}, 确认${rc.confirmed_count}/异常${rc.anomaly_count}/拒${rc.rejected_event_count}, ${rc.submitted_by})` : '';
+    return `<tr>
+      <td><b>${arEscape(a.recipient)}</b></td>
+      <td>${badge} <span class="muted">${rcInfo}</span></td>
+      <td class="muted">${arEscape(a.receipt_due_at||'')}</td>
+      <td class="muted">${a.required_scope_all ? '全部事件' : (a.required_global_seqs||[]).join(',')}</td>
+    </tr>`;
+  }).join('');
+  const anomaliesRows = (p.anomalies||[]).map(x =>
+    `<tr><td>${arEscape(x.recipient)}</td><td>global_seq=${x.global_seq}</td>
+     <td>${arEscape(x.result)}</td><td>${arEscape(x.note||'')}</td></tr>`).join('');
+  const extRows = (d.extensions||[]).slice(-5).reverse().map(e =>
+    `<tr><td>${arEscape(e.extension_id)}</td><td>${arEscape(e.status)}</td>
+     <td class="muted">${arEscape(e.requested_by)}</td>
+     <td class="muted">${arEscape(e.new_valid_until)}</td>
+     <td class="muted">${(e.approvals||[]).map(a=>arEscape(a.operator)+':'+arEscape(a.decision)).join(' ')}</td>
+     <td class="muted">${arEscape(e.invalidated_reason||'')}</td></tr>`).join('');
   document.getElementById('dstDetail').innerHTML = `
     <div style="border:2px solid #81c784;border-radius:8px;padding:8px;margin-top:6px">
       <div>${dstBadge(d.status)} <b>${d.package_id}</b>
         <span class="muted">复核单 ${arEscape(d.review_id)} · 计划 ${arEscape(d.plan_id)}</span></div>
       <div class="muted" style="margin:4px 0">
-        接收方 <b>${arEscape(d.recipient)}</b> · 创建者 ${arEscape(d.created_by)}
+        主接收方 <b>${arEscape(d.recipient)}</b> · 创建者 ${arEscape(d.created_by)}
         · 脱敏 <b>${arEscape(d.redaction_policy)}</b>(${arEscape((d.redacted_fields||[]).join(', '))})
         · 签发序号 ${d.issue_no}
       </div>
       <div class="muted">有效期 ${d.valid_from} ~ <b>${d.valid_until}</b>
         ${revoked?` · <span class="err">已由 ${arEscape(d.revoked_by)} 于 ${d.revoked_at} 撤销: ${arEscape(d.revoke_reason||'')}</span>`:''}
-        ${expired?' · <span class="err">已过期</span>':''}</div>
+        ${expired?' · <span class="err">已过期</span>':''}
+        ${pending?` · <span class="err">待处理: 到期仍有 ${p.unfinished??'-'} 个接收方未完成回执, 已禁止下载(回执与归档摘要只读)</span>`:''}
+        ${d.recovered?` · <span class="ok">已于 ${d.recovered_at} 由 ${arEscape(d.recovered_by)} 恢复</span>`:''}</div>
       <div class="muted">事件 <b>${d.event_count}</b> (${d.first_global_seq??'-'}..${d.last_global_seq??'-'})
         · 复核签署摘要 <code>${shortHash(d.review_signature_hash)}</code></div>
       <div class="muted">content_digest <code>${arEscape(d.content_digest)}</code><br>
         manifest_hash <code>${arEscape(d.manifest_hash)}</code><br>
         signature_digest <code>${arEscape(d.signature_digest)}</code></div>
+
+      <div style="margin-top:6px;border-top:1px dashed #81c784;padding-top:6px">
+        <b>回执进度</b>:
+        接收方 ${p.recipient_count||0} · 已完成 <b>${p.completed||0}</b>
+        (签收 ${p.signed||0} / 部分异常 ${p.partial||0} / 拒收 ${p.rejected||0})
+        · 未完成 ${p.unfinished||0} (逾期 ${p.overdue||0})
+        <table style="margin-top:4px"><thead><tr><th>接收方</th><th>状态/回执</th>
+          <th>最晚回执</th><th>必须确认事件</th></tr></thead>
+          <tbody>${assignmentsRows||'<tr><td colspan=4 class=muted>尚无分派</td></tr>'}</tbody></table>
+        ${anomaliesRows ? `<b class="err">异常原因</b>
+          <table><thead><tr><th>接收方</th><th>事件</th><th>结果</th><th>说明</th></tr></thead>
+          <tbody>${anomaliesRows}</tbody></table>` : ''}
+        ${(p.unfinished_recipients||[]).length ? `<div class="muted">未完成接收方: ${
+          p.unfinished_recipients.map(u=>arEscape(u.recipient)+(u.overdue?'(逾期)':'')).join('、')}</div>` : ''}
+      </div>
+
       <div style="margin-top:6px">
-        查看/下载身份
+        查看/下载/回执身份
         <input id="dstViewOp" size="12" value="${arEscape(op)}"
           onchange="dstLoad('${d.package_id}', this.value)">
-        <span class="muted">(仅授权接收方 ${arEscape(d.recipient)} 或创建者 ${arEscape(d.created_by)})</span>
       </div>
       <div style="margin-top:4px">
         <button ${canIssue?'':'disabled'} onclick="dstIssue('${d.package_id}')">签发一次性下载令牌</button>
         <button class="plain" onclick="dstVerifyStored('${d.package_id}')">重算留存包校验</button>
         <button class="danger" ${revoked?'disabled':''} onclick="dstRevoke('${d.package_id}')">撤销分发包</button>
+        <button class="plain" ${isAdminView && canIssue ?'':'disabled'}
+          onclick="dstAddRecipient('${d.package_id}')">追加授权接收方</button>
+        <button ${canIssue?'':'disabled'} onclick="dstSubmitReceipt('${d.package_id}')">提交回执</button>
+        <button class="plain" ${isAdminView && canIssue ?'':'disabled'}
+          onclick="dstRequestExtension('${d.package_id}')">申请延期(双人审批)</button>
+        <button class="plain" ${isAdminView && pending ?'':'disabled'}
+          onclick="dstRecover('${d.package_id}')">重新校验并恢复</button>
       </div>
+      <div style="margin-top:4px" class="muted">
+        延期审批: 申请 id
+        <input id="dstExtId-${d.package_id}" size="10" placeholder="EDE...">
+        <button class="plain" onclick="dstApproveExt()">通过延期</button>
+        <button class="plain" onclick="dstRejectExt()">拒绝延期</button>
+      </div>
+      ${extRows ? `<details><summary class="muted">延期申请(最近 5)</summary>
+        <table><thead><tr><th>申请</th><th>状态</th><th>申请人</th><th>延期至</th>
+        <th>审批</th><th>失效原因</th></tr></thead><tbody>${extRows}</tbody></table></details>` : ''}
       <div id="dstToken-${d.package_id}" style="margin-top:4px"></div>
       <div id="dstVerifyRes-${d.package_id}" style="margin-top:4px"></div>
       <details style="margin-top:6px"><summary class="muted">事件流水(最近 20 条)</summary>
         <table><thead><tr><th>时间</th><th>事件</th><th>操作者</th><th>原因</th></tr></thead>
         <tbody>${evs}</tbody></table></details>
     </div>`;
+}
+
+async function dstAddRecipient(pid) {
+  const recipient = prompt('追加授权接收方账号(必须已登记 ACTIVE):');
+  if (!recipient) return;
+  const due = prompt('该接收方最晚回执时间(ISO, 留空=包有效期止):', '') || null;
+  const seqsRaw = prompt('必须确认事件 global_seq, 逗号分隔(留空=包内全部事件):', '') || '';
+  const body = { operator: evOp(), idempotency_key: dstKey(), recipient: recipient.trim() };
+  if (due) body.receipt_due_at = due;
+  if (seqsRaw.trim()) body.required_global_seqs = seqsRaw.split(',').map(x=>Number(x.trim())).filter(Boolean);
+  const res = await dstPost(`/api/admin/evidence/distributions/${pid}/recipients`, body);
+  if (!res.ok) { dstMsg('追加接收方失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  dstMsg(`已追加接收方 ${res.json.recipient}`, 'ok');
+  dstRefreshList(); dstLoad(pid, document.getElementById('dstViewOp')?.value || evOp());
+}
+
+async function dstIssueForReceipt(pid, recipient) {
+  // 为提交回执准备: 签发并兑换一次性令牌, 返回 download_id
+  const res = await dstPost(`/api/admin/evidence/distributions/${pid}/download-token`,
+    { operator: recipient, idempotency_key: dstKey() });
+  if (!res.ok) { dstMsg('签发令牌失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return null; }
+  const rd = await fetch(`/api/admin/evidence/distribution-downloads/${res.json.token}?operator=${encodeURIComponent(recipient)}`);
+  if (!rd.ok) { dstMsg('令牌兑换失败: ' + rd.status, 'err'); return null; }
+  return res.json.download_id;
+}
+
+async function dstSubmitReceipt(pid) {
+  const recipient = document.getElementById('dstViewOp')?.value || evOp();
+  const d = await (await fetch(`/api/admin/evidence/distributions/${pid}?operator=${encodeURIComponent(recipient)}`)).json();
+  const assignment = (d.assignments||[]).find(a => a.recipient === recipient);
+  if (!assignment) { dstMsg('当前身份不是该包授权接收方, 不能提交回执', 'err'); return; }
+  const rtype = prompt('回执类型: SIGNED=签收 / PARTIAL=部分异常 / REJECTED=拒收', 'SIGNED');
+  if (!rtype || !['SIGNED','PARTIAL','REJECTED'].includes(rtype)) return;
+  const useLast = confirm('确定: 复用本身份最近一次成功兑换的一次性令牌?\n(取消可手动输入 download_id)');
+  let download_id;
+  if (useLast) {
+    const detail = await (await fetch(`/api/admin/evidence/distributions/${pid}?operator=${encodeURIComponent(recipient)}`)).json();
+    // 通过流水详情里无法直接取 download_id, 这里签发新令牌并兑换
+    download_id = await dstIssueForReceipt(pid, recipient);
+    if (!download_id) return;
+  } else {
+    download_id = prompt('请输入已成功兑换的一次性令牌 download_id:');
+    if (!download_id) return;
+  }
+  const reqSeqs = assignment.required_scope_all
+    ? (d.manifest?.lines||[]).map(l=>l.global_seq)
+    : assignment.required_global_seqs;
+  let events = null, note = null;
+  if (rtype === 'REJECTED') {
+    note = prompt('整包拒收原因(必填):');
+    if (!note) return;
+  } else {
+    const defaultRes = rtype === 'SIGNED' ? 'CONFIRMED' : 'CONFIRMED';
+    const input = prompt(`逐事件确认(${reqSeqs.length} 个)。\n格式: global_seq:结果,逗号分隔; 结果=CONFIRMED/ANOMALY/REJECTED。\n留空=全部 CONFIRMED`,
+      reqSeqs.map(g=>`${g}:CONFIRMED`).join(','));
+    if (input === null) return;
+    if (input.trim()) {
+      events = input.split(',').map(part => {
+        const [gs, result] = part.split(':').map(x=>x && x.trim());
+        return { global_seq: Number(gs), result: result || 'CONFIRMED',
+                 note: (result==='ANOMALY'||result==='REJECTED') ? prompt(`事件 ${gs} 的异常/拒收说明:`) : null };
+      });
+    } else {
+      events = reqSeqs.map(g => ({global_seq: g, result: 'CONFIRMED'}));
+    }
+    if (rtype === 'PARTIAL') note = prompt('整体说明(可选):') || null;
+  }
+  const body = { operator: recipient, idempotency_key: dstKey(), download_id,
+    manifest_hash: d.manifest_hash, content_digest: d.content_digest,
+    receipt_type: rtype, note, events };
+  const res = await dstPost(`/api/admin/evidence/distributions/${pid}/receipts`, body);
+  if (!res.ok) { dstMsg('回执被拒[' + (res.json?.detail?.code||res.status) + ']: ' + (res.json?.detail?.reason||JSON.stringify(res.json?.detail||'')), 'err'); return; }
+  dstMsg(`回执 ${res.json.receipt_type} 已提交(${res.json.confirmed_count??0} 确认/${res.json.anomaly_count??0} 异常)`, 'ok');
+  dstRefreshList(); dstLoad(pid, recipient);
+}
+
+async function dstRequestExtension(pid) {
+  const until = prompt('申请延期至(ISO, 例如 2026-12-31T00:00:00Z):');
+  if (!until) return;
+  const reason = prompt('延期原因:') || '接收方请求延期';
+  const res = await dstPost(`/api/admin/evidence/distributions/${pid}/extensions`,
+    { operator: evOp(), idempotency_key: dstKey(), new_valid_until: until, reason });
+  if (!res.ok) { dstMsg('延期申请失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  dstMsg(`延期申请 ${res.json.extension_id} 已创建, 等待两名不同操作者审批`, 'ok');
+  dstLoad(pid, document.getElementById('dstViewOp')?.value || evOp());
+}
+
+async function dstApproveExt() {
+  const eid = (document.querySelector('input[id^="dstExtId-"]')?.value || '').trim();
+  if (!eid) { dstMsg('请先填写延期申请 id(EDE...)', 'err'); return; }
+  const res = await dstPost(`/api/admin/evidence/extensions/${eid}/approve`,
+    { operator: evOp(), idempotency_key: dstKey() });
+  if (!res.ok) { dstMsg('审批失败[' + (res.json?.detail?.code||res.status) + ']: ' + (res.json?.detail?.reason||''), 'err'); return; }
+  dstMsg(res.json.applied ? `延期已应用, 新有效期至 ${res.json.valid_until}` : `已赞成(${res.json.approvals}/${res.json.required})`, 'ok');
+  const pid = (await (await fetch(`/api/admin/evidence/extensions/${eid}`)).json()).package_id;
+  dstRefreshList(); if (pid) dstLoad(pid, evOp());
+}
+
+async function dstRejectExt() {
+  const eid = (document.querySelector('input[id^="dstExtId-"]')?.value || '').trim();
+  if (!eid) { dstMsg('请先填写延期申请 id(EDE...)', 'err'); return; }
+  const reason = prompt('拒绝原因:');
+  if (!reason) return;
+  const res = await dstPost(`/api/admin/evidence/extensions/${eid}/reject`,
+    { operator: evOp(), idempotency_key: dstKey(), reason });
+  if (!res.ok) { dstMsg('拒绝失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  dstMsg('延期申请已拒绝', 'ok');
+  const pid = (await (await fetch(`/api/admin/evidence/extensions/${eid}`)).json()).package_id;
+  dstRefreshList(); if (pid) dstLoad(pid, evOp());
+}
+
+async function dstRecover(pid) {
+  const seconds = Number(prompt('恢复后续期秒数(默认 86400):', '86400'));
+  if (!seconds) return;
+  const reason = prompt('恢复说明:', '重新校验通过, 管理员恢复') || '';
+  const res = await dstPost(`/api/admin/evidence/distributions/${pid}/recover`,
+    { operator: evOp(), idempotency_key: dstKey(), extend_seconds: seconds, reason });
+  if (!res.ok) { dstMsg('恢复失败[' + (res.json?.detail?.code||res.status) + ']: ' + (res.json?.detail?.reason||''), 'err'); return; }
+  dstMsg(`包已恢复并续期至 ${res.json.valid_until}, 重开回执: ${(res.json.reopened_recipients||[]).join(',')}`, 'ok');
+  dstRefreshList(); dstLoad(pid, evOp());
 }
 
 async function dstIssue(pid) {

@@ -736,6 +736,50 @@ OPEN ─两名不同操作者对固定范围全部事件签署→ archive → AR
 - 页面"证据封存分发与离线校验"区提供名册管理、创建/撤销、令牌签发下载、留存校验与
   上传 zip 离线校验。
 
+### 接收回执与分发包生命周期(evidence_distribution_assignments / receipts / extensions)
+
+在已签署归档分发包之上管理**多授权接收方、接收回执、延期双人审批与到期生命周期**:
+
+- **多接收方分派**: 创建包时主接收方自动分派; 管理员(包创建者)可
+  `POST .../distributions/{id}/recipients {recipient, receipt_due_at?,
+  required_global_seqs?}` 追加接收方, 各自配置最晚回执时间(不得晚于包有效期)与必须
+  确认的事件范围(global_seq 必须全部在包内, 省略=包内全部事件)。重复分派
+  `recipient_already_assigned`、包外事件 `event_not_in_package`。
+- **回执提交** `POST .../distributions/{id}/receipts`: 接收方下载后必须提交, 类型
+  `SIGNED`(逐事件 CONFIRMED 且覆盖全部必须事件)/ `PARTIAL`(覆盖全部但至少一条
+  ANOMALY/REJECTED 且带说明)/ `REJECTED`(整包拒收, 必填原因)。服务端逐项校验:
+  - 身份: 操作者必须是该包已分派接收方本人, 否则 403 `recipient_forbidden`;
+  - 一次性令牌兑换结果: `download_id` 必须是本包、绑定并已由本人成功兑换的令牌
+    (`download_not_redeemed`/`download_redemption_mismatch`);
+  - 固定摘要: `package_id`/`manifest_hash`/`content_digest` 必须与库内固定值一致,
+    旧摘要/被篡改摘要 → `manifest_hash_mismatch`/`content_digest_mismatch`;
+  - 事件范围: 包外事件 `event_not_in_package`、超出本人必须范围
+    `event_outside_required_scope`、必须事件缺失 `required_events_missing`、
+    重复结论/异常无说明同样拒绝。
+  - 每事件确认结果(CONFIRMED/ANOMALY/REJECTED)、说明、操作者与时间逐条落库
+    (`..._receipt_events`); 回执一次性提交, 再次提交 `receipt_already_submitted`,
+    同一 idempotency_key 重放只返回**同一回执**。
+- **进度展示**: 详情与 `GET .../distributions/{id}/receipts` 返回每接收方状态
+  (PENDING/OVERDUE/SIGNED/PARTIAL/REJECTED)、最晚回执、回执结论与逐事件结果, 以及
+  整体 `receipt_progress`(总数/已完成/未完成接收方/签收/部分异常/拒收/逾期/异常原因)。
+- **延期双人审批**: `POST .../distributions/{id}/extensions {new_valid_until, reason}`
+  仅创建管理员可在回执截止前申请; 两名**不同且非申请人**的操作者分别
+  `POST /api/admin/evidence/extensions/{id}/approve`, 第二名通过时原子顺延包有效期与
+  未完成分派回执截止; `.../reject {reason}` 拒绝(赞成票留痕为 SUPERSEDED)。
+  同一操作者重复/并发审批去重(`approver_already_decided`, 唯一约束兜底);
+  **审批期间包状态变化(撤销/进入待处理)或摘要变化(manifest_hash/content_digest)
+  申请自动 INVALIDATED**, 审批时返回 `extension_basis_changed`。
+- **到期生命周期**: 后台 worker(可 `POST .../distributions/lifecycle/sweep` 手动触发)
+  扫描过有效期且仍有接收方未回执的包 → 库状态 **PENDING_PROCESS**(页面"待处理"),
+  未完成分派置 OVERDUE、未兑换令牌作废、审批中延期失效, **禁止继续下载与回执**
+  (`package_pending_process`), 已提交回执与原始归档摘要保持只读; 全部接收方按时完成
+  的包不进待处理(自然过期 EXPIRED)。
+- **恢复与重签**: 待处理包 `POST .../distributions/{id}/recover {new_valid_until|
+  extend_seconds}` 必须**重新校验留存包通过**才允许恢复(RECOVERED, 续期并重开逾期
+  接收方回执窗口; 校验失败 `recovery_verification_failed`); 重新签发走创建接口,
+  issue_no+1 产生**新的 package_id 与全新回执周期**, 旧包只读保留。撤销
+  (PENDING_PROCESS 也可撤销)后回执永久只读。历史包启动时自动补齐主接收方分派。
+
 ## 运行
 
 ```bash
@@ -905,13 +949,29 @@ GET  /api/admin/evidence/recipients[?status_filter=]
 POST /api/admin/evidence/distributions     {operator, idempotency_key, review_id, recipient,
                                             redaction_policy=NONE|STANDARD|FULL, valid_until?|ttl_seconds?}
                                             仅已归档复核单; 返回固定 package_id/manifest/content/签名摘要
-GET  /api/admin/evidence/distributions[?review_id=&recipient=&plan_id=&status_filter=ACTIVE|EXPIRED|REVOKED]
-GET  /api/admin/evidence/distributions/{package_id}[?operator=](仅授权接收方/创建管理员)
+GET  /api/admin/evidence/distributions[?review_id=&recipient=&plan_id=&status_filter=ACTIVE|EXPIRED|REVOKED|PENDING_PROCESS|RECOVERED]
+GET  /api/admin/evidence/distributions/{package_id}[?operator=](授权接收方(含已分派)/创建管理员)
 POST /api/admin/evidence/distributions/{package_id}/revoke {operator, idempotency_key, reason?}
-POST /api/admin/evidence/distributions/{package_id}/download-token {operator, idempotency_key, ttl_seconds?}
+POST /api/admin/evidence/distributions/{package_id}/download-token {operator, idempotency_key, ttl_seconds?, recipient?}
 GET  /api/admin/evidence/distribution-downloads/{token}?operator=   一次性, 绑定接收方
 GET  /api/admin/evidence/distributions/{package_id}/verify?operator= 重算留存包(逐项篡改位置)
 POST /api/admin/evidence/distributions/verify   (body=zip 二进制, 无身份; 独立离线校验)
+
+# ---- 多接收方 / 接收回执 / 延期审批 / 生命周期 ----
+POST /api/admin/evidence/distributions/{package_id}/recipients
+                   {operator, idempotency_key, recipient, receipt_due_at?, required_global_seqs?, note?}
+GET  /api/admin/evidence/distributions/{package_id}/receipts?operator=  整体回执进度/逐接收方/异常
+POST /api/admin/evidence/distributions/{package_id}/receipts
+                   {operator(=接收方), idempotency_key, download_id, manifest_hash, content_digest,
+                    receipt_type: SIGNED|PARTIAL|REJECTED, note?, events?: [{global_seq,result,note?}]}
+POST /api/admin/evidence/distributions/{package_id}/extensions
+                   {operator, idempotency_key, new_valid_until, reason?}  回执截止前申请延期
+POST /api/admin/evidence/extensions/{id}/approve {operator, idempotency_key}  两名不同非申请人
+POST /api/admin/evidence/extensions/{id}/reject  {operator, idempotency_key, reason}
+GET  /api/admin/evidence/extensions/{id}
+POST /api/admin/evidence/distributions/{package_id}/recover
+                   {operator, idempotency_key, new_valid_until?|extend_seconds?, reason?}  重新校验通过后恢复
+POST /api/admin/evidence/distributions/lifecycle/sweep {operator, idempotency_key}  到期扫描(worker 周期执行)
 ```
 
 幂等：所有管理动作要求 `idempotency_key`，重复执行返回首次结果（`replayed: true`），无副作用；

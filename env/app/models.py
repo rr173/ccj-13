@@ -1823,10 +1823,15 @@ class EvidenceReviewEvent(Base):
 # 分发接收方状态: ACTIVE 可接收/查看/下载; DISABLED 被停用(历史包保留, 不能再发新包)
 EVIDENCE_RECIPIENT_STATUSES = ("ACTIVE", "DISABLED")
 # 分发包状态机:
-#   ACTIVE   有效(未撤销; 是否可下载还看有效期与令牌)
+#   ACTIVE   有效(未撤销; 是否可下载还看有效期/回执到期与令牌)
 #   EXPIRED  有效期已过(派生状态, 库内仍为 ACTIVE, 由 valid_until 实时判定)
+#   PENDING_PROCESS 待处理(库内存量状态): 回执截止时仍有接收方未完成回执,
+#             自动进入; 禁止继续下载; 已提交回执与原始归档摘要只读;
+#             管理员重新校验通过并续期后恢复(RECOVERED), 或撤销后重新签发全新包
+#   RECOVERED 已恢复: 重新校验+续期后恢复回执/下载, 恢复只可能源自 PENDING_PROCESS
 #   REVOKED  被管理员撤销(终态; 不可下载, 但可离线校验; 可撤销后重新签发新包)
-EVIDENCE_DISTRIBUTION_STATUSES = ("ACTIVE", "REVOKED")
+EVIDENCE_DISTRIBUTION_STATUSES = ("ACTIVE", "PENDING_PROCESS", "RECOVERED",
+                                  "REVOKED")
 # 脱敏策略:
 #   NONE     不脱敏(包内事件保持规范化原貌)
 #   STANDARD 隐藏操作者与事件说明类字段(operator / payload.reason /
@@ -1838,6 +1843,39 @@ EVIDENCE_DISTRIBUTION_EVENTS = (
     "dist.create", "dist.idempotent_replay", "dist.reissue",
     "dist.revoke", "dist.download.issue", "dist.download.redeem",
     "dist.download.denied", "dist.verify.ok", "dist.verify.failed",
+    # 回执生命周期
+    "dist.recipient.assign", "dist.receipt.submit",
+    "dist.receipt.denied", "dist.receipt.overdue",
+    # 延期双人审批
+    "dist.extension.request", "dist.extension.approve",
+    "dist.extension.reject", "dist.extension.apply",
+    "dist.extension.invalidated",
+    # 待处理/恢复
+    "dist.pending", "dist.recover",
+)
+
+# 接收方分派状态: PENDING=尚未回执; OVERDUE=回执截止未回执(包进入待处理);
+#                SIGNED/PARTIAL/REJECTED=已提交对应回执(终态, 只读)
+EVIDENCE_ASSIGNMENT_STATUSES = ("PENDING", "OVERDUE", "SIGNED", "PARTIAL",
+                                "REJECTED")
+# 回执类型
+EVIDENCE_RECEIPT_TYPES = ("SIGNED", "PARTIAL", "REJECTED")
+# 逐事件确认结果
+EVIDENCE_RECEIPT_EVENT_RESULTS = ("CONFIRMED", "ANOMALY", "REJECTED")
+# 延期申请状态: PENDING=审批中; APPLIED=双人通过并已应用;
+#               REJECTED=被任一审批人拒绝; INVALIDATED=审批期间包状态/摘要变化失效
+EVIDENCE_EXTENSION_STATUSES = ("PENDING", "APPLIED", "REJECTED", "INVALIDATED")
+# 延期审批记录状态(只追加): APPROVED/REJECTED;
+# INVALIDATED=申请依据变化被系统失效; SUPERSEDED=申请被拒绝时其余通过留痕
+EVIDENCE_EXTENSION_DECISION_STATES = ("APPROVED", "REJECTED", "INVALIDATED",
+                                      "SUPERSEDED")
+# 延期申请所需独立审批人数(两名不同操作者)
+EVIDENCE_EXTENSION_REQUIRED_APPROVALS = 2
+# 延期审批失效原因(机器可读)
+EVIDENCE_EXTENSION_INVALID_REASONS = (
+    "package_status_changed",   # 包状态变化(撤销/进入待处理/已恢复/已被另一次延期应用)
+    "digest_changed",           # 包摘要变化(manifest_hash/content_digest)
+    "rejected_reset",           # 一名审批人拒绝, 已收集通过失效
 )
 
 
@@ -1914,6 +1952,9 @@ class EvidenceDistribution(Base):
     revoked_at = Column(DateTime, nullable=True)
     revoked_by = Column(String(128), nullable=True)
     revoke_reason = Column(String(500), nullable=True)
+    # 待处理 -> 恢复(重新校验通过后续期)的留痕
+    recovered_at = Column(DateTime, nullable=True)
+    recovered_by = Column(String(128), nullable=True)
     # 包产物
     package_path = Column(String(500), nullable=False)
     package_size = Column(Integer, nullable=False, default=0)
@@ -1932,6 +1973,15 @@ class EvidenceDistribution(Base):
     downloads = relationship("EvidenceDistributionDownload",
                              cascade="all, delete-orphan",
                              order_by="desc(EvidenceDistributionDownload.id)")
+    assignments = relationship("EvidenceDistributionAssignment",
+                               cascade="all, delete-orphan",
+                               order_by="EvidenceDistributionAssignment.id")
+    receipts = relationship("EvidenceDistributionReceipt",
+                            cascade="all, delete-orphan",
+                            order_by="EvidenceDistributionReceipt.id")
+    extensions = relationship("EvidenceDistributionExtension",
+                              cascade="all, delete-orphan",
+                              order_by="EvidenceDistributionExtension.id")
 
 
 class EvidenceDistributionEvent(Base):
@@ -1973,3 +2023,176 @@ class EvidenceDistributionDownload(Base):
     used_at = Column(DateTime, nullable=True)
     used_by = Column(String(128), nullable=True)
     revoked_at = Column(DateTime, nullable=True)           # 包撤销时连带作废
+
+
+class EvidenceDistributionAssignment(Base):
+    """分发包授权接收方分派(管理员为一个已签署归档包配置多个接收方):
+
+    - 每个接收方一行: 自带最晚回执时间(receipt_due_at)与必须确认的事件范围
+      (required_global_seqs, 必为包内事件的子集; 空列表表示全部包内事件);
+    - 创建包时主接收方(evidence_distributions.recipient_id)自动生成分派,
+      管理员可在包有效期内继续追加接收方;
+    - 接收方下载后针对固定 package_id/manifest_hash/content_digest 提交回执,
+      提交成功后分派进入终态 SIGNED/PARTIAL/REJECTED(只读);
+    - 回执截止仍未回执 -> OVERDUE, 同时包整体进入 PENDING_PROCESS(待处理)。"""
+
+    __tablename__ = "evidence_distribution_assignments"
+    __table_args__ = (
+        UniqueConstraint("distribution_id", "recipient_id",
+                         name="uq_evidence_dist_assignment_recipient"),
+        Index("ix_evidence_dist_assign_recipient", "recipient_id"),
+    )
+
+    id = Column(String(34), primary_key=True)               # "EDA" + 随机串
+    distribution_id = Column(String(32),
+                             ForeignKey("evidence_distributions.id"),
+                             nullable=False, index=True)
+    recipient_id = Column(String(64), ForeignKey("evidence_recipients.id"),
+                          nullable=False)
+    # 该接收方必须确认的事件范围(global_seq 列表, 创建时固化, 必为包内事件);
+    # 空列表等价于"包内全部事件"(避免在每行冗余全量序号)。
+    required_global_seqs = Column(JSON, nullable=False, default=list)
+    # 该接收方最晚回执时间(默认包 valid_until, 可单独配置; 延期随包顺延)
+    receipt_due_at = Column(DateTime, nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="PENDING", index=True)
+    assigned_by = Column(String(128), nullable=False)
+    note = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    receipt = relationship("EvidenceDistributionReceipt", uselist=False,
+                           cascade="all, delete-orphan",
+                           back_populates="assignment")
+
+
+class EvidenceDistributionReceipt(Base):
+    """接收回执(一次性, 提交后只读): 针对固定 package_id/manifest_hash/
+    content_digest 提交, 同时固化兑换成功的一次性下载令牌结果。
+
+    - SIGNED=签收: 每个必须确认的事件都有一条 CONFIRMED;
+    - PARTIAL=部分异常: 每个必须确认的事件都有结论, 但至少一条 ANOMALY/REJECTED;
+    - REJECTED=拒收: 整包拒收(必须带原因), 不要求逐事件结论。
+    逐事件结论在 EvidenceDistributionReceiptEvent; 重复提交同一幂等键只回显首次结果;
+    摘要不匹配/非授权接收方/包外事件一律拒绝, 拒绝不产生本行。"""
+
+    __tablename__ = "evidence_distribution_receipts"
+    __table_args__ = (
+        UniqueConstraint("assignment_id", name="uq_evidence_receipt_assignment"),
+        Index("ix_evidence_receipt_dist", "distribution_id"),
+    )
+
+    id = Column(String(34), primary_key=True)               # "EDR" + 随机串
+    distribution_id = Column(String(32),
+                             ForeignKey("evidence_distributions.id"),
+                             nullable=False, index=True)
+    assignment_id = Column(String(34),
+                           ForeignKey("evidence_distribution_assignments.id"),
+                           nullable=False)
+    recipient_id = Column(String(64), nullable=False, index=True)
+    receipt_type = Column(String(16), nullable=False)       # SIGNED|PARTIAL|REJECTED
+    # 提交时固定回显并校验的包摘要(拒绝旧摘要)
+    package_id_confirmed = Column(String(32), nullable=False)
+    manifest_hash = Column(String(64), nullable=False)
+    content_digest = Column(String(64), nullable=False)
+    # 一次性令牌兑换结果(必须存在且已由该接收方成功兑换)
+    download_id = Column(String(48), nullable=False)
+    download_token_hash = Column(String(64), nullable=False)
+    redeemed_at = Column(DateTime, nullable=False)
+    note = Column(String(2000), nullable=True)              # 整包说明(拒收必填)
+    # 逐事件汇总
+    total_required = Column(Integer, nullable=False, default=0)
+    confirmed_count = Column(Integer, nullable=False, default=0)
+    anomaly_count = Column(Integer, nullable=False, default=0)
+    rejected_event_count = Column(Integer, nullable=False, default=0)
+    anomalies = Column(JSON, nullable=False, default=list)  # 异常原因摘要(进度展示)
+    submitted_by = Column(String(128), nullable=False)
+    submitted_at = Column(DateTime, default=_utcnow, index=True)
+
+    assignment = relationship("EvidenceDistributionAssignment",
+                              back_populates="receipt")
+    events = relationship("EvidenceDistributionReceiptEvent",
+                          cascade="all, delete-orphan",
+                          order_by="EvidenceDistributionReceiptEvent.id")
+
+
+class EvidenceDistributionReceiptEvent(Base):
+    """回执逐事件确认结果(只追加): 每个被确认事件一行, 保存确认结果、
+    说明、操作者与时间。随回执整体只读。"""
+
+    __tablename__ = "evidence_distribution_receipt_events"
+    __table_args__ = (
+        UniqueConstraint("receipt_id", "global_seq",
+                         name="uq_evidence_receipt_event_seq"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    receipt_id = Column(String(34),
+                        ForeignKey("evidence_distribution_receipts.id"),
+                        nullable=False, index=True)
+    global_seq = Column(Integer, nullable=False, index=True)
+    result = Column(String(16), nullable=False)             # CONFIRMED|ANOMALY|REJECTED
+    note = Column(String(2000), nullable=True)              # 异常/拒收说明
+    operator = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class EvidenceDistributionExtension(Base):
+    """回执延期申请及双人审批(只追加申请/审批记录):
+
+    - 管理员(包创建者)在回执截止前申请延期(new_valid_until 必须晚于当前有效期);
+    - 必须收集同一申请内两名**不同操作者**且均不是申请人的独立 APPROVED,
+      第二名审批通过时原子应用: 包 valid_until 与未完成分派 receipt_due_at 顺延;
+    - 任一审批人拒绝(带原因) -> REJECTED(终态, 可重新申请);
+    - 审批期间包状态变化(撤销/进入待处理/恢复/已被另一次延期应用)或摘要变化
+      (manifest_hash/content_digest) -> INVALIDATED, 已收集审批全部失效;
+    - (申请, 审批人)唯一约束兜底并发去重: 同一操作者重复/并发点击只计一次。"""
+
+    __tablename__ = "evidence_distribution_extensions"
+    __table_args__ = (
+        Index("ix_evidence_ext_dist", "distribution_id", "status"),
+    )
+
+    id = Column(String(34), primary_key=True)               # "EDE" + 随机串
+    distribution_id = Column(String(32),
+                             ForeignKey("evidence_distributions.id"),
+                             nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="PENDING", index=True)
+    current_valid_until = Column(DateTime, nullable=False)  # 申请时有效期
+    new_valid_until = Column(DateTime, nullable=False)      # 申请延期至
+    # 申请时固化的审批依据(第二名审批前实时复核)
+    basis = Column(JSON, nullable=False)
+    requested_by = Column(String(128), nullable=False)
+    reason = Column(String(500), nullable=True)
+    idempotency_key = Column(String(128), nullable=True, unique=True)
+    applied_at = Column(DateTime, nullable=True)
+    invalidated_reason = Column(String(48), nullable=True)  # EVIDENCE_EXTENSION_INVALID_REASONS
+    invalidated_at = Column(DateTime, nullable=True)
+    rejected_by = Column(String(128), nullable=True)
+    rejected_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+
+    approvals = relationship("EvidenceDistributionExtensionApproval",
+                             cascade="all, delete-orphan",
+                             order_by="EvidenceDistributionExtensionApproval.id")
+
+
+class EvidenceDistributionExtensionApproval(Base):
+    """延期申请的单条审批结论(只追加): APPROVED/REJECTED 为原始结论;
+    INVALIDATED/SUPERSEDED 为申请失效/被拒时对其余通过记录的终态化留痕。"""
+
+    __tablename__ = "evidence_distribution_extension_approvals"
+    __table_args__ = (
+        # 同一申请同一审批人只有一条结论: 并发双人审批去重的数据库兜底
+        UniqueConstraint("extension_id", "operator",
+                         name="uq_evidence_ext_approval_operator"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    extension_id = Column(String(34),
+                          ForeignKey("evidence_distribution_extensions.id"),
+                          nullable=False, index=True)
+    decision = Column(String(16), nullable=False)
+    operator = Column(String(128), nullable=False)
+    reason = Column(String(500), nullable=True)            # REJECTED 时必填
+    basis = Column(JSON, nullable=True)                    # 审批时复核依据
+    created_at = Column(DateTime, default=_utcnow)

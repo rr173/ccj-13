@@ -410,3 +410,59 @@ class EvidenceDistributionTokenIssue(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
     ttl_seconds: Optional[int] = Field(default=None, ge=30, le=86_400)
+    # 多接收方: 管理员可指定为任一已分派接收方代签(默认包主接收方)
+    recipient: Optional[str] = Field(default=None, min_length=1, max_length=64)
+
+
+# ---------- 多接收方分派 / 接收回执 / 延期审批 / 生命周期 ----------
+
+class EvidenceAssignmentCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    recipient: str = Field(min_length=1, max_length=64)
+    receipt_due_at: Optional[str] = None    # ISO 8601; 默认包 valid_until, 不得晚于它
+    required_global_seqs: Optional[list[int]] = None  # 必须确认事件; 省略=包内全部
+    note: Optional[str] = Field(default=None, max_length=500)
+
+
+class EvidenceReceiptEventItem(BaseModel):
+    global_seq: int = Field(ge=1)
+    result: str = Field(min_length=1)        # CONFIRMED | ANOMALY | REJECTED
+    note: Optional[str] = Field(default=None, max_length=2000)
+
+
+class EvidenceReceiptSubmit(BaseModel):
+    operator: str = Field(min_length=1)                       # 必须为已分派接收方本人
+    idempotency_key: str = Field(min_length=1)
+    download_id: str = Field(min_length=1)                    # 已成功兑换的一次性令牌 id
+    manifest_hash: str = Field(min_length=64, max_length=64)  # 固定包摘要
+    content_digest: str = Field(min_length=64, max_length=64)
+    receipt_type: str = Field(min_length=1)                   # SIGNED | PARTIAL | REJECTED
+    note: Optional[str] = Field(default=None, max_length=2000)
+    events: Optional[list[EvidenceReceiptEventItem]] = None
+
+
+class EvidenceExtensionRequest(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    new_valid_until: str = Field(min_length=1)                # ISO 8601, 必须晚于当前有效期
+    reason: Optional[str] = Field(default=None, max_length=500)
+
+
+class EvidenceExtensionApproval(BaseModel):
+    operator: str = Field(min_length=1)                       # 不能是申请人; 两名不同操作者
+    idempotency_key: str = Field(min_length=1)
+
+
+class EvidenceExtensionReject(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    reason: str = Field(min_length=1, max_length=500)
+
+
+class EvidenceDistributionRecover(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    new_valid_until: Optional[str] = None    # ISO 8601; 与 extend_seconds 二选一
+    extend_seconds: Optional[int] = Field(default=None, ge=60, le=31_536_000)
+    reason: Optional[str] = Field(default=None, max_length=500)
