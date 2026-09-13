@@ -247,3 +247,39 @@ class QualityExemptionRevoke(BaseModel):
     idempotency_key: str = Field(min_length=1)
     plan_id: str = Field(min_length=1)
     reason: str = Field(min_length=1)
+
+
+# ---------- 审计事件回放与补偿 ----------
+
+class AuditEventNote(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)       # 显式补录去重键
+    content: str = Field(min_length=1, max_length=2000)
+    event_ts: Optional[str] = None                  # ISO 8601(默认当前; 乱序超阈值拒绝)
+    plan_id: Optional[str] = None
+    batch_id: Optional[str] = None
+
+
+class AuditSnapshotCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    plan_id: str = Field(min_length=1)
+    target_at: Optional[str] = None                # ISO 8601(默认计划终结时间)
+    ttl_seconds: Optional[int] = Field(default=None, ge=60, le=30 * 24 * 3600)
+
+
+class CompensationCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    snapshot_id: str = Field(min_length=1)
+
+
+class CompensationAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+
+
+class CompensationRetry(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    action_seq: int = Field(ge=1)

@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
@@ -7,21 +8,24 @@ from sqlalchemy.orm import Session
 
 from .db import Base, SessionLocal, engine
 from .models import (
-    REVIEW_STATUSES, ArchiveCleanupPlan, AuditLog, MigrationBatch, MigrationPlan,
-    QUALITY_ISSUE_STATUSES, QUALITY_SCAN_STATUSES, QualityScan, RecordNew,
-    RecordOld, ReplayArchive, ReplayBatchOp, ReplayCheckpoint, ReplayTask,
+    REVIEW_STATUSES, ArchiveCleanupPlan, AuditLog, AuditSnapshot,
+    CompensationTask, MigrationBatch, MigrationPlan, QUALITY_ISSUE_STATUSES,
+    QUALITY_SCAN_STATUSES, QualityScan, RecordNew, RecordOld, ReplayArchive,
+    ReplayBatchOp, ReplayCheckpoint, ReplayTask,
 )
 from .plans import PlanWorker
 from .quality import QualityWorker
 from .replay import ReplayWorker
-from . import archives, cleanup, plans, quality, replay, service
+from . import archives, auditreplay, cleanup, plans, quality, replay, service
 from .schemas import (
-    AdminAction, ArchiveAction, ArchiveCreate, ArchiveRetention, BatchCreate,
-    CheckpointCreate, CleanupAction, CleanupCreate, PlanAction, PlanCreate,
-    PlanRejectAction, PlanWindowAction, QualityExemptionCreate,
-    QualityExemptionRevoke, QualityFixCreate, QualityRulesSave, QualityScanAction,
-    QualityScanCreate, RecordIn, RecoverAction, ReplayAction, ReplayCreate,
-    ReviewBatchAssign, ReviewBatchReview, ReviewConfirm, ReviewReopen, ReviewSubmit,
+    AdminAction, ArchiveAction, ArchiveCreate, ArchiveRetention,
+    AuditEventNote, AuditSnapshotCreate, BatchCreate, CheckpointCreate, CleanupAction,
+    CleanupCreate, CompensationAction, CompensationCreate, CompensationRetry,
+    PlanAction, PlanCreate, PlanRejectAction, PlanWindowAction,
+    QualityExemptionCreate, QualityExemptionRevoke, QualityFixCreate,
+    QualityRulesSave, QualityScanAction, QualityScanCreate, RecordIn,
+    RecoverAction, ReplayAction, ReplayCreate, ReviewBatchAssign,
+    ReviewBatchReview, ReviewConfirm, ReviewReopen, ReviewSubmit,
 )
 
 APP_VERSION = service.APP_VERSION
@@ -38,6 +42,7 @@ replay_worker = ReplayWorker()
 archive_worker = archives.ArchiveWorker()
 cleanup_worker = cleanup.CleanupWorker()
 quality_worker = QualityWorker()
+compensation_worker = auditreplay.CompensationWorker()
 
 
 def get_db():
@@ -174,6 +179,10 @@ def startup():
         # 质量扫描重启对账: 遗留 RUNNING 扫描回到排队, RUNNING 批次复位 PENDING
         quality.boot_recover_scans(db)
         db.commit()
+        # 补偿任务重启对账: 遗留 RUNNING 回排队, UNDO_RUNNING 回 UNDO_PARTIAL,
+        # 动作进度/失败原因/撤销镜像全部保留, worker 从安全位置续跑
+        auditreplay.boot_recover_compensation(db)
+        db.commit()
         archives.ensure_store_dir()
     finally:
         db.close()
@@ -183,6 +192,7 @@ def startup():
         archive_worker.start()
         cleanup_worker.start()
         quality_worker.start()
+        compensation_worker.start()
 
 
 @app.on_event("shutdown")
@@ -192,6 +202,7 @@ def shutdown():
     archive_worker.stop()
     cleanup_worker.stop()
     quality_worker.stop()
+    compensation_worker.stop()
 
 
 # ---------- 错误映射 ----------
@@ -234,6 +245,17 @@ def status(db: Session = Depends(get_db)):
         "cleanup_plans": [cleanup.plan_to_dict(db, p, with_items=False)
                           for p in cleanup_rows],
         "quality": quality.quality_status_overview(db),
+        "audit_snapshots": [auditreplay.snapshot_to_dict(s) for s in
+                            (db.query(AuditSnapshot)
+                             .order_by(AuditSnapshot.created_at.desc(),
+                                       AuditSnapshot.id.desc()).limit(20).all())],
+        "compensations": [auditreplay.task_to_dict(t, with_actions=False,
+                                                   with_events=False)
+                          for t in (db.query(CompensationTask)
+                                    .order_by(CompensationTask.created_at.desc(),
+                                              CompensationTask.id.desc())
+                                    .limit(20).all())],
+        "compensation_concurrency": auditreplay.max_concurrency(),
         "replay_concurrency": replay.max_concurrency(),
         "archive_concurrency": archives.max_concurrency(),
         "quality_concurrency": quality.max_concurrency(),
@@ -1196,6 +1218,285 @@ def cancel_cleanup_plan(plan_id: str, body: CleanupAction,
                         lambda s, p: cleanup.do_cancel(s, p, body.operator), plan_id)
 
 
+# ---------- 审计事件回放与补偿(统一事件流 / 快照校验 / 补偿执行撤销) ----------
+
+def _audit_replay_not_found(e: Exception):
+    raise HTTPException(status_code=404, detail={
+        "error": "audit_replay_not_found", "reason": str(e)})
+
+
+def _audit_replay_conflict(e: Exception):
+    raise HTTPException(status_code=409, detail={
+        "error": "audit_replay_conflict", "reason": str(e)})
+
+
+def _parse_iso(value: str | None, field: str):
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_timestamp",
+            "reason": f"{field} 不是合法的 ISO 8601 时间: {value!r}"})
+    if dt.tzinfo is not None:
+        from datetime import timezone as _tz
+        dt = dt.astimezone(_tz.utc).replace(tzinfo=None)
+    return dt
+
+
+@app.get("/api/admin/audit-events")
+def list_audit_events(plan_id: str | None = None, batch_id: str | None = None,
+                      start_ts: str | None = None, end_ts: str | None = None,
+                      event_type: str | None = None,
+                      after_global_seq: int | None = None,
+                      limit: int = 50, db: Session = Depends(get_db)):
+    """统一审计事件链分页查询(keyset, 按 global_seq 升序)。
+
+    可按计划(计划流, stream_seq 连续)、批次(批次流+投影, 按 correlation 折叠)、
+    时间范围(闭区间)与事件类型过滤; after_global_seq 翻页。"""
+    if event_type is not None and event_type not in auditreplay.AUDIT_EVENT_TYPES:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_event_type",
+            "reason": f"事件类型必须是 {list(auditreplay.AUDIT_EVENT_TYPES)} 之一"})
+    return auditreplay.query_events(
+        db, plan_id=plan_id, batch_id=batch_id,
+        start_ts=_parse_iso(start_ts, "start_ts"),
+        end_ts=_parse_iso(end_ts, "end_ts"), event_type=event_type,
+        limit=limit, after_global_seq=after_global_seq)
+
+
+@app.post("/api/admin/audit-events", status_code=201)
+def add_audit_event_note(body: AuditEventNote, db: Session = Depends(get_db)):
+    """运维显式补录备注事件(EXTERNAL_NOTE, 唯一允许直接写入的类型)。
+
+    补录到计划流/批次流/全局流; 时间戳早于流上一事件超过容忍阈值(乱序) -> 409;
+    同一 idempotency_key 重放返回首次结果(不产生第二个顺序号)。"""
+    try:
+        result, replayed = auditreplay.run_comp_action(
+            db, action="event.note", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            fn=lambda s, _t: auditreplay.append_external_note(
+                s, operator=body.operator, content=body.content,
+                event_ts=_parse_iso(body.event_ts, "event_ts"),
+                plan_id=body.plan_id, batch_id=body.batch_id,
+                dedupe_key=body.idempotency_key))
+    except auditreplay.AuditEventRejected as e:
+        db.rollback()
+        _audit_replay_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/audit-snapshots", status_code=201)
+def create_audit_snapshot(body: AuditSnapshotCreate,
+                          db: Session = Depends(get_db)):
+    """对已 COMPLETED/CANCELED 计划在目标时间点生成回放快照并校验。
+
+    校验事件连续性、哈希链、乱序、规则版本与批次版本及目标时点状态一致性;
+    不满足时快照 REJECTED(逐条原因)且 HTTP 422; 幂等键重放返回首次快照。"""
+    target_at = _parse_iso(body.target_at, "target_at")
+
+    def _do(s, _t):
+        try:
+            snap = auditreplay.create_snapshot(
+                s, operator=body.operator, plan_id=body.plan_id,
+                target_at=target_at, ttl_seconds=body.ttl_seconds)
+        except auditreplay.AuditReplayNotFound:
+            raise
+        out = auditreplay.snapshot_to_dict(snap)
+        if snap.status == "REJECTED":
+            raise _SnapshotRejected(out)
+        return out
+
+    try:
+        result, replayed = auditreplay.run_comp_action(
+            db, action="snapshot.create", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            snapshot_id=None, fn=_do)
+    except auditreplay.AuditReplayNotFound as e:
+        db.rollback()
+        _audit_replay_not_found(e)
+    except _SnapshotRejected as e:
+        db.commit()  # REJECTED 快照仍持久化保留可查
+        raise HTTPException(status_code=422, detail={
+            "error": "snapshot_rejected",
+            "reason": "快照校验未通过, 已拒绝生成(REJECTED 快照已保留可查)",
+            "snapshot": e.detail})
+    result["replayed"] = replayed
+    return result
+
+
+class _SnapshotRejected(Exception):
+    def __init__(self, detail: dict):
+        super().__init__("snapshot rejected")
+        self.detail = detail
+
+
+@app.get("/api/admin/audit-snapshots")
+def list_audit_snapshots(plan_id: str | None = None,
+                         status_filter: str | None = None,
+                         limit: int = 50, db: Session = Depends(get_db)):
+    q = db.query(AuditSnapshot)
+    if plan_id:
+        q = q.filter(AuditSnapshot.plan_id == plan_id)
+    if status_filter:
+        if status_filter not in auditreplay.AUDIT_SNAPSHOT_STATUSES:
+            raise HTTPException(status_code=422, detail={
+                "error": "invalid_snapshot_status",
+                "reason": f"快照状态必须是 {list(auditreplay.AUDIT_SNAPSHOT_STATUSES)}"})
+        q = q.filter(AuditSnapshot.status == status_filter)
+    rows = (q.order_by(AuditSnapshot.created_at.desc(), AuditSnapshot.id.desc())
+            .limit(min(max(1, limit), 200)).all())
+    return [auditreplay.snapshot_to_dict(s) for s in rows]
+
+
+@app.get("/api/admin/audit-snapshots/{snapshot_id}")
+def get_audit_snapshot(snapshot_id: str, with_events: bool = True,
+                       db: Session = Depends(get_db)):
+    snap = db.get(AuditSnapshot, snapshot_id)
+    if snap is None:
+        _audit_replay_not_found(Exception(f"回放快照 {snapshot_id} 不存在"))
+    return auditreplay.snapshot_to_dict(snap, with_events=with_events,
+                                        session=db)
+
+
+@app.get("/api/admin/audit-snapshots/{snapshot_id}/preview")
+def preview_snapshot_actions(snapshot_id: str, db: Session = Depends(get_db)):
+    """预览快照中的待补偿动作(纯计算, 不落库): 动作类型/目标/预期/当前/门禁。"""
+    snap = db.get(AuditSnapshot, snapshot_id)
+    if snap is None:
+        _audit_replay_not_found(Exception(f"回放快照 {snapshot_id} 不存在"))
+    if snap.status != "VALID":
+        raise HTTPException(status_code=409, detail={
+            "error": "snapshot_rejected",
+            "reason": "REJECTED 快照不允许预览补偿动作",
+            "reasons": snap.reasons})
+    return {"snapshot_id": snap.id, "plan_id": snap.plan_id,
+            "plan_status": snap.plan_status_at_create, "expired":
+            auditreplay.is_expired(snap),
+            "actions": auditreplay.derive_actions(db, snap)}
+
+
+@app.post("/api/admin/compensations", status_code=201)
+def create_compensation(body: CompensationCreate, db: Session = Depends(get_db)):
+    """基于 VALID 快照创建补偿任务(动作落 PENDING 并排队)。
+
+    同快照同时至多一个非终态任务, 重复创建幂等返回已有任务; REJECTED 快照拒绝。"""
+    try:
+        result, replayed = auditreplay.run_comp_action(
+            db, action="comp.create", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            snapshot_id=body.snapshot_id,
+            fn=lambda s, _t: auditreplay.task_to_dict(
+                auditreplay.create_task(
+                    s, operator=body.operator, snapshot_id=body.snapshot_id)))
+    except auditreplay.AuditReplayNotFound as e:
+        db.rollback()
+        _audit_replay_not_found(e)
+    except auditreplay.AuditReplayStateError as e:
+        db.rollback()
+        _audit_replay_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.get("/api/admin/compensations")
+def list_compensations(plan_id: str | None = None,
+                       snapshot_id: str | None = None,
+                       status_filter: str | None = None,
+                       db: Session = Depends(get_db)):
+    q = db.query(CompensationTask)
+    if plan_id:
+        q = q.filter(CompensationTask.plan_id == plan_id)
+    if snapshot_id:
+        q = q.filter(CompensationTask.snapshot_id == snapshot_id)
+    if status_filter:
+        if status_filter not in auditreplay.COMP_TASK_STATUSES:
+            raise HTTPException(status_code=422, detail={
+                "error": "invalid_comp_status",
+                "reason": f"补偿任务状态必须是 {list(auditreplay.COMP_TASK_STATUSES)}"})
+        q = q.filter(CompensationTask.status == status_filter)
+    rows = (q.order_by(CompensationTask.created_at.desc(),
+                       CompensationTask.id.desc()).limit(200).all())
+    return [auditreplay.task_to_dict(t, with_actions=False, with_events=False)
+            for t in rows]
+
+
+@app.get("/api/admin/compensations/{task_id}")
+def get_compensation(task_id: str, db: Session = Depends(get_db)):
+    task = db.get(CompensationTask, task_id)
+    if task is None:
+        _audit_replay_not_found(Exception(f"补偿任务 {task_id} 不存在"))
+    return auditreplay.task_to_dict(task)
+
+
+def _run_comp_task(db: Session, body, fn, task_id: str, action: str):
+    try:
+        result, replayed = auditreplay.run_comp_action(
+            db, action=action, operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            task_id=task_id, fn=fn)
+    except auditreplay.AuditReplayNotFound as e:
+        db.rollback()
+        _audit_replay_not_found(e)
+    except auditreplay.AuditReplayStateError as e:
+        db.rollback()
+        _audit_replay_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/compensations/{task_id}/execute")
+def execute_compensation(task_id: str, body: CompensationAction,
+                         db: Session = Depends(get_db)):
+    """幂等执行任务全部待补偿动作(逐动作独立事务; 部分失败停 PARTIAL 不回滚)。
+
+    每动作执行前实时复核质量门禁, 不通过则该动作 FAILED(gate_blocked);
+    CANCELED 计划动作被拒绝; 快照过期拒绝执行。重复请求幂等, 不重复写入。"""
+    return _run_comp_task(
+        db, body,
+        lambda s, _t: auditreplay.task_to_dict(
+            auditreplay.execute_all(s, task_id, body.operator)),
+        task_id, "comp.execute")
+
+
+@app.post("/api/admin/compensations/{task_id}/retry")
+def retry_compensation_action(task_id: str, body: CompensationRetry,
+                              db: Session = Depends(get_db)):
+    """逐动作失败重试(仅 FAILED): 重新过门禁, 成功不重复写入(确定性动作键)。
+
+    不走通用幂等封装: 重试可能被多次调用直到成功, 幂等性由动作状态机
+    (SUCCESS 直接返回 / FAILED 才可重试)与确定性 action_key 保证。"""
+    try:
+        action = auditreplay.retry_action(db, task_id, body.action_seq,
+                                          body.operator)
+        task = auditreplay.get_task(db, task_id)
+        result = auditreplay.action_to_dict(action)
+        result["task_id"] = task_id
+        result["task_status"] = task.status
+        db.commit()
+    except auditreplay.AuditReplayNotFound as e:
+        db.rollback()
+        _audit_replay_not_found(e)
+    except auditreplay.AuditReplayStateError as e:
+        db.rollback()
+        _audit_replay_conflict(e)
+    return result
+
+
+@app.post("/api/admin/compensations/{task_id}/undo")
+def undo_compensation(task_id: str, body: CompensationAction,
+                      db: Session = Depends(get_db)):
+    """整体撤销: 对全部已成功动作按逆序用执行前镜像恢复现场(只追加 COMP_UNDONE,
+    关联原执行事件)。撤销不被快照 TTL/门禁卡死; 部分撤销失败停 UNDO_PARTIAL。"""
+    return _run_comp_task(
+        db, body,
+        lambda s, _t: auditreplay.task_to_dict(
+            auditreplay.undo_all(s, task_id, body.operator)),
+        task_id, "comp.undo")
+
+
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------
 
 def _reject_writes(batch: MigrationBatch):
@@ -1231,6 +1532,12 @@ def create_old(rec: RecordIn, db: Session = Depends(get_db)):
                or old.tags_csv != rec.tags_csv)
     row = RecordOld(id=rec.id, name=rec.name, email=rec.email, tags_csv=rec.tags_csv)
     db.merge(row)
+    # 批次范围内写入投影为 BATCH_WRITE 事件(仅活动计划流 + 批次流, 跨计划隔离)
+    if batch is not None:
+        from . import auditreplay
+        auditreplay.emit_batch_write(
+            db, batch=batch, record_id=rec.id, path="old",
+            record=service.old_to_dict(row), operator="api", changed=changed)
     db.commit()
     rescans = []
     if changed and batch is not None:
@@ -1259,6 +1566,10 @@ def create_new(rec: RecordIn, db: Session = Depends(get_db)):
     row = RecordNew(id=rec.id, name=rec.name, email=rec.email,
                     tags=rec.tags or [], schema_version=2)
     db.merge(row)
+    from . import auditreplay
+    auditreplay.emit_batch_write(
+        db, batch=batch, record_id=rec.id, path="new",
+        record=service.new_to_dict(row), operator="api", changed=True)
     db.commit()
     return {"ok": True, "structure": "new", "id": rec.id, "batch_id": batch.id}
 

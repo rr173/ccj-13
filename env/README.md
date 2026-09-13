@@ -458,6 +458,80 @@ QUEUED ─claim(单 RUNNING 串行)─▶ RUNNING ─全部项处理完─▶ CO
   历史按钮), 质量门禁区显示每个扫描的"自动重扫/手动扫描"标记、触发来源、
   取代扫描、受影响批次、合并触发次数, 以及暂停与自动恢复历史。
 
+## 审计事件回放与补偿(不可变事件流 / 时间点快照 / 补偿执行撤销)
+
+在质量门禁与迁移计划之上新增统一的不可变审计事件流, 并基于它提供时间点回放快照、
+快照校验与待补偿动作的预览/执行/重试/撤销。
+
+### 统一事件流(audit_events)
+
+- 只追加, 任何代码路径都不允许 UPDATE/DELETE; 补偿只追加 `COMP_*` 事件, 不改原事件。
+- 每个事件带:
+  - `global_seq`: 全库严格递增顺序号(插入加锁分配);
+  - `stream_key` / `stream_seq`: 计划相关事件以 `plan_id` 为流键, 批次写事件以
+    `batch:<id>` 为流键, 备注落到 `global`; 单流 seq 从 1 连续递增;
+  - `stream_hash`: 单流哈希链(含 seq/类型/关联 id/载荷/时间戳/操作者/前哈希),
+    篡改或丢失事件即断链;
+  - `correlation_id`: 同一逻辑事件扇出到计划流与批次流时共享, 批次查询据此折叠;
+  - `dedupe_key`: 投影去重, 重复请求/幂等重放返回同一行(不产生第二个顺序号)。
+- 事件类型: `BATCH_WRITE`(批次内记录写入)、`BATCH_CREATE/FREEZE/VALIDATE/CUTOVER/
+  RECOVER/ATTACH`、`RULE_CHANGED`、`SCAN_STATUS`、`QUALITY_HOLD`、
+  `PLAN_ADVANCE`、`PLAN_CANCEL`、`COMP_EXECUTED/COMP_FAILED/COMP_UNDONE`,
+  以及唯一允许运维直接写入的 `EXTERNAL_NOTE`(显式补录备注)。
+- 查询: `GET /api/admin/audit-events` 支持按计划(连续 seq)、批次(批次流+计划流投影,
+  按 correlation 折叠并标注 `other_plan_ids`)、时间范围(闭区间)、事件类型过滤,
+  keyset 分页(`after_global_seq`)。补录备注 `POST /api/admin/audit-events`,
+  时间戳早于流上一事件超过 `AUDIT_MAX_OUT_OF_ORDER_SECONDS`(默认 300s)按乱序拒绝。
+
+### 时间点快照(audit_snapshots)
+
+运维对已 `COMPLETED`/`CANCELED` 的计划选择时间点生成快照
+(`POST /api/admin/audit-snapshots`, `target_at` 缺省取计划终结事件时间)。
+快照逐行固化事件副本(`audit_snapshot_events`)与每个步骤批次的目标时点基线
+(`audit_snapshot_batches`, 含预期阶段/epoch/freeze_version 与旧表全量基线)。
+
+生成即校验, 任一不满足快照置 `REJECTED`(仍持久化可查, HTTP 422 并逐条给原因),
+通过为 `VALID` 并带 TTL(`AUDIT_SNAPSHOT_TTL_SECONDS`, 默认 86400):
+
+| 原因码 | 含义 |
+| --- | --- |
+| `plan_not_terminal` | 计划尚未 COMPLETED/CANCELED, 或流中找不到终结事件 |
+| `target_before_end` | 目标时间早于计划终结时间 |
+| `stream_gap` | 计划流 stream_seq 不连续(有缺口), 缺失序号随原因返回 |
+| `chain_broken` | 哈希链重算不一致(事件被篡改/丢失), 断链位置随原因返回 |
+| `out_of_order` | 事件时间戳倒流超过容忍阈值(乱序事件) |
+| `rule_version_gap` | 规则版本倒挂/跳号、引用的版本不存在或内容摘要不一致 |
+| `batch_version_gap` | 批次 epoch 增量不连续/倒挂, 或 freeze_version 不一致 |
+| `batch_state_drift` | 目标时点批次预期状态与当前批次行不一致(回放无法还原) |
+
+### 补偿任务(compensation_tasks / compensation_actions)
+
+`GET .../preview` 从快照基线推导待补偿动作(纯计算, 不落库):
+`record_backfill`(新表缺失/不一致, 按转换规则回填修正)、`record_cleanup`
+(基线外多余新表记录, 删除)、`batch_unfreeze`(取消计划中仍 FROZEN 等的批次恢复
+NORMAL)。`POST /api/admin/compensations` 基于 VALID 快照创建任务(动作落 PENDING)。
+
+- **不越过质量门禁**: 每个动作执行前实时复核该计划质量门禁, 门禁非
+  PASS/NOT_CONFIGURED 时该动作 FAILED(`gate_status` 记录状态), 不产生副作用;
+  门禁恢复后可逐动作重试。
+- **计划取消后拒绝补偿**: CANCELED 计划的快照可预览但 `execution_allowed=false`,
+  执行时每个动作 FAILED(`PLAN_CANCELED`)。
+- **幂等执行**: 动作带确定性 `action_key`(快照+类型+批次+记录), 同快照同时至多
+  一个非终态任务(部分唯一索引兜底), 重复请求返回首次结果, 不重复写入。
+- **逐动作失败重试**: `POST .../{task_id}/retry`(仅 FAILED), 动作逐个独立事务,
+  部分失败停 `PARTIAL`, 已成功动作不回滚。
+- **整体撤销**: `POST .../{task_id}/undo` 对 SUCCESS 动作按 seq 逆序用执行时捕获的
+  `before_image` 恢复现场, 只追加 `COMP_UNDONE` 并关联原 `COMP_EXECUTED` 事件;
+  撤销不被快照 TTL/门禁卡死, 部分撤销失败停 `UNDO_PARTIAL` 可继续。
+- **快照过期**: VALID 快照超过 `expires_at` 后执行/重试被 409 拒绝(撤销不受限)。
+- **重启续跑**: 遗留 RUNNING 任务回 QUEUED、UNDO_RUNNING 回 UNDO_PARTIAL,
+  动作状态/进度/失败原因/撤销镜像全部保留; worker 受
+  `COMPENSATION_MAX_CONCURRENCY` 限制认领执行与撤销。
+
+页面"审计事件回放与补偿"卡片展示事件链(全局序/流序/哈希/载荷/投影关联)、
+快照校验结果与逐条原因、补偿动作状态/门禁/操作者/执行与撤销事件关联,
+并提供查询、补录、生成快照、预览、创建任务、执行、重试、撤销操作。
+
 ## 运行
 
 ```bash
@@ -561,6 +635,24 @@ POST /api/records                                  旧结构写入(批次冻结�
 POST /api/v2/records                               新结构写入(仅所属批次 DONE)
 GET  /api/records/{id}                             按所属批次阶段返回 旧/新/双读+diff
 GET  /api/records/{id}/compare                     批次冻结窗内双读比对
+
+# ---- 审计事件回放与补偿 ----
+GET  /api/admin/audit-events?plan_id=&batch_id=&start_ts=&end_ts=&event_type=&after_global_seq=&limit=
+                                                     统一不可变事件链(keyset 分页; 批次查询按 correlation 折叠)
+POST /api/admin/audit-events                       {operator, idempotency_key, content, plan_id?, batch_id?, event_ts?}
+                                                     显式补录备注(EXTERNAL_NOTE; 乱序超阈值 409)
+POST /api/admin/audit-snapshots                    {operator, idempotency_key, plan_id, target_at?, ttl_seconds?}
+                                                     生成时间点快照并校验(REJECTED 返回 422 且逐条原因, 快照仍持久化)
+GET  /api/admin/audit-snapshots?plan_id=&status_filter=
+GET  /api/admin/audit-snapshots/{id}               快照详情(固化事件链 + 批次版本/规则版本校验结果)
+GET  /api/admin/audit-snapshots/{id}/preview       待补偿动作预览(类型/目标/预期/当前/门禁/execution_allowed)
+POST /api/admin/compensations                      {operator, idempotency_key, snapshot_id}
+                                                     基于 VALID 快照创建补偿任务(同快照同时唯一)
+GET  /api/admin/compensations?plan_id=&snapshot_id=&status_filter=
+GET  /api/admin/compensations/{id}                 补偿任务详情(逐动作状态/失败原因/执行撤销事件关联/任务事件)
+POST /api/admin/compensations/{id}/execute         {operator, idempotency_key} 幂等执行(逐动作过门禁; 部分失败 PARTIAL)
+POST /api/admin/compensations/{id}/retry           {operator, idempotency_key, action_seq} 逐动作失败重试
+POST /api/admin/compensations/{id}/undo            {operator, idempotency_key} 逆序整体撤销(before_image 恢复, 不受 TTL 限制)
 ```
 
 幂等：所有管理动作要求 `idempotency_key`，重复执行返回首次结果（`replayed: true`），无副作用；
@@ -570,7 +662,7 @@ GET  /api/records/{id}/compare                     批次冻结窗内双读比�
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 190 个用例:
+python3 -m pytest tests/ -q   # 232 个用例:
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
 # 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
@@ -636,4 +728,14 @@ python3 -m pytest tests/ -q   # 190 个用例:
 #           接口与 status 展示触发来源/重扫关联/暂停/多轮暂停恢复历史/
 #           hold 中允许手动扫描且通过后解除/普通 RUNNING 拒绝手动扫描/
 #           用户暂停叠加后取消/重扫被暂停不恢复/步骤完成后的边界也复评门禁
+# 审计事件回放与补偿(42): 流序连续/全局序递增/哈希链可重算(含操作者)/生命周期·规则·扫描·
+#           暂停事件投影/写入事件/批次流扇出与 correlation 折叠/keyset 分页/时间范围过滤/
+#           显式补录幂等与乱序拒绝/跨批次流隔离/正常快照 VALID/非终态·早于终结·流缺口·断链·
+#           篡改·批次漂移·规则版本冲突·批次 epoch 跳变·乱序·取消计划快照拒绝原因/
+#           REJECTED 快照持久化且不能建补偿/快照 TTL 过期/动作预览(回填·清理·解冻)/
+#           幂等执行不重复写入/只追加 COMP_* 不改原事件/门禁阻断 FAILED 后恢复重试成功/
+#           取消计划补偿逐动作 PLAN_CANCELED 拒绝/部分失败 PARTIAL/多余记录清理与撤销/
+#           before_image 撤销恢复(插入删除·改值还原·撤销关联执行事件)/执行与撤销操作者/
+#           同快照并发不建重复任务/worker 逐动作执行/COMP_FAILED 事件/
+#           重启 RUNNING→QUEUED·PARTIAL 保留失败原因·UNDO_RUNNING→UNDO_PARTIAL 续撤销
 ```

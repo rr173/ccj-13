@@ -997,3 +997,337 @@ class QualityGateHold(Base):
     created_by = Column(String(128), nullable=False, default="system")
     created_at = Column(DateTime, default=_utcnow, index=True)
     updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+# ======================================================================
+# ---------- 审计事件回放与补偿(audit replay & compensation) ----------
+# ======================================================================
+# 统一的不可变审计事件流: 把批次写入(BATCH_WRITE)、批次生命周期
+# (BATCH_CREATE/FREEZE/VALIDATE/CUTOVER/RECOVER)、规则变更(RULE_CHANGED)、
+# 扫描状态变化(SCAN_STATUS)、质量暂停(QUALITY_HOLD)、计划推进(PLAN_ADVANCE)
+# 与计划取消(PLAN_CANCEL)等全部投影到同一只追加事件表。
+#
+# - global_seq: 全库严格递增顺序号(插入时锁分配), 是跨流总顺序;
+# - stream_key: 每条流的归属。计划相关事件流以 plan_id 为 key(同一逻辑事件
+#   对相关计划各投影一份, 共享 correlation_id); 批次写等无计划上下文事件以
+#   "batch:" + batch_id 为 key; 纯外部备注以 "global" 为 key;
+# - stream_seq: 单流(同 stream_key)内从 1 连续递增, 是"事件连续性"校验依据;
+# - stream_hash: 单流哈希链 prev_hash = sha256(stream_seq|event_type|
+#   correlation_id|payload_json|ts|prev_stream_hash), 任何篡改/缺口都会断链;
+# - dedupe_key: 投影去重键, 同一逻辑事件的重投影(重复请求/幂等重放)返回已有行。
+AUDIT_EVENT_TYPES = (
+    "EXTERNAL_NOTE",    # 运维显式补录的备注(唯一允许直接写入的类型)
+    "BATCH_WRITE",      # 批次范围内记录写入(旧路径/新路径)
+    "BATCH_CREATE",     # 批次创建
+    "BATCH_FREEZE",     # 批次冻结
+    "BATCH_VALIDATE",   # 批次校验(通过或阻止)
+    "BATCH_CUTOVER",    # 批次切换
+    "BATCH_RECOVER",    # 批次恢复
+    "BATCH_ATTACH",     # 计划创建时把步骤批次锚定进该计划事件流
+    "RULE_CHANGED",     # 质量规则新版本发布
+    "SCAN_STATUS",      # 扫描状态变化(创建/排队/认领/暂停/恢复/完成/失败/取消)
+    "QUALITY_HOLD",     # 质量门禁暂停打开/恢复/取消
+    "PLAN_ADVANCE",     # 计划推进(创建/启动/暂停/恢复/步骤成功/完成/审批/窗口等)
+    "PLAN_CANCEL",      # 计划取消
+    "COMP_EXECUTED",    # 补偿动作执行成功(只追加, 不改原事件)
+    "COMP_FAILED",      # 补偿动作执行失败(只追加, 可重试)
+    "COMP_UNDONE",      # 补偿动作撤销(只追加, 关联原执行事件)
+)
+# 允许运维显式补录 / 回放校验接受的乱序时钟偏移(秒):
+# event_ts 早于流上一事件超过该阈值即视为乱序, 显式补录直接拒绝,
+# 历史流中的乱序会让该计划的快照校验失败(out_of_order)。
+AUDIT_MAX_OUT_OF_ORDER_SECONDS = 300
+
+
+class AuditEvent(Base):
+    """统一不可变审计事件流(只追加): 顺序号 + 哈希链 + 投影去重。
+
+    任何代码路径都不允许 UPDATE/DELETE 本表; 补偿只追加 COMP_* 事件,
+    原事件永远不可变。分页接口按计划(stream_key=plan_id)/批次
+    (batch_id 过滤)/时间范围(event_ts)查询。"""
+
+    __tablename__ = "audit_events"
+    __table_args__ = (
+        # 单流顺序号唯一: 连续性校验与分页都依赖它
+        UniqueConstraint("stream_key", "stream_seq", name="uq_audit_stream_seq"),
+        # 投影去重: 同逻辑事件重投影(含同一 correlation 的计划扇出例外,
+        # correlation 在不同 stream_key 下可重复, 故去重键含 stream_key)
+        UniqueConstraint("stream_key", "dedupe_key", name="uq_audit_dedupe"),
+        Index("ix_audit_events_batch_ts", "batch_id", "event_ts"),
+        Index("ix_audit_events_plan_ts", "plan_id", "event_ts"),
+        Index("ix_audit_events_ts", "event_ts"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    global_seq = Column(Integer, nullable=False, unique=True, index=True)
+    stream_key = Column(String(64), nullable=False, index=True)
+    stream_seq = Column(Integer, nullable=False)
+    event_type = Column(String(32), nullable=False, index=True)
+    # 逻辑关联
+    plan_id = Column(String(32), nullable=True, index=True)
+    batch_id = Column(String(32), nullable=True, index=True)
+    scan_id = Column(String(32), nullable=True, index=True)
+    step_seq = Column(Integer, nullable=True)
+    # 同一逻辑事件(批次动作扇出到多个计划流/补偿关联)的关联标识
+    correlation_id = Column(String(64), nullable=False, index=True)
+    # 单流哈希链
+    prev_global_seq = Column(Integer, nullable=True)
+    prev_stream_hash = Column(String(64), nullable=True)
+    stream_hash = Column(String(64), nullable=False)
+    # 业务载荷: 批次动作带 phase/epoch/freeze_version/watermark(批次版本),
+    # 规则事件带 rule_version/content_digest(规则版本), 扫描事件带状态与规则版本
+    payload = Column(JSON, nullable=False, default=dict)
+    operator = Column(String(128), nullable=False)
+    source = Column(String(32), nullable=False, default="internal")  # internal | api | system
+    dedupe_key = Column(String(128), nullable=False)
+    event_ts = Column(DateTime, nullable=False, default=_utcnow)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+# 回放快照状态机:
+#   VALID(校验通过, 可预览/执行补偿, 有 TTL) --执行补偿--> 不改变快照
+#   REJECTED(校验失败, 永久拒绝, reasons 逐条说明; 记录保留可查)
+#   VALID 快照超过 expires_at -> 只读, 补偿执行被拒绝(snapshot_expired),
+#          可重新生成; 撤销(undo)不受过期限制(回滚不允许被 TTL 卡死)。
+AUDIT_SNAPSHOT_STATUSES = ("VALID", "REJECTED")
+# 快照校验失败原因(机器可读):
+#   plan_not_terminal   计划尚未 COMPLETED/CANCELED, 不允许生成回放快照
+#   target_before_end   目标时间早于计划终结事件(未到可回放点)
+#   stream_gap          计划事件流顺序号不连续(存在缺口)
+#   chain_broken        哈希链无法重算(事件被篡改/丢失)
+#   out_of_order        事件时间戳倒流超过容忍阈值(乱序事件)
+#   rule_version_gap    规则版本不兼容: 引用了不存在的规则版本/版本跳跃/摘要不一致
+#   batch_version_gap   批次版本不兼容: epoch 倒挂/缺失版本增量/freeze_version 不一致
+#   batch_state_drift   目标时点批次预期状态与当前批次状态不一致(回放无法还原)
+SNAPSHOT_REJECT_REASONS = (
+    "plan_not_terminal", "target_before_end", "stream_gap", "chain_broken",
+    "out_of_order", "rule_version_gap", "batch_version_gap", "batch_state_drift",
+)
+AUDIT_SNAPSHOT_DEFAULT_TTL_SECONDS = 24 * 3600
+
+
+class AuditSnapshot(Base):
+    """针对已终结(COMPLETED/CANCELED)计划在某个时间点生成的回放快照。
+
+    创建时把计划事件流截至 target_at 的事件逐行固化(AuditSnapshotEvent),
+    并校验: 事件连续性(stream_seq 无缺口)、哈希链完整、时间戳不乱序、
+    规则版本(存在/摘要一致/无跳跃)与批次版本(epoch 不倒挂、版本增量连续、
+    freeze_version 与批次审计一致), 以及目标时点批次预期状态与当前状态一致。
+    任一不满足 -> REJECTED(reasons 逐条说明), 不允许补偿。
+    快照不可变; VALID 快照有 TTL, 过期后补偿执行拒绝(撤销除外)。"""
+
+    __tablename__ = "audit_snapshots"
+
+    id = Column(String(32), primary_key=True)          # "AS" + 随机串
+    # 刻意不加 FK: 计划被删是必须能观测并拒绝(data_deleted)的场景
+    plan_id = Column(String(32), nullable=False, index=True)
+    plan_name = Column(String(200), nullable=True)
+    plan_status_at_create = Column(String(16), nullable=False)  # COMPLETED | CANCELED
+    target_at = Column(DateTime, nullable=False)       # 回放时间点(闭区间, UTC naive)
+    # 固化时刻的流边界
+    last_stream_seq = Column(Integer, nullable=False, default=0)
+    last_global_seq = Column(Integer, nullable=False, default=0)
+    last_stream_hash = Column(String(64), nullable=True)
+    status = Column(String(16), nullable=False, default="REJECTED", index=True)
+    reasons = Column(JSON, nullable=False, default=list)   # [{code, message, ...}]
+    rule_versions = Column(JSON, nullable=False, default=list)   # 固化的规则版本链
+    batch_versions = Column(JSON, nullable=False, default=list)  # 固化的批次版本链
+    event_count = Column(Integer, nullable=False, default=0)
+    ttl_seconds = Column(Integer, nullable=False, default=AUDIT_SNAPSHOT_DEFAULT_TTL_SECONDS)
+    expires_at = Column(DateTime, nullable=True, index=True)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+
+    events = relationship("AuditSnapshotEvent", cascade="all, delete-orphan",
+                          order_by="AuditSnapshotEvent.stream_seq")
+    batches = relationship("AuditSnapshotBatch", cascade="all, delete-orphan",
+                           order_by="AuditSnapshotBatch.seq")
+
+
+class AuditSnapshotEvent(Base):
+    """快照内逐行固化的事件(不可变副本): 回放/校验以本表为准,
+    不依赖事后可能被外部工具触碰的事件表。"""
+
+    __tablename__ = "audit_snapshot_events"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "stream_seq", name="uq_snapshot_event_seq"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String(32), ForeignKey("audit_snapshots.id"),
+                         nullable=False, index=True)
+    audit_event_id = Column(Integer, nullable=False)
+    global_seq = Column(Integer, nullable=False)
+    stream_seq = Column(Integer, nullable=False)
+    event_type = Column(String(32), nullable=False)
+    batch_id = Column(String(32), nullable=True)
+    scan_id = Column(String(32), nullable=True)
+    correlation_id = Column(String(64), nullable=False)
+    payload = Column(JSON, nullable=False, default=dict)
+    operator = Column(String(128), nullable=False)
+    event_ts = Column(DateTime, nullable=False)
+    stream_hash = Column(String(64), nullable=False)
+
+
+class AuditSnapshotBatch(Base):
+    """快照内每个计划步骤批次在目标时点的预期状态与旧表基线:
+    补偿动作(记录回填/清理/解冻)推导的唯一来源。"""
+
+    __tablename__ = "audit_snapshot_batches"
+    __table_args__ = (
+        UniqueConstraint("snapshot_id", "batch_id", name="uq_snapshot_batch"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    snapshot_id = Column(String(32), ForeignKey("audit_snapshots.id"),
+                         nullable=False, index=True)
+    seq = Column(Integer, nullable=False)
+    plan_step_id = Column(Integer, nullable=False)
+    batch_id = Column(String(32), nullable=False)
+    biz = Column(String(128), nullable=True)
+    id_start = Column(Integer, nullable=False)
+    id_end = Column(Integer, nullable=False)
+    expected_phase = Column(String(32), nullable=False)
+    expected_epoch = Column(Integer, nullable=False)
+    expected_freeze_version = Column(String(64), nullable=True)
+    expected_schema = Column(String(8), nullable=False, default="old")
+    # 目标时点范围内旧表全量基线(记录修复的预期来源)
+    expected_old_records = Column(JSON, nullable=False, default=list)
+    expected_old_count = Column(Integer, nullable=False, default=0)
+
+
+# 补偿任务状态机:
+#   QUEUED(排队等并发额度) --claim--> RUNNING --全部动作成功--> COMPLETED(终态)
+#                                    +--部分动作失败--> PARTIAL(可逐动作/整任务重试)
+#   RUNNING/PARTIAL --undo--> UNDO_RUNNING --全部撤销成功--> UNDONE(终态)
+#                                        +--部分撤销失败--> UNDO_PARTIAL(可继续撤销)
+#   重启对账: 遗留 RUNNING/UNDO_RUNNING 回到 QUEUED/UNDO_RUNNING 安全位置续跑,
+#             动作级进度(PENDING/SUCCESS/FAILED/UNDONE)与失败原因持久化保留。
+COMP_TASK_STATUSES = (
+    "QUEUED", "RUNNING", "PARTIAL", "COMPLETED",
+    "UNDO_RUNNING", "UNDO_PARTIAL", "UNDONE",
+)
+COMP_TASK_TERMINAL_STATUSES = ("COMPLETED", "UNDONE")
+COMP_TASK_ACTIVE_STATUSES = ("QUEUED", "RUNNING", "PARTIAL",
+                            "UNDO_RUNNING", "UNDO_PARTIAL")
+COMP_TASK_UNDO_STATUSES = ("UNDO_RUNNING", "UNDO_PARTIAL", "UNDONE")
+# 补偿动作状态:
+#   PENDING 待执行; SUCCESS 执行成功; FAILED 执行失败(last_error 保留, 可重试);
+#   SKIPPED 推导时即不适用/被门禁策略跳过; UNDOING 撤销中; UNDONE 已撤销。
+COMP_ACTION_STATUSES = ("PENDING", "SUCCESS", "FAILED", "SKIPPED", "UNDOING", "UNDONE")
+# 补偿动作类型:
+#   record_backfill 目标时点旧表有而当前新表缺失/不一致 -> 按转换规则回填/修正新表
+#   record_cleanup  当前新表有而目标时点基线没有(__extra__) -> 删除多余新表记录
+#   batch_unfreeze  批次未走到预期终态(取消计划中仍 FROZEN/...) -> 恢复到可写 NORMAL
+COMP_ACTION_TYPES = ("record_backfill", "record_cleanup", "batch_unfreeze")
+
+
+class CompensationTask(Base):
+    """对一个 VALID 快照发起的补偿执行(同一快照同时至多一个非终态任务,
+    唯一部分索引兜底, 并发执行不能重复写入)。
+
+    补偿不变量:
+    1. 绝不 UPDATE/DELETE audit_events 原事件, 只追加 COMP_EXECUTED/COMP_FAILED/
+       COMP_UNDONE 事件;
+    2. 每个动作执行前实时复核质量门禁: 门禁不通过(STALE/BLOCKED/...)则该动作
+       FAILED(gate_blocked), 补偿不能越过质量门禁;
+    3. 计划已 CANCELED 的快照只允许预览, 任何执行都拒绝(plan_canceled);
+    4. 动作逐个独立事务提交, 部分失败不回滚已成功动作, 可逐动作重试;
+    5. 动作带确定性幂等键(快照+动作), 崩溃/并发重放走首次结果, 不重复写入;
+    6. 撤销按动作逆序执行, 用执行时捕获的 before_image 恢复现场, 同样只追加事件。
+    """
+
+    __tablename__ = "compensation_tasks"
+    __table_args__ = (
+        # 同一快照同时至多一个非终态补偿任务(数据库层兜底并发重复执行)
+        Index("uq_comp_active_snapshot", "snapshot_id", unique=True,
+              postgresql_where=Column("status").in_(
+                  ("QUEUED", "RUNNING", "PARTIAL",
+                   "UNDO_RUNNING", "UNDO_PARTIAL")),
+              sqlite_where=Column("status").in_(
+                  ("QUEUED", "RUNNING", "PARTIAL",
+                   "UNDO_RUNNING", "UNDO_PARTIAL"))),
+    )
+
+    id = Column(String(32), primary_key=True)          # "CT" + 随机串
+    # 刻意不加 FK: 快照缺失/被删必须能观测并明确失败
+    snapshot_id = Column(String(32), nullable=False, index=True)
+    plan_id = Column(String(32), nullable=False, index=True)
+    plan_status = Column(String(16), nullable=False)   # 创建任务时计划状态
+    status = Column(String(16), nullable=False, default="QUEUED", index=True)
+    total_actions = Column(Integer, nullable=False, default=0)
+    success_actions = Column(Integer, nullable=False, default=0)
+    failed_actions = Column(Integer, nullable=False, default=0)
+    undone_actions = Column(Integer, nullable=False, default=0)
+    current_action_seq = Column(Integer, nullable=True)
+    last_error = Column(String(500), nullable=True)
+    failure_reason = Column(String(500), nullable=True)
+    created_by = Column(String(128), nullable=False)
+    updated_by = Column(String(128), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    actions = relationship("CompensationAction", cascade="all, delete-orphan",
+                           order_by="CompensationAction.seq")
+    events = relationship("CompensationTaskEvent", cascade="all, delete-orphan",
+                          order_by="desc(CompensationTaskEvent.id)")
+
+
+class CompensationAction(Base):
+    """快照中推导出的单个待补偿动作: 类型、目标、预期值、执行结果、
+    失败原因、撤销前镜像与审计事件关联(执行/撤销对应的 audit_events 行 id)。"""
+
+    __tablename__ = "compensation_actions"
+    __table_args__ = (
+        UniqueConstraint("task_id", "seq", name="uq_comp_action_seq"),
+        # 确定性动作键(任务内唯一): 同快照同目标只推导一次, 是幂等执行/崩溃重放
+        # 的依据; 同一快照旧任务 UNDONE 后可再建新任务, 故不做跨任务全局唯一
+        UniqueConstraint("task_id", "action_key", name="uq_comp_task_action_key"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(32), ForeignKey("compensation_tasks.id"),
+                     nullable=False, index=True)
+    snapshot_id = Column(String(32), nullable=False, index=True)
+    seq = Column(Integer, nullable=False)
+    action_key = Column(String(160), nullable=False)
+    action_type = Column(String(24), nullable=False)
+    batch_id = Column(String(32), nullable=False, index=True)
+    record_id = Column(Integer, nullable=True, index=True)
+    # 执行依据(预期新表记录 / 预期存在性等, JSON)
+    expected = Column(JSON, nullable=True)
+    # 执行时捕获的撤销前镜像(被删新表行/被恢复批次的原阶段...)
+    before_image = Column(JSON, nullable=True)
+    result = Column(JSON, nullable=True)               # 执行结果摘要
+    status = Column(String(16), nullable=False, default="PENDING", index=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    last_error = Column(String(500), nullable=True)
+    gate_status = Column(String(32), nullable=True)    # 最近一次门禁判定状态
+    # 审计事件关联(撤销关联): 执行成功/撤销成功对应的 audit_events.global_seq
+    executed_event_global_seq = Column(Integer, nullable=True)
+    undone_event_global_seq = Column(Integer, nullable=True)
+    executed_by = Column(String(128), nullable=True)
+    executed_at = Column(DateTime, nullable=True)
+    undone_by = Column(String(128), nullable=True)
+    undone_at = Column(DateTime, nullable=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class CompensationTaskEvent(Base):
+    """补偿任务事件流水(只追加): 创建/排队/认领/执行开始/动作成功/动作失败/
+    门禁拒绝/部分完成/完成/重试/撤销开始/动作撤销/撤销部分完成/已撤销/重启对账。
+    业务审计效果同时投影到统一 audit_events(COMP_*), 本表是任务视角流水。"""
+
+    __tablename__ = "compensation_task_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=_utcnow)
+    task_id = Column(String(32), ForeignKey("compensation_tasks.id"),
+                     nullable=False, index=True)
+    action_seq = Column(Integer, nullable=True)
+    event = Column(String(40), nullable=False)
+    operator = Column(String(128), nullable=False)
+    reason = Column(String(500), nullable=True)
+    detail = Column(JSON, nullable=True)

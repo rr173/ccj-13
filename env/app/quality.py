@@ -154,6 +154,11 @@ def add_event(session: Session, *, plan_id: str, event: str, operator: str,
         plan_id=plan_id, scan_id=scan_id, event=event, operator=operator,
         reason=(reason[:500] if reason else None), detail=detail,
     ))
+    # 同步投影到统一不可变审计事件流(规则变更/扫描状态/质量暂停)
+    from . import auditreplay
+    auditreplay.emit_quality_event(
+        session, plan_id=plan_id, event=event, operator=operator,
+        scan_id=scan_id, reason=reason, detail=detail)
 
 
 # ---------- 行锁 / 串行锁 ----------

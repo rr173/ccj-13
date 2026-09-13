@@ -37,6 +37,12 @@
   .SEV_INFO { background: #1565c0; }
   .ST_OPEN { background: #c62828; } .ST_FIXED { background: #2e7d32; }
   .ST_EXEMPTED { background: #6a1b9a; }
+  .AR_VALID { background: #2e7d32; } .AR_REJECTED { background: #c62828; }
+  .AR_SUCCESS { background: #2e7d32; } .AR_FAILED { background: #c62828; }
+  .AR_PENDING { background: #ef6c00; } .AR_UNDONE { background: #546e7a; }
+  .AR_PARTIAL { background: #ef6c00; } .AR_UNDO_PARTIAL { background: #ef6c00; }
+  .AR_UNDO_RUNNING { background: #6a1b9a; } .AR_QUEUED { background: #78909c; }
+  .AR_RUNNING { background: #1565c0; } .AR_UNDONE2 { background: #546e7a; }
   .tag { display: inline-block; background: #eceff1; border: 1px solid #b0bec5;
          color: #37474f; border-radius: 10px; padding: 1px 8px; font-size: 11px;
          margin: 1px 2px 1px 0; }
@@ -328,6 +334,49 @@
   <pre id="writeMsg" class="msg"></pre>
 </div>
 
+<div class="card" style="background:#f4fbf7;border-color:#a5d6a7">
+  <b>审计事件回放与补偿</b>
+  <span class="muted">不可变顺序事件流 · 时间点快照校验(连续性/规则版本/批次版本) · 补偿预览/幂等执行/失败重试/整体撤销</span>
+  <div style="margin-top:8px">
+    <b>事件链查询</b>:
+    计划 <input id="arPlanId" size="10" placeholder="plan_id">
+    批次 <input id="arBatchId" size="10" placeholder="batch_id">
+    类型
+    <select id="arType">
+      <option value="">(全部)</option>
+    </select>
+    起 <input id="arStart" type="datetime-local" step="1" style="width:180px">
+    止 <input id="arEnd" type="datetime-local" step="1" style="width:180px">
+    <button class="plain" onclick="arQueryEvents(0)">查询事件链</button>
+    <button class="plain" onclick="arQueryEventsNext()">下一页</button>
+  </div>
+  <div style="margin-top:6px">
+    <b>生成回放快照</b>:
+    计划 <input id="arSnapPlan" size="10" placeholder="plan_id">
+    时间点(可空=终结点) <input id="arSnapAt" type="datetime-local" step="1" style="width:190px">
+    TTL(秒,可空) <input id="arSnapTtl" type="number" min="60" style="width:90px" placeholder="86400">
+    <button onclick="arCreateSnapshot()">生成快照并校验</button>
+  </div>
+  <div style="margin-top:6px">
+    <b>补录备注</b>:
+    计划 <input id="arNotePlan" size="10" placeholder="plan_id">
+    内容 <input id="arNoteText" size="30" placeholder="备注内容">
+    <button class="plain" onclick="arAddNote()">补录事件</button>
+  </div>
+  <div id="arMsg" class="msg"></div>
+  <div id="arEvents" style="margin-top:8px"></div>
+</div>
+
+<div class="card" style="background:#f4fbf7;border-color:#a5d6a7">
+  <b>回放快照</b>
+  <div id="arSnapshots" style="margin-top:6px"></div>
+</div>
+
+<div class="card" style="background:#f4fbf7;border-color:#a5d6a7">
+  <b>补偿任务</b>
+  <div id="arComps" style="margin-top:6px"></div>
+</div>
+
 <div class="card">
   <b>审计日志</b>（批次 / 操作者 / 版本 / 水位 / 差异 / 恢复原因）
   <table>
@@ -391,6 +440,7 @@ async function refresh() {
   renderArchiveControls(s);
   renderArchives(s.archives || []);
   renderQuality(s);
+  renderAuditReplay(s);
   const rows = await (await fetch('/api/admin/audit?limit=50')).json();
   document.getElementById('audit').innerHTML = rows.map(r =>
     `<tr><td>${r.ts||''}</td><td>${r.batch_id||r.plan_id||''}</td><td>${r.operator}</td><td>${r.action}</td>
@@ -2167,7 +2217,267 @@ addPlanStepRow(1);
 addPlanStepRow(2);
 searchCatalog();
 refreshCleanupPlans();
+qgInit();
+refresh().then(() => { qgLoadRules(); qgLoadOverview(); });
+addPlanStepRow(1);
+addPlanStepRow(2);
+searchCatalog();
+refreshCleanupPlans();
 setInterval(refreshCleanupPlans, 3000);
+
+// ======================================================================
+// ---------- 审计事件回放与补偿 ----------
+// ======================================================================
+
+const AR_EVENT_TYPES = ['EXTERNAL_NOTE','BATCH_WRITE','BATCH_CREATE','BATCH_FREEZE',
+  'BATCH_VALIDATE','BATCH_CUTOVER','BATCH_RECOVER','BATCH_ATTACH','RULE_CHANGED',
+  'SCAN_STATUS','QUALITY_HOLD','PLAN_ADVANCE','PLAN_CANCEL','COMP_EXECUTED',
+  'COMP_FAILED','COMP_UNDONE'];
+let arEventCursor = null;
+let arLastQuery = null;
+
+function arShowMsg(ok, text) {
+  const el = document.getElementById('arMsg');
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.textContent = text;
+}
+function arBadge(status) {
+  return `<span class="badge AR_${status}">${status}</span>`;
+}
+function arEscape(s) {
+  return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+// 审计回放动作的独立幂等键: 每次调用都生成新键, 允许连续执行/重试/撤销
+function arKey() {
+  return 'ar-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+}
+
+(function arInitTypes() {
+  const sel = document.getElementById('arType');
+  for (const t of AR_EVENT_TYPES) {
+    const o = document.createElement('option'); o.value = t; o.textContent = t;
+    sel.appendChild(o);
+  }
+})();
+
+async function arPost(url, body) {
+  const r = await fetch(url, { method: 'POST', headers: {'Content-Type': 'application/json'},
+                              body: JSON.stringify(body) });
+  let j = null; try { j = await r.json(); } catch (e) {}
+  return { ok: r.ok, status: r.status, json: j };
+}
+
+async function arQueryEvents(cursor) {
+  const plan = document.getElementById('arPlanId').value.trim();
+  const batch = document.getElementById('arBatchId').value.trim();
+  const type = document.getElementById('arType').value;
+  const start = localInputToIso(document.getElementById('arStart').value);
+  const end = localInputToIso(document.getElementById('arEnd').value);
+  const q = new URLSearchParams({ limit: '20' });
+  if (plan) q.set('plan_id', plan);
+  if (batch) q.set('batch_id', batch);
+  if (type) q.set('event_type', type);
+  if (start) q.set('start_ts', start);
+  if (end) q.set('end_ts', end);
+  if (cursor) q.set('after_global_seq', cursor);
+  const res = await (await fetch('/api/admin/audit-events?' + q.toString())).json();
+  if (!cursor) arEventCursor = null;
+  arLastQuery = q;
+  arRenderEvents(res.items, res.has_more, res.next_after_global_seq, !cursor);
+}
+
+async function arQueryEventsNext() {
+  if (arEventCursor) await arQueryEvents(arEventCursor);
+}
+
+function arRenderEvents(items, hasMore, nextCursor, reset) {
+  const box = document.getElementById('arEvents');
+  const head = `<div class="muted">${items.length} 个事件${hasMore?' (还有更多, 点下一页)':''}</div>`;
+  const rows = items.map(e => `
+    <tr>
+      <td>${e.global_seq}</td><td>${e.stream_seq}</td>
+      <td>${arEscape(e.event_type)}</td>
+      <td>${arEscape(e.plan_id||'')}</td><td>${arEscape(e.batch_id||'')}</td>
+      <td>${arEscape(e.operator)}</td><td class="muted">${(e.event_ts||'').replace('T',' ').slice(0,19)}</td>
+      <td style="max-width:340px"><pre style="margin:0;white-space:pre-wrap">${arEscape(JSON.stringify(e.payload))}</pre></td>
+      <td class="muted" title="${arEscape(e.stream_hash)}">${arEscape((e.stream_hash||'').slice(0,8))}${e.other_plan_ids&&e.other_plan_ids.length?'<br>投影:'+e.other_plan_ids.map(arEscape).join(','):''}</td>
+    </tr>`).join('') || '<tr><td colspan="9" class="muted">无事件</td></tr>';
+  const table = `<table style="margin-top:4px"><thead><tr>
+    <th>全局序</th><th>流序</th><th>类型</th><th>计划</th><th>批次</th><th>操作者</th><th>时间</th><th>载荷</th><th>链/关联</th>
+    </tr></thead><tbody>${rows}</tbody></table>`;
+  if (reset) { box.innerHTML = head + table; arEventCursor = null; }
+  else {
+    box.querySelector('.muted').textContent = `${items.length} 个事件(续)`;
+    box.querySelector('tbody').insertAdjacentHTML('beforeend',
+      items.map(()=>'').join(''));
+    const tb = box.querySelector('tbody');
+    const tmp = document.createElement('tbody');
+    tmp.innerHTML = rows;
+    while (tmp.firstChild) tb.appendChild(tmp.firstChild);
+  }
+  arEventCursor = hasMore ? nextCursor : null;
+}
+
+async function arCreateSnapshot() {
+  const plan_id = document.getElementById('arSnapPlan').value.trim();
+  const at = localInputToIso(document.getElementById('arSnapAt').value);
+  const ttlRaw = document.getElementById('arSnapTtl').value.trim();
+  if (!plan_id) { arShowMsg(false, '请填写计划 id'); return; }
+  const body = { operator: operator(), idempotency_key: arKey(), plan_id };
+  if (at) body.target_at = at;
+  if (ttlRaw) body.ttl_seconds = parseInt(ttlRaw);
+  const r = await arPost('/api/admin/audit-snapshots', body);
+  if (r.status === 422 && r.json && r.json.detail && r.json.detail.snapshot) {
+    const snap = r.json.detail.snapshot;
+    arShowMsg(false, '快照被拒绝: ' + snap.reasons.map(x => x.code).join(', '));
+  } else if (!r.ok) {
+    arShowMsg(false, '生成失败: ' + ((r.json && r.json.detail && r.json.detail.reason) || r.status));
+  } else {
+    arShowMsg(true, `快照 ${r.json.snapshot_id} 校验通过(VALID), 事件 ${r.json.event_count} 个`);
+  }
+  refresh();
+}
+
+async function arAddNote() {
+  const plan_id = document.getElementById('arNotePlan').value.trim();
+  const content = document.getElementById('arNoteText').value.trim();
+  if (!content) { arShowMsg(false, '请填写备注内容'); return; }
+  const body = { operator: operator(), idempotency_key: arKey(), content };
+  if (plan_id) body.plan_id = plan_id;
+  const r = await arPost('/api/admin/audit-events', body);
+  arShowMsg(r.ok, r.ok ? '备注事件已追加(全局序 '+r.json.global_seq+')'
+    : ('补录被拒: ' + (r.json.detail.reason || r.status)));
+  refresh();
+}
+
+function arRenderSnapshots(snaps) {
+  const box = document.getElementById('arSnapshots');
+  if (!snaps || !snaps.length) { box.innerHTML = '<span class="muted">尚无快照</span>'; return; }
+  box.innerHTML = snaps.map(s => {
+    const reasons = (s.reasons||[]).map(r =>
+      `<li><b>${arEscape(r.code)}</b>: ${arEscape(r.message)}</li>`).join('');
+    const batches = (s.batch_versions||[]).map(b =>
+      `<span class="tag">${arEscape(b.batch_id)} 目标${arEscape(b.target_phase)}/e${b.target_epoch} → 当前${arEscape(b.phase_now)}/e${b.epoch_now}</span>`
+    ).join(' ');
+    const rules = (s.rule_versions||[]).map(v => `<span class="tag">v${v.version}</span>`).join(' ');
+    return `<div class="card" style="margin:6px 0;padding:10px">
+      <div>${arBadge(s.status)} <b>${s.snapshot_id}</b> 计划 ${arEscape(s.plan_id)}
+        <span class="muted">(${arEscape(s.plan_status_at_create)})</span>
+        ${s.expired ? '<span class="badge AR_FAILED">已过期</span>' : ''}
+        <span class="muted">目标点 ${(s.target_at||'').replace('T',' ').slice(0,19)} · 事件 ${s.event_count} · 流序 ${s.last_stream_seq}</span>
+      </div>
+      <div style="margin:4px 0"><b>批次版本:</b> ${batches||'<span class="muted">无</span>'}</div>
+      <div style="margin:4px 0"><b>规则版本:</b> ${rules||'<span class="muted">无</span>'}</div>
+      ${reasons ? `<ul class="err" style="margin:4px 0">${reasons}</ul>` : ''}
+      <div style="margin-top:6px">
+        <button class="plain" onclick="arViewSnapshot('${s.snapshot_id}')">事件链/校验</button>
+        ${s.status==='VALID' ? `<button class="plain" onclick="arPreview('${s.snapshot_id}')">预览补偿</button>
+          <button onclick="arCreateComp('${s.snapshot_id}')">创建补偿任务</button>` : ''}
+      </div>
+      <div id="ars-${s.snapshot_id}"></div>
+    </div>`;
+  }).join('');
+}
+
+async function arViewSnapshot(sid) {
+  const d = await (await fetch('/api/admin/audit-snapshots/' + sid)).json();
+  const evRows = (d.events||[]).map(e => `<tr>
+    <td>${e.stream_seq}</td><td>${arEscape(e.event_type)}</td>
+    <td>${arEscape(e.batch_id||'')}</td><td>${arEscape(e.operator)}</td>
+    <td class="muted">${(e.event_ts||'').replace('T',' ').slice(0,19)}</td>
+    <td class="muted" title="${arEscape(e.stream_hash)}">${arEscape((e.stream_hash||'').slice(0,8))}</td>
+  </tr>`).join('');
+  document.getElementById('ars-' + sid).innerHTML =
+    `<b>快照事件链(${d.event_count})</b><table><thead><tr><th>流序</th><th>类型</th><th>批次</th><th>操作者</th><th>时间</th><th>哈希</th></tr></thead>
+     <tbody>${evRows||'<tr><td colspan="6" class="muted">无</td></tr>'}</tbody></table>`;
+}
+
+async function arPreview(sid) {
+  const r = await fetch(`/api/admin/audit-snapshots/${sid}/preview`);
+  const d = await r.json();
+  if (!r.ok) { document.getElementById('ars-'+sid).textContent = d.detail.reason; return; }
+  const rows = (d.actions||[]).map(a => `<tr>
+    <td>${a.seq}</td><td>${arEscape(a.action_type)}</td><td>${arEscape(a.batch_id)}</td>
+    <td>${a.record_id??'-'}</td><td class="muted">${arEscape(a.description)}</td>
+    <td>${a.execution_allowed?'<span class="ok">允许</span>':'<span class="err">执行被拒</span>'}</td>
+    <td>${arEscape(a.gate_status)}</td></tr>`).join('');
+  document.getElementById('ars-'+sid).innerHTML =
+    `<b>待补偿动作预览(${d.actions.length})</b><table><thead><tr>
+     <th>#</th><th>类型</th><th>批次</th><th>记录</th><th>说明</th><th>可执行</th><th>门禁</th>
+     </tr></thead><tbody>${rows||'<tr><td colspan="7" class="muted">无需补偿</td></tr>'}</tbody></table>`;
+}
+
+async function arCreateComp(sid) {
+  const r = await arPost('/api/admin/compensations',
+    { operator: operator(), idempotency_key: arKey(), snapshot_id: sid });
+  arShowMsg(r.ok, r.ok ? `补偿任务 ${r.json.task_id} 已创建并排队`
+    : ('创建失败: ' + (r.json.detail.reason || r.status)));
+  refresh();
+}
+
+function arRenderComps(tasks) {
+  const box = document.getElementById('arComps');
+  if (!tasks || !tasks.length) { box.innerHTML = '<span class="muted">尚无补偿任务</span>'; return; }
+  box.innerHTML = tasks.map(t => `
+    <div class="card" style="margin:6px 0;padding:10px">
+      <div>${arBadge(t.status)} <b>${t.task_id}</b> 快照 ${arEscape(t.snapshot_id)}
+        计划 ${arEscape(t.plan_id)} <span class="muted">(${arEscape(t.plan_status)})</span>
+        <span class="muted">成功 ${t.success_actions}/${t.total_actions} 失败 ${t.failed_actions} 已撤销 ${t.undone_actions}</span>
+      </div>
+      <div class="muted">${arEscape(t.last_error||'')} 创建者 ${arEscape(t.created_by)}</div>
+      <div style="margin-top:6px">
+        <button onclick="arCompAct('${t.task_id}','execute')">执行</button>
+        <button class="plain" onclick="arCompView('${t.task_id}')">详情</button>
+        <button class="danger" onclick="arCompAct('${t.task_id}','undo')">整体撤销</button>
+      </div>
+      <div id="arc-${t.task_id}"></div>
+    </div>`).join('');
+}
+
+async function arCompView(tid) {
+  const t = await (await fetch('/api/admin/compensations/' + tid)).json();
+  const acts = (t.actions||[]).map(a => `<tr>
+    <td>${a.seq}</td><td>${arEscape(a.action_type)}</td><td>${a.record_id??'-'}</td>
+    <td>${arBadge(a.status)}</td><td>${a.attempts}</td><td>${arEscape(a.gate_status||'')}</td>
+    <td class="muted">${arEscape(a.last_error||'')}</td>
+    <td>${arEscape(a.executed_by||'')}${a.executed_event_global_seq?(' #'+a.executed_event_global_seq):''}</td>
+    <td>${arEscape(a.undone_by||'')}${a.undone_event_global_seq?(' #'+a.undone_event_global_seq):''}</td>
+    <td>${a.status==='FAILED'?`<button onclick="arRetry('${tid}',${a.seq})">重试</button>`:''}</td>
+  </tr>`).join('');
+  const evs = (t.events||[]).slice(0,15).map(e => `<tr>
+    <td class="muted">${(e.ts||'').replace('T',' ').slice(0,19)}</td><td>${arEscape(e.event)}</td>
+    <td>${e.action_seq??'-'}</td><td>${arEscape(e.operator)}</td><td class="muted">${arEscape(e.reason||'')}</td></tr>`).join('');
+  document.getElementById('arc-'+tid).innerHTML =
+    `<table style="margin-top:6px"><thead><tr><th>#</th><th>类型</th><th>记录</th><th>状态</th><th>尝试</th>
+      <th>门禁</th><th>失败原因</th><th>执行者/执行事件</th><th>撤销者/撤销事件</th><th></th></tr></thead>
+     <tbody>${acts}</tbody></table>
+     <b style="display:inline-block;margin-top:6px">任务事件</b>
+     <table><thead><tr><th>时间</th><th>事件</th><th>动作</th><th>操作者</th><th>原因</th></tr></thead>
+     <tbody>${evs}</tbody></table>`;
+}
+
+async function arCompAct(tid, name) {
+  const r = await arPost(`/api/admin/compensations/${tid}/${name}`,
+    { operator: operator(), idempotency_key: arKey() });
+  arShowMsg(r.ok, r.ok ? `${name} 完成: ${r.json.status}`
+    : (name+' 失败: ' + (r.json.detail.reason || r.status)));
+  refresh();
+  if (r.ok) arCompView(tid);
+}
+
+async function arRetry(tid, seq) {
+  const r = await arPost(`/api/admin/compensations/${tid}/retry`,
+    { operator: operator(), idempotency_key: arKey(), action_seq: seq });
+  arShowMsg(r.ok, r.ok ? `动作 ${seq} 重试结果: ${r.json.status}`
+    : ('重试失败: ' + (r.json.detail.reason || r.status)));
+  refresh(); arCompView(tid);
+}
+
+function renderAuditReplay(s) {
+  arRenderSnapshots(s.audit_snapshots || []);
+  arRenderComps(s.compensations || []);
+}
+
 setInterval(refresh, 3000);
 </script>
 </body>

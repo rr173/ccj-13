@@ -181,6 +181,11 @@ def audit(session: Session, batch: MigrationBatch, *, operator: str, action: str
         app_version=APP_VERSION, freeze_version=batch.freeze_version,
         watermark=batch.watermark, reason=reason, diffs=diffs or None,
     ))
+    # 同步投影到统一不可变审计事件流(同一事务提交/回滚, 失败随业务事务一致)。
+    from . import auditreplay
+    auditreplay.emit_batch_event(
+        session, batch, operator=operator, action=action,
+        from_phase=from_phase, reason=reason, diffs=diffs)
 
 
 # ---------- 幂等执行框架 ----------

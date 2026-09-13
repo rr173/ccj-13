@@ -204,6 +204,11 @@ def plan_audit(session: Session, plan: MigrationPlan, *, operator: str, action: 
         app_version=APP_VERSION, freeze_version=None, watermark=None,
         reason=reason, diffs=None,
     ))
+    # 同步投影到统一不可变审计事件流(计划推进/取消)
+    from . import auditreplay
+    auditreplay.emit_plan_event(
+        session, plan, operator=operator, action=action, reason=reason,
+        step_id=step_id)
 
 
 def add_event(session: Session, *, plan_id: str, step_id: int, attempt: int,
@@ -357,6 +362,9 @@ def do_create_plan(session: Session, _plan, operator: str, name: str,
         windows_of(session, plan_id))
     session.flush()
     risk_desc = "高风险(启动前须由另一名管理员审批)" if risk_level == "HIGH" else "低风险(可直接启动)"
+    # 把每个步骤批次锚定进该计划事件流(批次版本链起点)
+    from . import auditreplay
+    auditreplay.emit_plan_attach(session, plan, built, operator)
     plan_audit(session, plan, operator=operator, action="plan.create",
                reason=f"创建计划 {name.strip()}, {len(built)} 个步骤, "
                       f"每步默认额外重试 {max_retries} 次, 风险等级 {risk_level}, "
