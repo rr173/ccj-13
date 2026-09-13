@@ -43,6 +43,11 @@
   .AR_PARTIAL { background: #ef6c00; } .AR_UNDO_PARTIAL { background: #ef6c00; }
   .AR_UNDO_RUNNING { background: #6a1b9a; } .AR_QUEUED { background: #78909c; }
   .AR_RUNNING { background: #1565c0; } .AR_UNDONE2 { background: #546e7a; }
+  .EV_ACTIVE { background: #1565c0; } .EV_BROKEN { background: #c62828; }
+  .EV_CLOSED { background: #2e7d32; } .EV_PAUSED { background: #ef6c00; }
+  .EV_FAILED { background: #c62828; } .EV_COMPLETED { background: #2e7d32; }
+  .EV_CANCELED { background: #546e7a; } .EV_QUEUED { background: #78909c; }
+  .EV_RUNNING { background: #1565c0; }
   .tag { display: inline-block; background: #eceff1; border: 1px solid #b0bec5;
          color: #37474f; border-radius: 10px; padding: 1px 8px; font-size: 11px;
          margin: 1px 2px 1px 0; }
@@ -375,6 +380,46 @@
 <div class="card" style="background:#f4fbf7;border-color:#a5d6a7">
   <b>补偿任务</b>
   <div id="arComps" style="margin-top:6px"></div>
+</div>
+
+<div class="card" style="background:#eef5ff;border-color:#90caf9">
+  <b>审计证据查询与一致性证明</b>
+  <span class="muted">固定边界会话(创建后新写入不插入结果集) · 跨计划/批次/补偿控制流统一时间线 · 每页哈希链连续性证明 · 异步分段 JSONL 证据包</span>
+
+  <div style="margin-top:8px">
+    <b>1. 创建证据会话</b>:
+    计划 <input id="evPlan" size="10" placeholder="plan_id">
+    起始 global_seq <input id="evStartSeq" type="number" min="0" style="width:90px" placeholder="0">
+    起 <input id="evStart" type="datetime-local" step="1" style="width:175px">
+    止 <input id="evEnd" type="datetime-local" step="1" style="width:175px">
+  </div>
+  <div style="margin-top:4px">
+    事件类型(可空=全部)
+    <select id="evTypes" multiple size="3" style="vertical-align:top;min-width:200px"></select>
+    来源
+    <select id="evSources" multiple size="3" style="vertical-align:top">
+      <option value="internal">internal</option>
+      <option value="api">api</option>
+      <option value="system">system</option>
+    </select>
+    每页 <input id="evLimit" type="number" value="20" min="1" max="500" style="width:70px">
+    <button onclick="evCreateSession()">创建固定边界会话</button>
+  </div>
+  <div id="evSession" style="margin-top:8px"></div>
+  <div id="evPages" style="margin-top:6px"></div>
+
+  <div style="margin-top:10px;border-top:1px dashed #90caf9;padding-top:8px">
+    <b>2. 证据导出任务</b>
+    <span class="muted">会话 <b id="evExportSidLabel">-</b></span>
+    <div style="margin-top:4px">
+      会话 <input id="evExportSid" size="12" placeholder="ES...">
+      段大小 <input id="evSegSize" type="number" value="200" min="1" max="1000" style="width:80px">
+      <button onclick="evCreateExport()">创建导出任务</button>
+      <button class="plain" onclick="evRefreshExports()">刷新导出列表</button>
+    </div>
+  </div>
+  <div id="evExports" style="margin-top:6px"></div>
+  <div id="evMsg" class="msg"></div>
 </div>
 
 <div class="card">
@@ -2591,6 +2636,272 @@ function renderAuditReplay(s) {
   arRenderSnapshots(s.audit_snapshots || []);
   arRenderComps(s.compensations || []);
 }
+
+
+// ======================================================================
+// ---------- 审计证据查询与一致性证明 ----------
+// ======================================================================
+const EV_EVENT_TYPES = AR_EVENT_TYPES;
+let evState = { session: null, cursor: null, pages: [] };
+
+(function evInit() {
+  const sel = document.getElementById('evTypes');
+  for (const t of EV_EVENT_TYPES) {
+    const o = document.createElement('option'); o.value = t; o.textContent = t;
+    sel.appendChild(o);
+  }
+})();
+
+function evLocalIso(id) {
+  const v = document.getElementById(id).value;
+  return v ? new Date(v).toISOString() : null;
+}
+function evSelected(id) {
+  return [...document.getElementById(id).selectedOptions].map(o => o.value);
+}
+function evKey() {
+  return 'ev-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+}
+function evOp() { return document.getElementById('operator').value || 'admin'; }
+function evMsg(msg, cls='') {
+  const el = document.getElementById('evMsg');
+  el.className = 'msg ' + cls;
+  el.textContent = msg;
+}
+async function evPost(url, body) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(body)});
+  let j=null; try{j=await r.json();}catch(e){}
+  return {ok:r.ok, status:r.status, json:j};
+}
+
+async function evCreateSession() {
+  const plan = document.getElementById('evPlan').value.trim();
+  if (!plan) { evMsg('请填写 plan_id', 'err'); return; }
+  const body = { operator: evOp(), idempotency_key: evKey(), plan_id: plan,
+                 event_types: evSelected('evTypes'),
+                 sources: evSelected('evSources') };
+  const sgs = document.getElementById('evStartSeq').value;
+  if (sgs) body.start_global_seq = parseInt(sgs, 10);
+  const st = evLocalIso('evStart'); if (st) body.start_ts = st;
+  const et = evLocalIso('evEnd'); if (et) body.end_ts = et;
+  const res = await evPost('/api/admin/evidence/sessions', body);
+  if (!res.ok) { evMsg('创建会话失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  evState = { session: res.json, cursor: null, pages: [] };
+  document.getElementById('evExportSid').value = res.json.session_id;
+  document.getElementById('evExportSidLabel').textContent = res.json.session_id;
+  evRenderSession();
+  document.getElementById('evPages').innerHTML =
+    '<div class="muted">会话已固定边界, 点击"下一页"开始带哈希链证明的翻页</div>';
+  evMsg('会话已创建: 固定边界 upper_global_seq=' + res.json.boundary.upper_global_seq
+        + ', 预期事件 ' + res.json.expected_count + ' 个', 'ok');
+  evRefreshExports();
+}
+
+function evBadge(status) { return `<span class="badge EV_${status}">${status}</span>`; }
+
+function evRenderSession() {
+  const s = evState.session;
+  if (!s) return;
+  const f = s.filters, b = s.boundary;
+  let anchorRows = Object.entries(b.anchors || {}).map(([k,v]) =>
+    `<tr><td>${arEscape(k)}</td><td>${v.tail_stream_seq}</td>
+      <td title="边界 hash">${String(v.tail_stream_hash).slice(0,16)}…</td>
+      <td>${v.tail_global_seq}</td></tr>`).join('');
+  document.getElementById('evSession').innerHTML = `
+    <div>会话 <b>${s.session_id}</b> ${evBadge(s.status)}
+      <span class="muted">创建者 ${arEscape(s.created_by)} · ${s.created_at}</span></div>
+    <table style="margin-top:6px"><thead><tr><th>固定条件</th><th>固定边界</th></tr></thead>
+      <tbody><tr><td>
+        计划 ${arEscape(s.plan_id)}<br>
+        起始 global_seq≥${f.start_global_seq}<br>
+        时间 ${f.start_ts||'−'} ~ ${f.end_ts||'−'}<br>
+        类型 ${arEscape((f.event_types||[]).join(', ')||'全部')}<br>
+        来源 ${arEscape((f.sources||[]).join(', ')||'全部')}<br>
+        涉及流 ${(f.streams||[]).map(x=>`<span class="tag">${arEscape(x)}</span>`).join('')}
+      </td><td>
+        upper_global_seq=<b>${b.upper_global_seq}</b><br>
+        边界事件时间 ${b.upper_event_ts||'−'}<br>
+        预期事件数 <b>${s.expected_count}</b>, 流数 ${(s.expected_streams||[]).length}<br>
+        当前游标 delivered=${s.cursor?.delivered_global_seq ?? 0},
+        已交付 ${s.pages_delivered ?? (evState.pages.length)} 页
+      </td></tr></tbody></table>
+    <details style="margin-top:4px"><summary class="muted">边界流锚点(${Object.keys(b.anchors||{}).length})</summary>
+      <table><thead><tr><th>流</th><th>尾 stream_seq</th><th>尾 hash</th><th>尾 global_seq</th></tr></thead>
+      <tbody>${anchorRows}</tbody></table></details>
+    <div style="margin-top:6px">
+      <button onclick="evNextPage()">下一页(带证明)</button>
+      <button class="plain" onclick="evRefreshSession()">刷新会话</button>
+      <span class="muted">每页 limit=${document.getElementById('evLimit').value}</span>
+    </div>`;
+}
+
+async function evRefreshSession() {
+  if (!evState.session) return;
+  const res = await fetch('/api/admin/evidence/sessions/' + evState.session.session_id);
+  evState.session = await res.json();
+  evRenderSession();
+}
+
+async function evNextPage() {
+  if (!evState.session) { evMsg('请先创建会话', 'err'); return; }
+  const limit = parseInt(document.getElementById('evLimit').value || '20', 10);
+  const res = await evPost(
+    '/api/admin/evidence/sessions/' + evState.session.session_id + '/pages',
+    { operator: evOp(), cursor: evState.cursor, limit });
+  if (!res.ok) {
+    const d = res.json?.detail || {};
+    const breaks = d.breaks || [];
+    document.getElementById('evPages').insertAdjacentHTML('beforeend',
+      `<pre class="msg err">${res.status===409?'游标错误':'哈希链校验失败, 已拒绝导出并锁定会话'}:\n`
+      + breaks.map(x=>`[${x.code}] ${x.message}` + (x.stream_key?` (流 ${x.stream_key} stream_seq=${x.stream_seq} global_seq=${x.global_seq??'-'})`:'')).join('\n')
+      + '</pre>');
+    evMsg('校验失败: ' + (d.reason||''), 'err');
+    evRefreshSession();
+    return;
+  }
+  const j = res.json;
+  evState.cursor = j.cursor.next_cursor;
+  evState.pages.push(j);
+  evState.session.status = j.session_status;
+  evRenderSession();
+  evRenderPage(j);
+  evMsg(`第 ${j.page_no} 页: ${j.item_count} 个事件, 证明 ${j.proof.status}, `
+        + `片段摘要 ${(j.proof.fragment_digest||'').slice(0,16)}…`
+        + (j.cursor.has_more ? '' : ' (已到固定边界)'), 'ok');
+}
+
+function evRenderPage(j) {
+  const rows = j.items.map(i => `
+    <tr>
+      <td>${i.global_seq}</td>
+      <td><span class="tag">${arEscape(i.flow)}</span><br>
+          <span class="muted">${arEscape(i.stream_key)}#${i.stream_seq}</span></td>
+      <td>${arEscape(i.event_type)}</td>
+      <td>${arEscape(i.operator)}<br><span class="muted">${arEscape(i.source)}</span></td>
+      <td>${arEscape(i.batch_id||'')}${i.step_seq?(' / 步骤'+i.step_seq):''}
+          ${i.is_compensation_control?`<br><span class="tag">补偿 ${arEscape(i.comp_task_id||'')}#${i.comp_action_seq??'-'}</span>`:''}</td>
+      <td>${i.event_ts||''}</td>
+      <td title="${arEscape(JSON.stringify(i.payload))}">${arEscape((i.stream_hash||'').slice(0,10))}…</td>
+    </tr>`).join('');
+  const sb = Object.entries(j.proof.stream_boundaries||{}).map(([k,v]) =>
+    `<span class="tag">${arEscape(k)}: seq ${v.first_stream_seq}→${v.last_stream_seq}</span>`).join('');
+  const html = `
+  <div style="margin-top:8px;border-top:1px dashed #90caf9;padding-top:6px">
+    <b>第 ${j.page_no} 页</b>
+    <span class="muted">global_seq ${j.items[0]?.global_seq??'-'} .. ${j.items[j.items.length-1]?.global_seq??'-'}
+      · 前边界 ${j.proof.prev_global_seq} · ${j.item_count} 事件 · has_more=${j.cursor.has_more}</span>
+    <table><thead><tr><th>global_seq</th><th>流/流序</th><th>类型</th><th>操作者/来源</th>
+      <th>关联批次/补偿</th><th>事件时间</th><th>stream_hash</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    <div class="muted">片段前后边界流位置: ${sb||'(空页)'}<br>
+      片段摘要: ${j.proof.fragment_digest||'(空页)'}<br>
+      next_cursor: <code>${arEscape(j.cursor.next_cursor||'(无, 已到边界)')}</code></div>
+  </div>`;
+  document.getElementById('evPages').insertAdjacentHTML('beforeend', html);
+}
+
+// ---------- 导出任务 ----------
+async function evCreateExport() {
+  const sid = document.getElementById('evExportSid').value.trim() || evState.session?.session_id;
+  if (!sid) { evMsg('请填写会话 id', 'err'); return; }
+  const size = parseInt(document.getElementById('evSegSize').value || '200', 10);
+  const res = await evPost('/api/admin/evidence/exports',
+    { operator: evOp(), idempotency_key: evKey(), session_id: sid, segment_size: size });
+  if (!res.ok) { evMsg('创建导出失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  evMsg('导出任务已创建/幂等回显: ' + res.json.export_id + ' (' + res.json.status + ')', 'ok');
+  evRefreshExports();
+}
+
+async function evExportControl(eid, action) {
+  const res = await evPost(`/api/admin/evidence/exports/${eid}/${action}`,
+    { operator: evOp(), idempotency_key: evKey() });
+  if (!res.ok) { evMsg(action+' 失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); }
+  else { evMsg(action + ': ' + (res.json.detail||res.json.reason||'ok'), 'ok'); }
+  evRefreshExports();
+}
+
+async function evVerify(eid) {
+  const r = await fetch(`/api/admin/evidence/exports/${eid}/verify?operator=${encodeURIComponent(evOp())}`);
+  const j = await r.json();
+  evMsg('校验结果: ' + (j.valid?'通过':'失败 ' + (j.issues||[]).join('; ')), j.valid?'ok':'err');
+  evRefreshExports();
+}
+
+async function evIssueToken(eid) {
+  const res = await evPost(`/api/admin/evidence/exports/${eid}/download-token`,
+    { operator: evOp(), idempotency_key: evKey() });
+  if (!res.ok) { evMsg('签发下载令牌失败: ' + JSON.stringify(res.json?.detail||res.json), 'err'); return; }
+  const url = '/api/admin/evidence/downloads/' + res.json.token
+            + '?operator=' + encodeURIComponent(evOp());
+  const a = document.createElement('a'); a.href=url; a.textContent=' 下载证据包(一次性)';
+  evMsg('一次性下载令牌已签发(过期 ' + res.json.expires_at + '): ', 'ok');
+  document.getElementById('evMsg').appendChild(a);
+}
+
+function evToggle(id) {
+  const el = document.getElementById(id);
+  el.style.display = el.style.display === 'none' ? '' : 'none';
+}
+
+async function evRefreshExports() {
+  const sid = document.getElementById('evExportSid').value.trim()
+              || evState.session?.session_id || '';
+  const q = sid ? ('?session_id=' + encodeURIComponent(sid)) : '';
+  const rows = await (await fetch('/api/admin/evidence/exports' + q)).json();
+  document.getElementById('evExports').innerHTML = rows.map(e => `
+    <div style="border:1px solid #ddd;border-radius:6px;padding:8px;margin-top:6px">
+      <div>${evBadge(e.status)} <b>${e.export_id}</b>
+        <span class="muted">会话 ${arEscape(e.session_id)} · 计划 ${arEscape(e.plan_id)} · ${e.created_at}</span></div>
+      <div class="muted" style="margin:4px 0">
+        分段 ${e.completed_segments}/${e.total_segments} · 事件 ${e.exported_events}/${e.total_events}
+        · 段大小 ${e.segment_size} · 序号 ${e.first_global_seq??'-'}..${e.last_global_seq??'-'}
+        ${e.paused_reason?` · <span class="err">暂停原因: ${arEscape(e.paused_reason)}</span>`:''}
+        ${e.failure_reason?` · <span class="err">失败: ${arEscape(e.failure_code||'')} ${arEscape(e.failure_reason)}</span>`:''}
+      </div>
+      ${e.chain_break?`<pre class="msg err" style="margin:4px 0">断链证据[${e.chain_break.code}]: ${arEscape(e.chain_break.message)}
+流 ${arEscape(e.chain_break.stream_key||'')} stream_seq=${e.chain_break.stream_seq??'-'} global_seq=${e.chain_break.global_seq??'-'} (分段 ${e.chain_break.at_segment??'-'})</pre>`:''}
+      ${e.manifest_hash?`<div class="muted">manifest_hash <code>${arEscape(e.manifest_hash)}</code>
+        · content_digest <code>${arEscape(e.content_digest||'')}</code> · 包大小 ${e.package_size} · 已下载 ${e.download_count} 次</div>`:''}
+      <div style="margin-top:4px">
+        <button class="plain" onclick="evExportControl('${e.export_id}','pause')">暂停</button>
+        <button class="plain" onclick="evExportControl('${e.export_id}','resume')">恢复(重新校验后续跑)</button>
+        <button class="danger" onclick="evExportControl('${e.export_id}','cancel')">取消</button>
+        <button class="plain" onclick="evVerify('${e.export_id}')">摘要校验</button>
+        <button onclick="evIssueToken('${e.export_id}')">签发一次性下载</button>
+        <button class="plain" onclick="evToggle('evd-${e.export_id}')">分段/事件详情</button>
+      </div>
+      <div id="evd-${e.export_id}" style="display:none;margin-top:6px"><div id="evdd-${e.export_id}"></div></div>
+    </div>`).join('') || '<div class="muted">暂无导出任务</div>';
+  // 懒加载详情
+  for (const e of rows) {
+    fetch('/api/admin/evidence/exports/' + e.export_id).then(r=>r.json()).then(d=>{
+      const host = document.getElementById('evdd-' + e.export_id);
+      if (!host) return;
+      const segs = (d.segments||[]).map(x=>`<tr><td>${x.segment_no}</td><td>${x.status}</td>
+        <td>${x.event_count}</td><td>${x.from_global_seq}..${x.to_global_seq}</td>
+        <td title="${arEscape(x.fragment_digest||'')}">${(x.fragment_digest||'').slice(0,12)}…</td><td>${x.attempts}</td></tr>`).join('');
+      const streams = Object.entries((d.manifest&&d.manifest.streams)||{}).map(([k,v])=>
+        `<tr><td>${arEscape(k)}</td><td>${v.kind}</td><td>${v.event_count}</td>
+         <td>${v.first_stream_seq}..${v.last_stream_seq}</td>
+         <td title="${arEscape(v.stream_digest)}">${v.stream_digest.slice(0,12)}…</td>
+         <td>${arEscape((v.operators||[]).join(','))}</td></tr>`).join('');
+      const evs = (d.events||[]).slice(-12).reverse().map(x=>
+        `<tr><td>${x.ts}</td><td>${arEscape(x.event)}</td><td>${arEscape(x.operator)}</td>
+         <td class="muted">${arEscape((x.reason||'').slice(0,120))}</td></tr>`).join('');
+      host.innerHTML = `
+        <b>分段</b><table><thead><tr><th>#</th><th>状态</th><th>事件数</th><th>global_seq</th><th>摘要</th><th>尝试</th></tr></thead><tbody>${segs}</tbody></table>
+        <b style="display:inline-block;margin-top:6px">流摘要(manifest)</b>
+        <table><thead><tr><th>流</th><th>类型</th><th>事件数</th><th>stream_seq</th><th>流摘要</th><th>操作者</th></tr></thead><tbody>${streams}</tbody></table>
+        <b style="display:inline-block;margin-top:6px">最近事件</b>
+        <table><thead><tr><th>时间</th><th>事件</th><th>操作者</th><th>原因</th></tr></thead><tbody>${evs}</tbody></table>`;
+    });
+  }
+}
+setInterval(() => {
+  const host = document.getElementById('evExports');
+  if (host && host.querySelector('.EV_RUNNING,.EV_QUEUED')) evRefreshExports();
+}, 3000);
 
 setInterval(refresh, 3000);
 </script>

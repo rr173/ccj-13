@@ -312,3 +312,39 @@ class CompensationRetry(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
     action_seq: int = Field(ge=1)
+
+
+# ---------- 审计证据查询与一致性证明 ----------
+
+class EvidenceSessionCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    plan_id: str = Field(min_length=1)
+    start_global_seq: Optional[int] = Field(default=None, ge=0)
+    start_ts: Optional[str] = None                  # ISO 8601 闭区间
+    end_ts: Optional[str] = None
+    event_types: Optional[list[str]] = None         # 白名单: AUDIT_EVENT_TYPES
+    sources: Optional[list[str]] = None             # internal | api | system
+
+
+class EvidencePageQuery(BaseModel):
+    operator: str = Field(min_length=1)
+    cursor: Optional[str] = None                    # 上一页签发的 next_cursor
+    limit: Optional[int] = Field(default=None, ge=1, le=500)
+
+
+class EvidenceExportCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    session_id: str = Field(min_length=1)
+    segment_size: Optional[int] = Field(default=None, ge=1, le=1000)
+
+
+class EvidenceExportAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+
+
+class EvidenceDownloadIssue(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)

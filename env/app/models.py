@@ -1449,3 +1449,241 @@ class CompensationWindow(Base):
     ends_at = Column(DateTime, nullable=False)
     created_by = Column(String(128), nullable=False)
     created_at = Column(DateTime, default=_utcnow)
+
+
+# ======================================================================
+# ---------- 审计证据查询与一致性证明(evidence) ----------
+# ======================================================================
+# 证据查询会话状态机:
+#   ACTIVE  可继续翻页(每页重算哈希链与边界, 通过才返回片段)
+#   BROKEN  翻页校验发现缺失/乱序/重复/哈希不一致, 会话锁定不可继续
+#           (已有页面仍可查询, 证据导出被拒绝)
+#   CLOSED  已翻到固定边界(最后一页之后), 无更多事件; 导出仍可创建
+# 证据导出任务状态机:
+#   QUEUED(排队等并发额度) --claim--> RUNNING --全部分段+清单完成--> COMPLETED(终态)
+#   QUEUED/RUNNING --pause--> PAUSED --resume--> QUEUED(从上次成功分段续跑)
+#   导出期间事件链变化 --> PAUSED(chain_changed, 记录断链证据; 不产出"完整"标记的包)
+#   任意活动状态 --cancel--> CANCELED(终态, 禁止继续)
+#   可恢复错误 --> FAILED(可 resume, 已完成分段不重写; 失败重试不重复写包)
+EVIDENCE_SESSION_STATUSES = ("ACTIVE", "BROKEN", "CLOSED")
+EVIDENCE_EXPORT_STATUSES = ("QUEUED", "RUNNING", "PAUSED", "COMPLETED",
+                            "FAILED", "CANCELED")
+EVIDENCE_EXPORT_ACTIVE_STATUSES = ("QUEUED", "RUNNING", "PAUSED", "FAILED")
+EVIDENCE_EXPORT_TERMINAL_STATUSES = ("COMPLETED", "CANCELED")
+# 翻页/导出校验失败原因(机器可读):
+#   global_seq_gap      全局序号出现缺口(边界内事件被删除)
+#   global_seq_out_of_order 全局序号非严格递增(乱序)
+#   global_seq_duplicate 片段内/相对已交付位置出现重复 global_seq
+#   stream_seq_gap      单流顺序号不连续(流内事件缺失)
+#   stream_seq_duplicate 单流顺序号重复
+#   stream_hash_mismatch 重算 stream_hash 与存储不一致(事件被篡改)
+#   prev_hash_mismatch  事件的 prev_stream_hash 与流上前一事件不衔接
+#   boundary_anchor_mismatch 固定边界锚点被破坏(边界内/边界事件被删改)
+#   out_of_order        事件时间戳倒流超过容忍阈值(乱序事件)
+#   cursor_invalid      cursor 不属于该会话或已被后续页超越
+EVIDENCE_BREAK_REASONS = (
+    "global_seq_gap", "global_seq_out_of_order", "global_seq_duplicate",
+    "stream_seq_gap", "stream_seq_duplicate", "stream_hash_mismatch",
+    "prev_hash_mismatch", "boundary_anchor_mismatch", "out_of_order",
+    "cursor_invalid",
+)
+
+
+class EvidenceSession(Base):
+    """持久化证据查询会话: 创建时固定筛选条件、起始 global_seq 与读取边界。
+
+    - 固定边界 upper_global_seq 为创建时刻全库最大 global_seq; 之后新写入事件
+      global_seq 更大, 永远不会插入已开始的结果集;
+    - boundary_anchors 固定各涉及流在边界处的 (stream_seq, stream_hash,
+      global_seq) 及边界事件前一事件锚点, 每页校验边界事件未被删改;
+    - 翻页只沿同一会话继续: cursor 必须是该会话上一页签发的 next_cursor,
+      服务端 delivered_checkpoint 单调推进, 漏页/跳页/重页一律拒绝;
+    - 任何一致性校验失败 -> BROKEN(锁定), 断链位置与原因机器可读、永久保留。"""
+
+    __tablename__ = "evidence_sessions"
+    __table_args__ = (
+        Index("ix_evidence_sessions_plan", "plan_id"),
+    )
+
+    id = Column(String(32), primary_key=True)          # "ES" + 随机串
+    plan_id = Column(String(32), nullable=False, index=True)
+    # 固定的筛选条件(创建后不可变)
+    start_global_seq = Column(Integer, nullable=False, default=0)
+    start_ts = Column(DateTime, nullable=True)
+    end_ts = Column(DateTime, nullable=True)
+    event_types = Column(JSON, nullable=False, default=list)
+    sources = Column(JSON, nullable=False, default=list)
+    include_streams = Column(JSON, nullable=False, default=list)
+    # 创建时刻固定的读取边界(新写入不影响本会话)
+    upper_global_seq = Column(Integer, nullable=False)
+    upper_event_id = Column(Integer, nullable=False)
+    upper_event_ts = Column(DateTime, nullable=True)
+    # 边界处各流锚点: {stream_key: {tail_stream_seq, tail_stream_hash,
+    #                              tail_global_seq, anchor_stream_seq,
+    #                              anchor_stream_hash, anchor_global_seq}}
+    boundary_anchors = Column(JSON, nullable=False, default=dict)
+    expected_count = Column(Integer, nullable=False, default=0)
+    expected_streams = Column(JSON, nullable=False, default=list)
+    # 翻页状态: 已交付到的全局位置(单调推进)与最近签发/使用的游标
+    delivered_global_seq = Column(Integer, nullable=False, default=0)
+    delivered_event_id = Column(Integer, nullable=False, default=0)
+    last_cursor = Column(String(200), nullable=True)
+    pages_delivered = Column(Integer, nullable=False, default=0)
+    status = Column(String(16), nullable=False, default="ACTIVE", index=True)
+    broken_reason = Column(JSON, nullable=True)        # 首个断链证据(机器可读)
+    broken_at = Column(DateTime, nullable=True)
+    closed_at = Column(DateTime, nullable=True)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+
+    exports = relationship("EvidenceExport", cascade="all, delete-orphan",
+                           order_by="EvidenceExport.created_at")
+    pages = relationship("EvidencePage", cascade="all, delete-orphan",
+                         order_by="EvidencePage.page_no")
+
+
+class EvidencePage(Base):
+    """会话每次成功翻页的只追加留痕: 片段范围、条目数、片段前后边界与
+    片段内容哈希链摘要(供导出/审计核对"哪些片段已向谁交付")。"""
+
+    __tablename__ = "evidence_pages"
+    __table_args__ = (
+        UniqueConstraint("session_id", "page_no", name="uq_evidence_page_no"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    session_id = Column(String(32), ForeignKey("evidence_sessions.id"),
+                        nullable=False, index=True)
+    page_no = Column(Integer, nullable=False)
+    from_global_seq = Column(Integer, nullable=False)
+    to_global_seq = Column(Integer, nullable=False)
+    event_count = Column(Integer, nullable=False, default=0)
+    # 片段摘要: sha256(规范化后的全部事件行), 与导出包同算法可复算
+    fragment_digest = Column(String(64), nullable=False)
+    # 该页涉及流在片段首尾的链位置
+    stream_boundaries = Column(JSON, nullable=False, default=dict)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class EvidenceExport(Base):
+    """证据导出任务: 基于证据会话异步分段生成确定性 JSONL 证据包。
+
+    - 分段: 边界内事件按 global_seq 固定大小切分, 每段一个 JSONL 文件;
+      段内容与文件名完全由(会话边界, 段序号)决定, 重跑幂等、不重复写包;
+    - 导出期间检测到事件链变化(边界锚点/哈希链被破坏) -> 自动 PAUSED 并
+      记录断链证据(chain_break), 绝不产出标记为 COMPLETED 的包;
+      resume 前从边界起点重新全量校验, 通过后从首个未完成分段续跑;
+    - 失败重试: 已完成分段(fragment_digest 已固化)直接复用, 不重写;
+    - 包完成后 manifest(逐段/逐流摘要 + 整体 manifest_hash)随包与库双份保存,
+      可离线复算; 下载走一次性下载令牌。"""
+
+    __tablename__ = "evidence_exports"
+    __table_args__ = (
+        Index("ix_evidence_exports_session", "session_id"),
+    )
+
+    id = Column(String(32), primary_key=True)              # "EE" + 随机串
+    session_id = Column(String(32), ForeignKey("evidence_sessions.id"),
+                        nullable=False, index=True)
+    plan_id = Column(String(32), nullable=False, index=True)
+    status = Column(String(16), nullable=False, default="QUEUED", index=True)
+    # 分段参数(创建时固化)
+    segment_size = Column(Integer, nullable=False, default=200)
+    total_segments = Column(Integer, nullable=False, default=0)
+    completed_segments = Column(Integer, nullable=False, default=0)
+    current_segment = Column(Integer, nullable=True)
+    total_events = Column(Integer, nullable=False, default=0)
+    exported_events = Column(Integer, nullable=False, default=0)
+    first_global_seq = Column(Integer, nullable=True)
+    last_global_seq = Column(Integer, nullable=True)
+    # 断链暂停证据(链变化时记录: 原因码/位置/受影响流/说明)
+    chain_break = Column(JSON, nullable=True)
+    paused_reason = Column(String(32), nullable=True)      # user_paused | chain_changed
+    failure_code = Column(String(40), nullable=True)
+    failure_reason = Column(String(500), nullable=True)
+    # 完成后产物
+    package_path = Column(String(500), nullable=True)
+    package_size = Column(Integer, nullable=True)
+    manifest = Column(JSON, nullable=True)
+    content_digest = Column(String(64), nullable=True, index=True)
+    manifest_hash = Column(String(64), nullable=True)
+    digest_algorithm = Column(String(16), nullable=False, default="sha256")
+    download_count = Column(Integer, nullable=False, default=0)
+    created_by = Column(String(128), nullable=False)
+    updated_by = Column(String(128), nullable=True)
+    started_at = Column(DateTime, nullable=True)
+    finished_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    segments = relationship("EvidenceExportSegment", cascade="all, delete-orphan",
+                            order_by="EvidenceExportSegment.segment_no")
+    events = relationship("EvidenceExportEvent", cascade="all, delete-orphan",
+                          order_by="EvidenceExportEvent.id")
+    downloads = relationship("EvidenceDownload", cascade="all, delete-orphan",
+                             order_by="desc(EvidenceDownload.id)")
+
+
+class EvidenceExportSegment(Base):
+    """导出任务的单个分段(崩溃边界): 段范围、事件数、JSONL 行摘要与段文件
+    摘要落库后该段即为已完成, 重启/失败重跑直接复用, 绝不重复写包。"""
+
+    __tablename__ = "evidence_export_segments"
+    __table_args__ = (
+        UniqueConstraint("export_id", "segment_no", name="uq_evidence_seg_no"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    export_id = Column(String(32), ForeignKey("evidence_exports.id"),
+                       nullable=False, index=True)
+    segment_no = Column(Integer, nullable=False)           # 从 1 开始
+    from_global_seq = Column(Integer, nullable=False)
+    to_global_seq = Column(Integer, nullable=False)
+    event_count = Column(Integer, nullable=False, default=0)
+    file_name = Column(String(128), nullable=False)
+    file_size = Column(Integer, nullable=True)
+    # 逐行 sha256 有序拼接后的摘要; 同时是段文件字节摘要
+    fragment_digest = Column(String(64), nullable=True)
+    file_digest = Column(String(64), nullable=True)
+    # 该段各流的链位置(段首尾 stream_seq/hash), 供续跑衔接校验
+    stream_boundaries = Column(JSON, nullable=False, default=dict)
+    status = Column(String(16), nullable=False, default="PENDING")  # PENDING|DONE
+    attempts = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+
+class EvidenceExportEvent(Base):
+    """导出任务事件流水(只追加): 创建/排队/认领/分段开始/分段完成/暂停(用户/
+    断链)/恢复/失败/重试/取消/完成/下载令牌签发。"""
+
+    __tablename__ = "evidence_export_events"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=_utcnow)
+    export_id = Column(String(32), ForeignKey("evidence_exports.id"),
+                       nullable=False, index=True)
+    segment_no = Column(Integer, nullable=True)
+    event = Column(String(48), nullable=False)
+    operator = Column(String(128), nullable=False)
+    reason = Column(String(500), nullable=True)
+    detail = Column(JSON, nullable=True)
+
+
+class EvidenceDownload(Base):
+    """证据包一次性下载令牌: 创建即持久化(支持重启后兑换), 首次下载即标记
+    已用(used_at/used_by/used_ip), 再次使用被拒绝。"""
+
+    __tablename__ = "evidence_downloads"
+
+    id = Column(String(48), primary_key=True)               # "ED" + 随机串
+    token_hash = Column(String(64), nullable=False, unique=True, index=True)
+    export_id = Column(String(32), ForeignKey("evidence_exports.id"),
+                       nullable=False, index=True)
+    session_id = Column(String(32), nullable=False)
+    issued_by = Column(String(128), nullable=False)
+    issued_at = Column(DateTime, default=_utcnow)
+    used_at = Column(DateTime, nullable=True)
+    used_by = Column(String(128), nullable=True)
+    expires_at = Column(DateTime, nullable=True)

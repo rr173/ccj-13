@@ -9,20 +9,23 @@ from sqlalchemy.orm import Session
 from .db import Base, SessionLocal, engine
 from .models import (
     REVIEW_STATUSES, ArchiveCleanupPlan, AuditLog, AuditSnapshot,
-    CompensationTask, MigrationBatch, MigrationPlan, QUALITY_ISSUE_STATUSES,
-    QUALITY_SCAN_STATUSES, QualityScan, RecordNew, RecordOld, ReplayArchive,
-    ReplayBatchOp, ReplayCheckpoint, ReplayTask,
+    CompensationTask, EvidenceExport, EvidenceSession, MigrationBatch,
+    MigrationPlan, QUALITY_ISSUE_STATUSES, QUALITY_SCAN_STATUSES, QualityScan,
+    RecordNew, RecordOld, ReplayArchive, ReplayBatchOp, ReplayCheckpoint,
+    ReplayTask,
 )
 from .plans import PlanWorker
 from .quality import QualityWorker
 from .replay import ReplayWorker
-from . import archives, auditreplay, cleanup, plans, quality, replay, service
+from . import archives, auditreplay, cleanup, evidence, plans, quality, replay, service
 from .schemas import (
     AdminAction, ArchiveAction, ArchiveCreate, ArchiveRetention,
     AuditEventNote, AuditSnapshotCreate, BatchCreate, CheckpointCreate, CleanupAction,
     CleanupCreate, CompensationAction, CompensationApprovalAction,
     CompensationCancelAction, CompensationCreate, CompensationRejectAction,
-    CompensationRetry, CompensationWindowAction, PlanAction, PlanCreate,
+    CompensationRetry, CompensationWindowAction, EvidenceDownloadIssue,
+    EvidenceExportAction, EvidenceExportCreate, EvidencePageQuery,
+    EvidenceSessionCreate, PlanAction, PlanCreate,
     PlanRejectAction, PlanWindowAction, QualityExemptionCreate,
     QualityExemptionRevoke, QualityFixCreate, QualityRulesSave, QualityScanAction,
     QualityScanCreate, RecordIn, RecoverAction, ReplayAction, ReplayCreate,
@@ -45,6 +48,7 @@ archive_worker = archives.ArchiveWorker()
 cleanup_worker = cleanup.CleanupWorker()
 quality_worker = QualityWorker()
 compensation_worker = auditreplay.CompensationWorker()
+evidence_worker = evidence.EvidenceExportWorker()
 
 
 def get_db():
@@ -214,7 +218,11 @@ def startup():
         # 动作进度/失败原因/撤销镜像全部保留, worker 从安全位置续跑
         auditreplay.boot_recover_compensation(db)
         db.commit()
+        # 证据导出重启对账: 遗留 RUNNING 导出回排队, 已完成分段与摘要保留
+        evidence.boot_recover_exports(db)
+        db.commit()
         archives.ensure_store_dir()
+        evidence.ensure_store_dir()
     finally:
         db.close()
     if _worker_enabled():
@@ -224,6 +232,7 @@ def startup():
         cleanup_worker.start()
         quality_worker.start()
         compensation_worker.start()
+        evidence_worker.start()
 
 
 @app.on_event("shutdown")
@@ -234,6 +243,7 @@ def shutdown():
     cleanup_worker.stop()
     quality_worker.stop()
     compensation_worker.stop()
+    evidence_worker.stop()
 
 
 # ---------- 错误映射 ----------
@@ -290,6 +300,17 @@ def status(db: Session = Depends(get_db)):
         "replay_concurrency": replay.max_concurrency(),
         "archive_concurrency": archives.max_concurrency(),
         "quality_concurrency": quality.max_concurrency(),
+        "evidence_sessions": [
+            evidence.session_to_dict(s, with_pages=False) for s in
+            (db.query(EvidenceSession)
+             .order_by(EvidenceSession.created_at.desc(),
+                       EvidenceSession.id.desc()).limit(20).all())],
+        "evidence_exports": [
+            evidence.export_to_dict(e, with_segments=False, with_events=False)
+            for e in (db.query(EvidenceExport)
+                      .order_by(EvidenceExport.created_at.desc(),
+                                EvidenceExport.id.desc()).limit(20).all())],
+        "evidence_concurrency": evidence.max_concurrency(),
     }
 
 
@@ -1636,6 +1657,302 @@ def undo_compensation(task_id: str, body: CompensationAction,
         lambda s, _t: auditreplay.task_to_dict(
             auditreplay.undo_all(s, task_id, body.operator)),
         task_id, "comp.undo")
+
+
+# ---------- 审计证据查询与一致性证明(固定边界会话 / 哈希链证明 / 分段导出) ----------
+
+def _evidence_not_found(e: Exception):
+    raise HTTPException(status_code=404, detail={
+        "error": "evidence_not_found", "reason": str(e)})
+
+
+def _evidence_conflict(e: Exception, extra=None):
+    detail = {"error": "evidence_conflict", "reason": str(e)}
+    if extra:
+        detail.update(extra)
+    raise HTTPException(status_code=409, detail=detail)
+
+
+def _evidence_forbidden(e: Exception):
+    raise HTTPException(status_code=403, detail={
+        "error": "evidence_forbidden", "reason": str(e)})
+
+
+@app.post("/api/admin/evidence/sessions", status_code=201)
+def create_evidence_session(body: EvidenceSessionCreate,
+                            db: Session = Depends(get_db)):
+    """创建持久化证据查询会话: 固定筛选条件、起始 global_seq 与读取边界。
+
+    边界 upper_global_seq 在创建时刻确定, 之后新写入事件不会插入本会话结果集。
+    同 idempotency_key 重放返回首次会话。"""
+    if body.event_types:
+        bad = [t for t in body.event_types
+               if t not in auditreplay.AUDIT_EVENT_TYPES]
+        if bad:
+            raise HTTPException(status_code=422, detail={
+                "error": "invalid_event_type",
+                "reason": f"事件类型必须是 {list(auditreplay.AUDIT_EVENT_TYPES)} 之一",
+                "bad": bad})
+    if body.sources:
+        bad = [s for s in body.sources if s not in ("internal", "api", "system")]
+        if bad:
+            raise HTTPException(status_code=422, detail={
+                "error": "invalid_source",
+                "reason": "事件来源必须是 internal/api/system 之一", "bad": bad})
+
+    def _do(s):
+        sess = evidence.create_session(
+            s, operator=body.operator, plan_id=body.plan_id,
+            start_global_seq=body.start_global_seq,
+            start_ts=_parse_iso(body.start_ts, "start_ts"),
+            end_ts=_parse_iso(body.end_ts, "end_ts"),
+            event_types=body.event_types, sources=body.sources)
+        out = evidence.session_to_dict(sess)
+        out["status"] = sess.status
+        return out
+
+    try:
+        result, replayed = evidence.run_evidence_action(
+            db, action="session.create", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            session_id=None, fn=_do)
+    except evidence.EvidenceNotFound as e:
+        db.rollback()
+        _evidence_not_found(e)
+    except evidence.EvidenceStateError as e:
+        db.rollback()
+        _evidence_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.get("/api/admin/evidence/sessions")
+def list_evidence_sessions(plan_id: str | None = None,
+                           status_filter: str | None = None,
+                           limit: int = 50, db: Session = Depends(get_db)):
+    from .models import EVIDENCE_SESSION_STATUSES
+    q = db.query(EvidenceSession)
+    if plan_id:
+        q = q.filter(EvidenceSession.plan_id == plan_id)
+    if status_filter:
+        if status_filter not in EVIDENCE_SESSION_STATUSES:
+            raise HTTPException(status_code=422, detail={
+                "error": "invalid_session_status",
+                "reason": f"会话状态必须是 {list(EVIDENCE_SESSION_STATUSES)} 之一"})
+        q = q.filter(EvidenceSession.status == status_filter)
+    rows = (q.order_by(EvidenceSession.created_at.desc(),
+                       EvidenceSession.id.desc())
+            .limit(min(max(1, limit), 200)).all())
+    return [evidence.session_to_dict(s) for s in rows]
+
+
+@app.get("/api/admin/evidence/sessions/{session_id}")
+def get_evidence_session(session_id: str, with_pages: bool = True,
+                         db: Session = Depends(get_db)):
+    try:
+        s = evidence.get_session(db, session_id)
+    except evidence.EvidenceNotFound as e:
+        _evidence_not_found(e)
+    return evidence.session_to_dict(s, with_pages=with_pages)
+
+
+@app.post("/api/admin/evidence/sessions/{session_id}/pages")
+def evidence_next_page(session_id: str, body: EvidencePageQuery,
+                       db: Session = Depends(get_db)):
+    """沿会话翻页: 固定边界读取 + 片段哈希链连续性证明。
+
+    发现缺失/乱序/重复/stream_hash 或 prev_hash 不一致 -> 422 拒绝返回,
+    detail.breaks 给出机器可读断链位置与原因, 会话置 BROKEN 不可继续。"""
+    try:
+        return evidence.page_session(
+            db, session_id, operator=body.operator,
+            cursor=body.cursor, limit=body.limit)
+    except evidence.EvidenceNotFound as e:
+        db.rollback()
+        _evidence_not_found(e)
+    except evidence.EvidenceStateError as e:
+        db.rollback()
+        _evidence_conflict(e)
+    except evidence.EvidenceChainBroken as e:
+        db.commit()  # BROKEN 状态与断链证据必须保留
+        code = e.breaks[0].get("code") if e.breaks else None
+        status = 409 if code == "cursor_invalid" else 422
+        raise HTTPException(status_code=status, detail={
+            "error": "evidence_chain_broken",
+            "reason": str(e), "breaks": e.breaks})
+
+
+@app.post("/api/admin/evidence/exports", status_code=201)
+def create_evidence_export(body: EvidenceExportCreate,
+                           db: Session = Depends(get_db)):
+    """基于证据会话创建异步分段 JSONL 证据包导出任务并排队。
+
+    会话断链 -> 409; 活动导出重复创建幂等回显; 同键重放返回首次结果。"""
+
+    def _do(s):
+        e = evidence.create_export(
+            s, operator=body.operator, session_id=body.session_id,
+            segment_size=body.segment_size)
+        out = evidence.export_to_dict(e, with_events=False)
+        out["status"] = e.status
+        return out
+
+    try:
+        result, replayed = evidence.run_evidence_action(
+            db, action="export.create", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            session_id=body.session_id, fn=_do)
+    except evidence.EvidenceNotFound as e:
+        db.rollback()
+        _evidence_not_found(e)
+    except evidence.EvidenceStateError as e:
+        db.rollback()
+        _evidence_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.get("/api/admin/evidence/exports")
+def list_evidence_exports(session_id: str | None = None,
+                          plan_id: str | None = None,
+                          status_filter: str | None = None,
+                          limit: int = 50, db: Session = Depends(get_db)):
+    from .models import EVIDENCE_EXPORT_STATUSES
+    q = db.query(EvidenceExport)
+    if session_id:
+        q = q.filter(EvidenceExport.session_id == session_id)
+    if plan_id:
+        q = q.filter(EvidenceExport.plan_id == plan_id)
+    if status_filter:
+        if status_filter not in EVIDENCE_EXPORT_STATUSES:
+            raise HTTPException(status_code=422, detail={
+                "error": "invalid_export_status",
+                "reason": f"导出状态必须是 {list(EVIDENCE_EXPORT_STATUSES)} 之一"})
+        q = q.filter(EvidenceExport.status == status_filter)
+    rows = (q.order_by(EvidenceExport.created_at.desc(),
+                       EvidenceExport.id.desc())
+            .limit(min(max(1, limit), 200)).all())
+    return [evidence.export_to_dict(e, with_segments=False, with_events=False)
+            for e in rows]
+
+
+@app.get("/api/admin/evidence/exports/{export_id}")
+def get_evidence_export(export_id: str, with_events: bool = True,
+                        db: Session = Depends(get_db)):
+    try:
+        e = evidence.get_export(db, export_id)
+    except evidence.EvidenceNotFound as ex:
+        _evidence_not_found(ex)
+    return evidence.export_to_dict(e, with_segments=True,
+                                   with_events=with_events)
+
+
+def _run_export_control(db: Session, body: EvidenceExportAction,
+                        export_id: str, action: str, fn):
+    try:
+        result, replayed = evidence.run_evidence_action(
+            db, action=action, operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            export_id=export_id,
+            fn=lambda s: fn(s, evidence.get_export(s, export_id),
+                            body.operator))
+    except evidence.EvidenceNotFound as e:
+        db.rollback()
+        _evidence_not_found(e)
+    except evidence.EvidenceStateError as e:
+        db.rollback()
+        _evidence_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/evidence/exports/{export_id}/pause")
+def pause_evidence_export(export_id: str, body: EvidenceExportAction,
+                          db: Session = Depends(get_db)):
+    """暂停导出(在分段边界停住, 已完成分段与摘要保留); 重复暂停幂等。"""
+    return _run_export_control(db, body, export_id, "export.pause",
+                               evidence.do_pause)
+
+
+@app.post("/api/admin/evidence/exports/{export_id}/resume")
+def resume_evidence_export(export_id: str, body: EvidenceExportAction,
+                           db: Session = Depends(get_db)):
+    """恢复导出: 断链暂停时先从固定边界起点重新全量校验, 通过后从首个未完成
+    分段继续(已完成失配分段重生成, 不重复写包); FAILED 可恢复重试。"""
+    return _run_export_control(db, body, export_id, "export.resume",
+                               evidence.do_resume)
+
+
+@app.post("/api/admin/evidence/exports/{export_id}/cancel")
+def cancel_evidence_export(export_id: str, body: EvidenceExportAction,
+                           db: Session = Depends(get_db)):
+    """取消导出(终态, 禁止继续; 已完成分段记录保留, 不产出完整包)。"""
+    return _run_export_control(db, body, export_id, "export.cancel",
+                               evidence.do_cancel)
+
+
+@app.get("/api/admin/evidence/exports/{export_id}/verify")
+def verify_evidence_export(export_id: str, operator: str = "system",
+                           db: Session = Depends(get_db)):
+    """回读证据包重算逐段/逐流/content/manifest 摘要并比对;
+    摘要不一致或包缺失时导出明确置 FAILED 并保留记录。"""
+    try:
+        e = evidence.get_export(db, export_id)
+        return evidence.verify_export(db, e, operator)
+    except evidence.EvidenceNotFound as ex:
+        db.rollback()
+        _evidence_not_found(ex)
+    except evidence.EvidenceStateError as ex:
+        db.rollback()
+        _evidence_conflict(ex)
+
+
+@app.post("/api/admin/evidence/exports/{export_id}/download-token")
+def issue_evidence_download(export_id: str, body: EvidenceDownloadIssue,
+                            db: Session = Depends(get_db)):
+    """为 COMPLETED 证据包签发一次性下载令牌(仅会话创建者; 同键重放幂等)。
+
+    明文 token 仅在本次响应返回; 下载用 GET .../downloads/{token} 兑换,
+    首次下载即失效。"""
+
+    def _do(s):
+        dl = evidence.issue_download_token(
+            s, evidence.get_export(s, export_id), body.operator)
+        out = {"download_id": dl.id, "token": getattr(dl, "token_plain", None),
+               "expires_at": dl.expires_at.isoformat() if dl.expires_at else None,
+               "one_time": True}
+        return out
+
+    try:
+        result, replayed = evidence.run_evidence_action(
+            db, action="export.download_issue", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            export_id=export_id, fn=_do)
+    except evidence.EvidenceNotFound as e:
+        db.rollback()
+        _evidence_not_found(e)
+    except evidence.EvidenceStateError as e:
+        db.rollback()
+        _evidence_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.get("/api/admin/evidence/downloads/{token}")
+def evidence_download(token: str, operator: str = "system",
+                      db: Session = Depends(get_db)):
+    """一次性下载证据包 zip: 令牌首次兑换即失效, 重复/过期/缺失 -> 404/409。"""
+    try:
+        e, path = evidence.redeem_download_token(db, token, operator)
+    except evidence.EvidenceNotFound as ex:
+        db.rollback()
+        _evidence_not_found(ex)
+    except evidence.EvidenceStateError as ex:
+        db.rollback()
+        _evidence_conflict(ex)
+    return FileResponse(
+        path, media_type="application/zip",
+        filename=f"evidence-{e.id}-plan-{e.plan_id}.zip")
 
 
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------

@@ -572,6 +572,86 @@ NORMAL)。`POST /api/admin/compensations` 基于 VALID 快照创建任务(动作
 窗口暂停原因与取消信息**, 提供查询、补录、生成快照、预览、创建任务、
 双人审批/拒绝、预约窗口、执行、重试、取消、撤销操作。
 
+## 审计证据查询与一致性证明
+
+在统一不可变事件流之上, 为运维提供**固定读取边界**的跨流证据时间线与**可复算**的
+分段 JSONL 证据包。严格只读(除自身会话/导出/下载令牌表外不写任何业务数据)。
+
+### 证据查询会话(evidence_sessions / evidence_pages)
+
+- `POST /api/admin/evidence/sessions {plan_id, start_global_seq?, start_ts?, end_ts?,
+  event_types?, sources?}` 按 plan_id 创建**持久化会话**: 一次性固定筛选条件、起始
+  global_seq 与读取边界 `upper_global_seq`(创建时刻全库最大 global_seq)以及每条涉及流
+  (计划流 + 各步骤批次流)的**边界锚点**(尾 stream_seq/hash/global_seq)。补偿控制流
+  (`COMP_*`)追加在计划流上, 因此跨计划流/批次流/补偿控制流的统一时间线天然完整。
+- **固定边界**: 会话之后新写入事件 global_seq 必然更大, 永远不进入已开始的结果集 ——
+  翻页不漏事件、不重复事件, 也不会把新事件插入旧结果; 同计划先后两个会话边界相互独立。
+  无结果是合法边界(`expected_count=0`, 立即 CLOSED, 仍可导出空包)。
+- 翻页 `POST .../sessions/{id}/pages {cursor?, limit?}`: keyset 稳定游标(HMAC 不透明,
+  服务端 `delivered` 位置单调推进), **cursor 只能沿同一会话继续**: 第一页可省略,
+  之后必须用上一页 `next_cursor`; 漏页/重放/跨会话/损坏 → 409 `cursor_invalid`,
+  状态不推进。
+- **每页哈希链连续性证明**(一次请求的固定读取边界内完成):
+  - global_seq 片段内严格递增且不与已交付位置重复(`global_seq_duplicate`);
+  - 按流重算 `stream_hash` 逐行一致(`stream_hash_mismatch`),
+    `prev_stream_hash` 与 DB 实读的流上前一事件衔接(`prev_hash_mismatch`),
+    `stream_seq` 从流上前一事件 +1 连续(`stream_seq_gap`/`stream_seq_duplicate`);
+    **片段前边界事件也自证哈希**(已交付页被篡改照样拦住);
+  - 时间戳倒流超 `AUDIT_MAX_OUT_OF_ORDER_SECONDS` → `out_of_order`;
+  - 各流边界锚点每页复核: 边界内删除/篡改尾事件 → `boundary_anchor_mismatch`
+    (边界之后正常追加不报错, 但其前向哈希必须仍连回锚点)。
+  - 任一失败: **拒绝返回该页**, HTTP 422 + 机器可读 `breaks[]`(原因码/流/stream_seq/
+    global_seq/期望与实际值), 会话置 **BROKEN 锁定**(断链证据永久保留), 不能继续翻页
+    或导出; 需要取证时新建会话。
+- 每条事件返回: 事件来源(`internal/api/system`)、操作者、流归属(`flow=plan/batch`)、
+  关联批次/步骤/扫描、补偿任务 id 与动作 seq、correlation 与逐行哈希;
+  每页返回固定条件/固定边界/当前游标/片段前后流边界/`fragment_digest`。
+  逐页留痕(evidence_pages: 范围/条目数/片段摘要/流边界)持久化可查。
+
+### 证据导出任务(evidence_exports / evidence_export_segments)
+
+异步分段生成**确定性 JSONL 证据包**(zip; worker 受 `EVIDENCE_EXPORT_MAX_CONCURRENCY`
+限制, 随 `PLAN_WORKER_ENABLED` 一并开关):
+
+```
+QUEUED ─claim→ RUNNING ─全部分段+清单完成→ COMPLETED(终态, 包不可变)
+ │               ├─ pause(分段边界)→ PAUSED ─resume→ QUEUED
+ │               ├─ 导出期间事件链变化 → PAUSED(chain_changed, 记录断链证据; 绝不出完整包)
+ │               └─ 可恢复错误 → FAILED ─resume→ QUEUED(失败重试不重复写包)
+ └────────────────────────── cancel → CANCELED(终态, 禁止继续)
+```
+
+- **分段幂等**: 段内容完全由(固定边界, 段序号, 段大小)决定; 段产物
+  (`segments/segment-NNNNN.jsonl` 原子写 + 逐行 `fragment_digest` + 文件 sha256)
+  先落库提交(崩溃边界), 重启/重试只生成缺失或失配段, 好段字节级复用;
+  打包前对全量范围**再做一次链证明**并逐段复算摘要。
+- **导出期间检测到事件链变化 → 自动 PAUSED**(`paused_reason=chain_changed`,
+  `chain_break` 带原因码/流/位置/分段号), 绝不产出标记完整的包; `resume` 前从边界起点
+  **重新全量校验**, 不通过 → 409 保持暂停; 通过后失配段重生成、从首个未完成段继续。
+- 暂停/恢复/取消/创建全部走 `evidence.*` 幂等命名空间(同态重复 `already_in_state`,
+  同键重放 `replayed`); CANCELED 后禁止 resume/pause; FAILED 可 resume
+  (被外部删改的段文件检测后仅重生成该段)。
+- 包内容(确定性 zip, 固定文件顺序/时间戳):
+  - `metadata.json` 会话/边界/筛选/操作者/段大小/内容清单;
+  - `events.jsonl` 全量规范化事件行; `segments/segment-*.jsonl` 分段;
+  - `manifest.json`: 逐段(范围/计数/逐行摘要/文件 sha256)、**每条流摘要**
+    (事件数/起止 stream_seq/global_seq/补偿控制事件数/操作者/批次/`stream_digest`)、
+    逐文件 sha256、`content_digest`(仿 git 风格文件名有序拼接)与
+    **`manifest_hash`(manifest 除自身外字段的 sha256, 可离线复算)**。
+  - 事件规范化字段与翻页 `fragment_digest` 完全一致, 页面留痕可与包内段直接核对。
+- **一次性下载**: `POST .../exports/{id}/download-token`(仅会话创建者, 令牌明文只返回
+  一次, 默认 10 分钟过期, 持久化支持重启兑换) → `GET .../downloads/{token}`,
+  首次下载即失效(重复/过期/缺失明确 409/404); `GET .../exports/{id}/verify`
+  回读包重算逐文件/content/manifest 摘要, 不一致或包缺失 → FAILED 留证(原包保留)。
+- 页面"审计证据查询与一致性证明"区: 创建会话表单、固定条件/边界锚点/当前 cursor/
+  校验状态徽章、逐页证明(片段摘要/前后流边界/断链位置)、导出任务表(进度条/暂停原因/
+  断链证据/失败原因/逐段与流摘要/manifest_hash)、暂停恢复取消/校验/一次性下载操作。
+- 配置: `EVIDENCE_SEGMENT_SIZE`(默认 200)、`EVIDENCE_PAGE_LIMIT`(默认 100)、
+  `EVIDENCE_EXPORT_MAX_CONCURRENCY`(默认 2)、`EVIDENCE_WORKER_POLL_INTERVAL`、
+  `EVIDENCE_STORE_DIR`(默认 `./evidence_store`)、`EVIDENCE_DOWNLOAD_TTL_SECONDS`
+  (默认 600)、`EVIDENCE_CURSOR_SECRET`(游标 HMAC 密钥)。
+- 接口文档见 [`docs_evidence.md`](docs_evidence.md)。
+
 ## 运行
 
 ```bash
@@ -699,6 +779,26 @@ POST /api/admin/compensations/{id}/cancel          {operator, idempotency_key, r
 POST /api/admin/compensations/{id}/execute         {operator, idempotency_key} 幂等执行(审批/窗口闸门; 部分失败 PARTIAL)
 POST /api/admin/compensations/{id}/retry           {operator, idempotency_key, action_seq} 逐动作失败重试
 POST /api/admin/compensations/{id}/undo            {operator, idempotency_key} 逆序整体撤销(before_image 恢复, 不受 TTL 限制)
+
+# ---- 审计证据查询与一致性证明 ----
+POST /api/admin/evidence/sessions       {operator, idempotency_key, plan_id, start_global_seq?,
+                                         start_ts?, end_ts?, event_types?, sources?}
+                                                      创建固定边界证据会话(计划流+批次流+补偿控制流)
+GET  /api/admin/evidence/sessions[?plan_id=&status_filter=]
+GET  /api/admin/evidence/sessions/{id}[?with_pages=]   会话详情(条件/边界锚点/cursor/校验状态/逐页留痕)
+POST /api/admin/evidence/sessions/{id}/pages {operator, cursor?, limit?}
+                                                      沿会话翻一页(哈希链连续性证明; 断链 422+breaks,
+                                                      游标错误 409; BROKEN 会话锁定)
+POST /api/admin/evidence/exports        {operator, idempotency_key, session_id, segment_size?}
+                                                      异步分段 JSONL 证据包并排队(活动导出幂等回显)
+GET  /api/admin/evidence/exports[?session_id=&plan_id=&status_filter=]
+GET  /api/admin/evidence/exports/{id}[?with_events=]   导出详情(进度/断链证据/逐段/流摘要/manifest/事件)
+POST /api/admin/evidence/exports/{id}/pause|resume|cancel {operator, idempotency_key}
+                                                      暂停(分段边界)/恢复(断链先全量重校, 从上次成功段继续)/取消(终态)
+GET  /api/admin/evidence/exports/{id}/verify?operator= 回读包重算逐文件/content/manifest 摘要(失配→FAILED)
+POST /api/admin/evidence/exports/{id}/download-token {operator, idempotency_key}
+                                                      签发一次性下载令牌(仅会话创建者, 明文仅此返回)
+GET  /api/admin/evidence/downloads/{token}?operator=  兑换一次性下载(zip; 重复/过期 409/404)
 ```
 
 幂等：所有管理动作要求 `idempotency_key`，重复执行返回首次结果（`replayed: true`），无副作用；
@@ -708,7 +808,7 @@ POST /api/admin/compensations/{id}/undo            {operator, idempotency_key} �
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 253 个用例:
+python3 -m pytest tests/ -q   # 293 个用例(含审计证据查询与一致性证明 36 个):
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
 # 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/
@@ -784,4 +884,15 @@ python3 -m pytest tests/ -q   # 253 个用例:
 #           before_image 撤销恢复(插入删除·改值还原·撤销关联执行事件)/执行与撤销操作者/
 #           同快照并发不建重复任务/worker 逐动作执行/COMP_FAILED 事件/
 #           重启 RUNNING→QUEUED·PARTIAL 保留失败原因·UNDO_RUNNING→UNDO_PARTIAL 续撤销
+# 审计证据查询与一致性证明(36): 跨计划/批次/补偿控制流统一时间线排序/时间范围与类型过滤/
+#           start_global_seq/固定边界后新增事件不进入既有会话(前后边界稳定, 多会话边界独立)/
+#           翻页不漏不重不插新(片段摘要+流边界)/无游标只能首页/旧游标重放/跨会话游标/坏游标拒绝/
+#           缺失 stream_seq_gap+prev_hash+stream_hash 拒绝并锁定会话/payload 篡改/重链后锚点不匹配/
+#           边界尾事件删除/乱序事件/片段前边界被篡改/重复 global_seq/
+#           导出包 manifest/content/逐流摘要可复算/重启分段幂等不重写/暂停恢复分段边界/取消终态禁止继续/
+#           导出期间链变化 PAUSED+断链证据且不出完整包/恢复前重校失败保持暂停/
+#           失败重试仅重生成失配段(好段不重写)/活动导出与完成后创建幂等/空结果边界导出空包/
+#           一次性下载令牌(单次使用/重放/未知 404/未完成拒绝)/仅创建者权限/未知计划 404/非法过滤 422/
+#           会话与控制幂等(同键重放/跨请求体 409)/重启 RUNNING 回 QUEUED 续跑/
+#           高风险计划审批+撤销+窗口与证据接口共存/补偿列表与撤销接口不回归
 ```
