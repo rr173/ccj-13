@@ -514,6 +514,183 @@ def test_partial_approvals_also_invalidated_and_history_kept(client):
 
 
 # ======================================================================
+# ---------- 执行/重试/预约入口触发的依据失效: 必须可靠持久化 ----------
+# (入口返回 409 后事务回滚, 失效状态/轮次/审批记录/事件不能随之丢失)
+# ======================================================================
+
+def test_execute_entry_persists_invalidation_on_snapshot_expiry(client):
+    """快照过期后直接请求执行: 409 之外失效状态可靠落库; 重复请求不重复写;
+    重新收集两名审批后可以执行; 详情接口展示失效历史。"""
+    pid, b, sid = backfill_setup(client, "expe", n=5)
+    tid = make_task(client, sid, "ct-expe", risk_level="HIGH")
+    approve(client, tid, "bob", "a1")
+    approve(client, tid, "carol", "a2")
+    assert get_task(client, tid)["approval_status"] == "APPROVED"
+    # 快照过期, 不经 sweep, 直接请求执行
+    db = SessionLocal()
+    db.get(AuditSnapshot, sid).expires_at = datetime(2020, 1, 1)
+    db.commit()
+    db.close()
+    r = execute(client, tid, "alice", "run-exp", status=409)
+    assert "失效" in r.json()["detail"]["reason"]
+    # 409 事务回滚后失效状态仍可靠持久化
+    t = get_task(client, tid)
+    assert t["approval_status"] == "INVALIDATED"
+    assert t["approval_round"] == 2
+    inv_rows = [a for a in t["approvals"] if a["decision"] == "INVALIDATED"]
+    assert {a["operator"] for a in inv_rows} == {"bob", "carol"}
+    assert all(a["invalidated_reason"] == "snapshot_expired" for a in inv_rows)
+    # 详情接口展示失效历史(机器可读原因)
+    hist = t["approval_invalidations"]
+    assert len(hist) == 2
+    assert all(x["reason_code"] == "snapshot_expired" for x in hist)
+    # COMP_APPROVAL 事件落统一事件流(恰好一次)
+    ev = client.get(f"/api/admin/audit-events?plan_id={pid}&limit=300").json()["items"]
+    inv_events = [e for e in ev if e["event_type"] == "COMP_APPROVAL"
+                  and e["payload"].get("action") == "approval_invalidated"]
+    assert len(inv_events) == 1
+    assert inv_events[0]["payload"]["detail"]["reason_code"] == "snapshot_expired"
+    # 重复请求(同键重放与跨键重试)都不重复写审批或事件
+    execute(client, tid, "alice", "run-exp", status=409)
+    execute(client, tid, "alice", "run-exp-again", status=409)
+    t = get_task(client, tid)
+    assert t["approval_status"] == "INVALIDATED" and t["approval_round"] == 2
+    assert len(t["approvals"]) == 2
+    ev = client.get(f"/api/admin/audit-events?plan_id={pid}&limit=300").json()["items"]
+    assert len([e for e in ev if e["event_type"] == "COMP_APPROVAL"
+                and e["payload"].get("action") == "approval_invalidated"]) == 1
+    # 恢复快照有效期并重新收集两名审批 -> 可以执行
+    db = SessionLocal()
+    snap = db.get(AuditSnapshot, sid)
+    snap.expires_at = (datetime.now(timezone.utc).replace(tzinfo=None)
+                       + timedelta(hours=1))
+    db.commit()
+    db.close()
+    approve(client, tid, "bob", "b1")
+    approve(client, tid, "carol", "b2")
+    t = get_task(client, tid)
+    assert t["approval_status"] == "APPROVED" and t["approval_round"] == 2
+    r = execute(client, tid, "alice", "run-ok")
+    assert r.json()["status"] == "COMPLETED"
+    # 执行完成后失效历史仍完整可查
+    t = get_task(client, tid)
+    assert any(x["reason_code"] == "snapshot_expired"
+               for x in t["approval_invalidations"])
+
+
+def test_execute_entry_persists_invalidation_on_gate_change(client):
+    """质量门禁状态变化后直接请求执行: 失效持久化; 重新收集审批后审批闸门恢复。"""
+    pid, b, sid = backfill_setup(client, "gatee", n=5)
+    tid = make_task(client, sid, "ct-gatee", risk_level="HIGH")
+    approve(client, tid, "bob", "a1")
+    approve(client, tid, "carol", "a2")
+    # 审批依据为门禁 NOT_CONFIGURED; 审批后绑定规则(未扫描) -> NOT_SCANNED
+    r = client.put(f"/api/admin/plans/{pid}/quality-rules", json={
+        "operator": "alice", "idempotency_key": "qr-gx", "plan_id": pid,
+        "rules": [{"id": "r1", "type": "required", "field": "name",
+                   "severity": "BLOCKER"}]})
+    assert r.status_code in (200, 201), r.text
+    # 不经 sweep, 直接请求执行 -> 409 且失效持久化
+    r = execute(client, tid, "alice", "run-gx", status=409)
+    assert "失效" in r.json()["detail"]["reason"]
+    t = get_task(client, tid)
+    assert t["approval_status"] == "INVALIDATED"
+    assert t["approval_round"] == 2
+    codes = {x["reason_code"] for x in t["approval_invalidations"]}
+    assert "gate_status_changed" in codes
+    assert all(a["decision"] == "INVALIDATED" for a in t["approvals"])
+    # 重复执行请求不重复失效
+    execute(client, tid, "alice", "run-gx2", status=409)
+    t = get_task(client, tid)
+    assert t["approval_round"] == 2 and len(t["approvals"]) == 2
+    ev = client.get(f"/api/admin/audit-events?plan_id={pid}&limit=300").json()["items"]
+    assert len([e for e in ev if e["event_type"] == "COMP_APPROVAL"
+                and e["payload"].get("action") == "approval_invalidated"]) == 1
+    # 重新收集两名审批 -> 审批闸门恢复(失效历史保留)
+    approve(client, tid, "bob", "b1")
+    approve(client, tid, "carol", "b2")
+    t = get_task(client, tid)
+    assert t["approval_status"] == "APPROVED"
+    assert any(x["reason_code"] == "gate_status_changed"
+               for x in t["approval_invalidations"])
+
+
+def test_retry_entry_persists_invalidation(client):
+    """失败重试入口触发依据复核: 409 之外失效状态同样可靠落库, 动作未被重试。"""
+    pid, b, sid = backfill_setup(client, "retr", n=5)
+    tid = make_task(client, sid, "ct-retr", risk_level="HIGH")
+    approve(client, tid, "bob", "a1")
+    approve(client, tid, "carol", "a2")
+    # 制造一个 FAILED 动作(直接落库模拟门禁拦截失败), 任务停在 PARTIAL
+    db = SessionLocal()
+    task = db.get(CompensationTask, tid)
+    act = next(a for a in task.actions if a.seq == 1)
+    act.status = "FAILED"
+    act.last_error = "模拟门禁拦截失败"
+    task.status = "PARTIAL"
+    db.commit()
+    db.close()
+    # 快照过期后直接请求重试
+    db = SessionLocal()
+    db.get(AuditSnapshot, sid).expires_at = datetime(2020, 1, 1)
+    db.commit()
+    db.close()
+    r = client.post(f"/api/admin/compensations/{tid}/retry",
+                    json={"operator": "alice", "idempotency_key": "rt1",
+                          "action_seq": 1})
+    assert r.status_code == 409, r.text
+    assert "失效" in r.json()["detail"]["reason"]
+    t = get_task(client, tid)
+    assert t["approval_status"] == "INVALIDATED"
+    assert t["approval_round"] == 2
+    assert any(x["reason_code"] == "snapshot_expired"
+               for x in t["approval_invalidations"])
+    # 动作保持 FAILED 未被重试; 重复重试请求不重复失效
+    assert t["actions"][0]["status"] == "FAILED"
+    r = client.post(f"/api/admin/compensations/{tid}/retry",
+                    json={"operator": "alice", "idempotency_key": "rt2",
+                          "action_seq": 1})
+    assert r.status_code == 409
+    t = get_task(client, tid)
+    assert t["approval_round"] == 2 and len(t["approvals"]) == 2
+
+
+def test_window_booking_persists_invalidation(client):
+    """预约窗口入口触发依据复核: 失效独立提交, 窗口预约本身不受影响且幂等。"""
+    pid, b, sid = backfill_setup(client, "wininv", n=5)
+    tid = make_task(client, sid, "ct-wininv", risk_level="HIGH")
+    approve(client, tid, "bob", "a1")
+    approve(client, tid, "carol", "a2")
+    db = SessionLocal()
+    db.get(AuditSnapshot, sid).expires_at = datetime(2020, 1, 1)
+    db.commit()
+    db.close()
+    now = datetime.now(timezone.utc)
+    wins = [{"starts_at": iso(now + timedelta(hours=1)),
+             "ends_at": iso(now + timedelta(hours=2))}]
+    r = client.put(f"/api/admin/compensations/{tid}/windows",
+                   json={"operator": "alice", "idempotency_key": "w1",
+                         "windows": wins})
+    assert r.status_code == 200, r.text
+    t = get_task(client, tid)
+    assert t["has_windows"] is True
+    assert t["approval_status"] == "INVALIDATED"
+    assert t["approval_round"] == 2
+    assert any(x["reason_code"] == "snapshot_expired"
+               for x in t["approval_invalidations"])
+    # 相同窗口重复预约幂等, 不重复写审批或事件
+    r = client.put(f"/api/admin/compensations/{tid}/windows",
+                   json={"operator": "alice", "idempotency_key": "w1b",
+                         "windows": wins})
+    assert r.status_code == 200 and r.json().get("already_in_state") is True
+    t = get_task(client, tid)
+    assert t["approval_round"] == 2 and len(t["approvals"]) == 2
+    ev = client.get(f"/api/admin/audit-events?plan_id={pid}&limit=300").json()["items"]
+    assert len([e for e in ev if e["event_type"] == "COMP_APPROVAL"
+                and e["payload"].get("action") == "approval_invalidated"]) == 1
+
+
+# ======================================================================
 # ---------- 执行窗口: 预约 / 窗口外拒绝 / 冲突 ----------
 # ======================================================================
 

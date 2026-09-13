@@ -1316,8 +1316,11 @@ def _require_executable_state(session: Session, task: CompensationTask,
             f"补偿任务 {task.id} 处于 {task.status}, 不能再执行")
     if task.status == "CANCELED":
         raise AuditReplayStateError(f"补偿任务 {task.id} 已取消, 不能执行")
-    # 审批依据实时复核: 变化则先失效, 再按失效状态拒绝
-    check_approval_basis(session, task)
+    # 审批依据实时复核: 变化则先失效, 再按失效状态拒绝。
+    # 失效必须独立提交(commit=True): 本函数随后抛出的 409 会让 API 层回滚
+    # 当前事务, 不提交的话 INVALIDATED 状态/审批轮次/失效历史/COMP_APPROVAL
+    # 事件都会随回滚丢失, 任务错误地保持 APPROVED。
+    check_approval_basis(session, task, commit=True)
     if task.risk_level == "HIGH":
         approvers = {a.operator for a in _active_approvals(session, task)}
         if task.approval_status == "INVALIDATED" or len(approvers) < COMP_REQUIRED_APPROVALS:
@@ -1614,6 +1617,10 @@ def update_task_windows(session: Session, task_id: str, operator: str,
     if task.status not in COMP_TASK_ACTIVE_STATUSES:
         raise AuditReplayStateError(
             f"补偿任务 {task.id} 当前状态 {task.status}, 只能在活动状态预约执行窗口")
+    # 预约窗口同样触发审批依据惰性复核: 失效留痕独立提交, 不受后续窗口
+    # 校验/冲突结果影响(即使窗口预约 409 回滚, 失效状态也已可靠落库);
+    # 依据未变化时无副作用, 重复预约不会重复写审批或事件。
+    check_approval_basis(session, task, commit=True)
     new_ranges = _validate_comp_windows(windows)
     old = windows_of_task(session, task_id)
     same = (len(old) == len(new_ranges)
@@ -1707,6 +1714,9 @@ def _apply_window_gate(session: Session, task: CompensationTask) -> bool:
 
 def sweep_approval_drift(session: Session) -> list[dict]:
     """worker 周期兜底: 复核所有活动高风险任务的审批依据, 变化即失效已收集审批。
+
+    每个任务的失效在复核处独立提交(commit=True), 失效状态/轮次/审批记录/
+    COMP_APPROVAL 事件可靠落库, 不受后续任务处理结果影响。
     返回每个失效任务的摘要(测试可断言)。"""
     results: list[dict] = []
     tasks = (session.query(CompensationTask)
@@ -1714,9 +1724,8 @@ def sweep_approval_drift(session: Session) -> list[dict]:
                      CompensationTask.risk_level == "HIGH")
              .order_by(CompensationTask.id).all())
     for t in tasks:
-        drifts = check_approval_basis(session, t)
+        drifts = check_approval_basis(session, t, commit=True)
         if drifts:
-            session.commit()
             results.append({"task_id": t.id, "drifts": drifts,
                             "approval_round": t.approval_round})
     return results
