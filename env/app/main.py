@@ -20,12 +20,14 @@ from . import archives, auditreplay, cleanup, plans, quality, replay, service
 from .schemas import (
     AdminAction, ArchiveAction, ArchiveCreate, ArchiveRetention,
     AuditEventNote, AuditSnapshotCreate, BatchCreate, CheckpointCreate, CleanupAction,
-    CleanupCreate, CompensationAction, CompensationCreate, CompensationRetry,
-    PlanAction, PlanCreate, PlanRejectAction, PlanWindowAction,
-    QualityExemptionCreate, QualityExemptionRevoke, QualityFixCreate,
-    QualityRulesSave, QualityScanAction, QualityScanCreate, RecordIn,
-    RecoverAction, ReplayAction, ReplayCreate, ReviewBatchAssign,
-    ReviewBatchReview, ReviewConfirm, ReviewReopen, ReviewSubmit,
+    CleanupCreate, CompensationAction, CompensationApprovalAction,
+    CompensationCancelAction, CompensationCreate, CompensationRejectAction,
+    CompensationRetry, CompensationWindowAction, PlanAction, PlanCreate,
+    PlanRejectAction, PlanWindowAction, QualityExemptionCreate,
+    QualityExemptionRevoke, QualityFixCreate, QualityRulesSave, QualityScanAction,
+    QualityScanCreate, RecordIn, RecoverAction, ReplayAction, ReplayCreate,
+    ReviewBatchAssign, ReviewBatchReview, ReviewConfirm, ReviewReopen,
+    ReviewSubmit,
 )
 
 APP_VERSION = service.APP_VERSION
@@ -152,6 +154,34 @@ def _backfill_archive_columns():
                     f"ALTER TABLE replay_archives ADD COLUMN {col} {ddl}"))
 
 
+def _backfill_compensation_columns():
+    """旧库补齐补偿审批/执行窗口列: 已存在补偿任务按低风险、免审批、
+    无窗口限制处理(与历史行为一致)。幂等, 可重复执行。"""
+    from sqlalchemy import inspect, text as _text
+    inspector = inspect(engine)
+    tables = set(inspector.get_table_names())
+    if "compensation_tasks" not in tables:
+        return
+    existing = {c["name"] for c in inspector.get_columns("compensation_tasks")}
+    defaults = {
+        "risk_level": "VARCHAR(8) NOT NULL DEFAULT 'LOW'",
+        "approval_status": "VARCHAR(16) NOT NULL DEFAULT 'NOT_REQUIRED'",
+        "approval_round": "INTEGER NOT NULL DEFAULT 0",
+        "reject_reason": "VARCHAR(500)",
+        "approval_basis": "JSON",
+        "canceled_by": "VARCHAR(128)",
+        "canceled_at": "TIMESTAMP",
+        "cancel_reason": "VARCHAR(500)",
+        "window_open": "BOOLEAN",
+        "window_pause_reason": "VARCHAR(500)",
+    }
+    with engine.begin() as conn:
+        for col, ddl in defaults.items():
+            if col not in existing:
+                conn.execute(_text(
+                    f"ALTER TABLE compensation_tasks ADD COLUMN {col} {ddl}"))
+
+
 @app.on_event("startup")
 def startup():
     Base.metadata.create_all(engine)
@@ -159,6 +189,7 @@ def startup():
     _backfill_replay_columns()
     _backfill_archive_columns()
     _backfill_quality_rescan_columns()
+    _backfill_compensation_columns()
     db = SessionLocal()
     try:
         service.boot_check(db)
@@ -1382,7 +1413,13 @@ def preview_snapshot_actions(snapshot_id: str, db: Session = Depends(get_db)):
 def create_compensation(body: CompensationCreate, db: Session = Depends(get_db)):
     """基于 VALID 快照创建补偿任务(动作落 PENDING 并排队)。
 
-    同快照同时至多一个非终态任务, 重复创建幂等返回已有任务; REJECTED 快照拒绝。"""
+    同快照同时至多一个非终态任务, 重复创建幂等返回已有任务; REJECTED 快照拒绝。
+    风险等级默认按动作构成自动推导(含清理/解冻为 HIGH), 可显式 risk_level=HIGH。
+    HIGH 任务必须收集两名不同于创建者的操作者独立审批后才能执行。"""
+    if body.risk_level is not None and body.risk_level not in auditreplay.COMP_RISK_LEVELS:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_risk_level",
+            "reason": f"风险等级必须是 {list(auditreplay.COMP_RISK_LEVELS)} 之一"})
     try:
         result, replayed = auditreplay.run_comp_action(
             db, action="comp.create", operator=body.operator,
@@ -1390,7 +1427,8 @@ def create_compensation(body: CompensationCreate, db: Session = Depends(get_db))
             snapshot_id=body.snapshot_id,
             fn=lambda s, _t: auditreplay.task_to_dict(
                 auditreplay.create_task(
-                    s, operator=body.operator, snapshot_id=body.snapshot_id)))
+                    s, operator=body.operator, snapshot_id=body.snapshot_id,
+                    risk_level=body.risk_level)))
     except auditreplay.AuditReplayNotFound as e:
         db.rollback()
         _audit_replay_not_found(e)
@@ -1447,6 +1485,108 @@ def _run_comp_task(db: Session, body, fn, task_id: str, action: str):
     return result
 
 
+def _comp_action_windows(body: CompensationWindowAction):
+    return [{"starts_at": w.starts_at, "ends_at": w.ends_at}
+            for w in body.windows]
+
+
+@app.post("/api/admin/compensations/{task_id}/approvals", status_code=201)
+def approve_compensation(task_id: str, body: CompensationApprovalAction,
+                         db: Session = Depends(get_db)):
+    """高风险补偿双人审批: 提交一名操作者的独立通过(审批人不能是创建者)。
+
+    同一操作者同轮重复/并发提交幂等去重; 集齐两名不同操作者 -> APPROVED。
+    审批依据(快照/质量门禁/计划状态)变化时已收集审批自动失效, 须重新收集。"""
+    try:
+        result, replayed = auditreplay.run_comp_action(
+            db, action="comp.approve", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            task_id=task_id,
+            fn=lambda s, _t: auditreplay.approve_task(s, task_id, body.operator))
+    except auditreplay.AuditReplayNotFound as e:
+        db.rollback()
+        _audit_replay_not_found(e)
+    except auditreplay.AuditReplayStateError as e:
+        db.rollback()
+        _audit_replay_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/compensations/{task_id}/rejections", status_code=201)
+def reject_compensation(task_id: str, body: CompensationRejectAction,
+                        db: Session = Depends(get_db)):
+    """高风险补偿审批拒绝(原因必填): 闸门关闭, 当轮已收集通过失效, 须重新收集。"""
+    try:
+        result, replayed = auditreplay.run_comp_action(
+            db, action="comp.reject", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            task_id=task_id,
+            fn=lambda s, _t: auditreplay.reject_task(
+                s, task_id, body.operator, body.reason))
+    except auditreplay.AuditReplayNotFound as e:
+        db.rollback()
+        _audit_replay_not_found(e)
+    except auditreplay.AuditReplayStateError as e:
+        db.rollback()
+        _audit_replay_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.put("/api/admin/compensations/{task_id}/windows")
+def update_compensation_windows(task_id: str, body: CompensationWindowAction,
+                                db: Session = Depends(get_db)):
+    """为补偿任务预约/整体替换限定执行窗口(空列表清空)。
+
+    窗口外禁止执行(显式执行 409; worker 在动作边界自动暂停并保留已完成动作,
+    重新进入窗口自动继续)。与其他活动补偿任务时间重叠且批次相交 -> 409
+    返回占用者与冲突时间段; 相同窗口重复预约幂等。"""
+    try:
+        result, replayed = auditreplay.run_comp_action(
+            db, action="comp.window_update", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            task_id=task_id,
+            fn=lambda s, _t: auditreplay.update_task_windows(
+                s, task_id, body.operator, _comp_action_windows(body)))
+    except auditreplay.AuditReplayNotFound as e:
+        db.rollback()
+        _audit_replay_not_found(e)
+    except auditreplay.AuditReplayWindowConflict as e:
+        db.rollback()
+        raise HTTPException(status_code=409, detail={
+            "error": "comp_window_conflict",
+            "reason": "预约窗口与其他活动补偿任务冲突, 已返回占用者与冲突时间段",
+            "conflicts": e.conflicts})
+    except auditreplay.AuditReplayStateError as e:
+        db.rollback()
+        _audit_replay_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
+@app.post("/api/admin/compensations/{task_id}/cancel")
+def cancel_compensation(task_id: str, body: CompensationCancelAction,
+                        db: Session = Depends(get_db)):
+    """取消补偿任务(QUEUED/RUNNING/PARTIAL): 未执行动作终止, 已完成动作保留;
+    未决审批随任务取消留痕(TASK_CANCELED), 审批历史仍可查询。"""
+    try:
+        result, replayed = auditreplay.run_comp_action(
+            db, action="comp.cancel", operator=body.operator,
+            idempotency_key=body.idempotency_key, payload=body.model_dump(),
+            task_id=task_id,
+            fn=lambda s, _t: auditreplay.task_to_dict(
+                auditreplay.cancel_task(s, task_id, body.operator, body.reason)))
+    except auditreplay.AuditReplayNotFound as e:
+        db.rollback()
+        _audit_replay_not_found(e)
+    except auditreplay.AuditReplayStateError as e:
+        db.rollback()
+        _audit_replay_conflict(e)
+    result["replayed"] = replayed
+    return result
+
+
 @app.post("/api/admin/compensations/{task_id}/execute")
 def execute_compensation(task_id: str, body: CompensationAction,
                          db: Session = Depends(get_db)):
@@ -1489,7 +1629,8 @@ def retry_compensation_action(task_id: str, body: CompensationRetry,
 def undo_compensation(task_id: str, body: CompensationAction,
                       db: Session = Depends(get_db)):
     """整体撤销: 对全部已成功动作按逆序用执行前镜像恢复现场(只追加 COMP_UNDONE,
-    关联原执行事件)。撤销不被快照 TTL/门禁卡死; 部分撤销失败停 UNDO_PARTIAL。"""
+    关联原执行事件)。撤销不被快照 TTL/门禁/审批/窗口卡死; 部分撤销失败停
+    UNDO_PARTIAL; CANCELED 任务若已有成功动作同样允许撤销。"""
     return _run_comp_task(
         db, body,
         lambda s, _t: auditreplay.task_to_dict(

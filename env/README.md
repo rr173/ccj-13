@@ -528,9 +528,49 @@ NORMAL)。`POST /api/admin/compensations` 基于 VALID 快照创建任务(动作
   动作状态/进度/失败原因/撤销镜像全部保留; worker 受
   `COMPENSATION_MAX_CONCURRENCY` 限制认领执行与撤销。
 
+#### 风险分级与双人审批(compensation_approvals)
+
+补偿任务创建时按动作构成自动推导风险等级(可显式 `risk_level=HIGH`):
+
+- **LOW(免审批)**: 仅 `record_backfill` 回填/修正动作, 创建即 `NOT_REQUIRED`, 可直接执行;
+- **HIGH(双人审批)**: 含 `record_cleanup`/`batch_unfreeze` 等破坏性动作, 或基于
+  CANCELED 计划快照的补偿, 创建即 `PENDING`, 必须收集**同一审批轮次内两名不同
+  操作者**的独立通过才能执行;
+- **职责分离**: 审批人不能是任务创建者; 执行操作者不能是任一审批人(创建者可以执行);
+- **拒绝**: 任一审批人带原因拒绝即关闭闸门(`REJECTED`), 当轮已收集通过置
+  `SUPERSEDED`, 必须在新一轮重新收集两名通过;
+- **审批依据自动失效**: 首轮通过时固化审批依据(快照状态/目标点/流边界/TTL、
+  质量门禁状态/规则版本与摘要/最新扫描、计划状态、批次 phase/epoch/freeze_version);
+  审批收集后任一依据变化, worker sweep 与执行/重试/预约的惰性复核都会把当前轮次
+  已收集审批置 `INVALIDATED` 并记录机器可读原因
+  (`snapshot_expired`/`snapshot_changed`/`gate_status_changed`/
+  `plan_status_changed`/`batch_version_gap`), 任务审批状态回到 `INVALIDATED`,
+  开启新一轮(`approval_round+1`)重新收集; 审批记录只追加, 失效历史完整可查;
+- **并发去重**: `(task_id, approval_round, operator)` 唯一约束兜底, 同一操作者
+  并发/重复提交只产生一条有效审批(幂等返回)。
+
+#### 限定执行窗口(compensation_windows)
+
+运维可为活动补偿任务预约限定执行窗口(闭区间, 可多个; 空列表清空):
+
+- 窗口外**显式执行/重试 409 拒绝**; worker 在**动作边界自动暂停**,
+  已完成动作与失败动作进度全部保留(`window_pause_reason` 记录原因),
+  重新进入窗口后自动从下一个未完成动作继续(暂停/恢复只追加 `COMP_WINDOW` 事件);
+- **冲突检测**: 预约窗口与其他活动补偿任务时间重叠且动作批次集合相交时 409,
+  返回每个占用者的任务 id/创建者/双方窗口/冲突时间段/共享批次;
+- 终态任务不能再改窗口; 与当前窗口完全相同的预约幂等无副作用;
+- 窗口边界持久化, 重启后按当前时刻重新判定, 不丢暂停状态也不偷跑。
+
+#### 任务取消
+
+`POST .../{task_id}/cancel` 取消 QUEUED/RUNNING/PARTIAL 任务(终态):
+未执行动作终止, 已完成动作保留; 未决审批置 `TASK_CANCELED`, 审批历史仍可查询。
+
 页面"审计事件回放与补偿"卡片展示事件链(全局序/流序/哈希/载荷/投影关联)、
 快照校验结果与逐条原因、补偿动作状态/门禁/操作者/执行与撤销事件关联,
-并提供查询、补录、生成快照、预览、创建任务、执行、重试、撤销操作。
+并展示**风险分级、审批状态/当前审批人、审批失效历史、预约窗口、窗口冲突详情、
+窗口暂停原因与取消信息**, 提供查询、补录、生成快照、预览、创建任务、
+双人审批/拒绝、预约窗口、执行、重试、取消、撤销操作。
 
 ## 运行
 
@@ -646,11 +686,17 @@ POST /api/admin/audit-snapshots                    {operator, idempotency_key, p
 GET  /api/admin/audit-snapshots?plan_id=&status_filter=
 GET  /api/admin/audit-snapshots/{id}               快照详情(固化事件链 + 批次版本/规则版本校验结果)
 GET  /api/admin/audit-snapshots/{id}/preview       待补偿动作预览(类型/目标/预期/当前/门禁/execution_allowed)
-POST /api/admin/compensations                      {operator, idempotency_key, snapshot_id}
-                                                     基于 VALID 快照创建补偿任务(同快照同时唯一)
+POST /api/admin/compensations                      {operator, idempotency_key, snapshot_id, risk_level?}
+                                                     基于 VALID 快照创建补偿任务(同快照同时唯一;
+                                                     风险按动作自动推导, 破坏性动作 HIGH 须双人审批)
 GET  /api/admin/compensations?plan_id=&snapshot_id=&status_filter=
-GET  /api/admin/compensations/{id}                 补偿任务详情(逐动作状态/失败原因/执行撤销事件关联/任务事件)
-POST /api/admin/compensations/{id}/execute         {operator, idempotency_key} 幂等执行(逐动作过门禁; 部分失败 PARTIAL)
+GET  /api/admin/compensations/{id}                 补偿任务详情(风险/审批状态/审批与失效历史/窗口/冲突/暂停原因)
+POST /api/admin/compensations/{id}/approvals       {operator, idempotency_key} 双人审批通过(创建者不可; 两人独立)
+POST /api/admin/compensations/{id}/rejections      {operator, idempotency_key, reason} 审批拒绝(原因必填)
+PUT  /api/admin/compensations/{id}/windows         {operator, idempotency_key, windows:[{starts_at,ends_at}]}
+                                                     预约/替换限定执行窗口(冲突 409 返回占用者与冲突时间; 空列表清空)
+POST /api/admin/compensations/{id}/cancel          {operator, idempotency_key, reason?} 取消任务(保留已完成动作)
+POST /api/admin/compensations/{id}/execute         {operator, idempotency_key} 幂等执行(审批/窗口闸门; 部分失败 PARTIAL)
 POST /api/admin/compensations/{id}/retry           {operator, idempotency_key, action_seq} 逐动作失败重试
 POST /api/admin/compensations/{id}/undo            {operator, idempotency_key} 逆序整体撤销(before_image 恢复, 不受 TTL 限制)
 ```
@@ -662,7 +708,7 @@ POST /api/admin/compensations/{id}/undo            {operator, idempotency_key} �
 ## 测试
 
 ```bash
-python3 -m pytest tests/ -q   # 232 个用例:
+python3 -m pytest tests/ -q   # 253 个用例:
 # 批次(16): 批次创建与范围重叠拒绝/批次外正常读写/双读差异/范围内外多余记录拦截/
 #           单独恢复不清其他批次/幂等重放(含跨批次)/epoch 栅栏双人推进只一人成功/重启保持
 # 计划(13): 建计划聚合拒绝(批次不存在/重复占用/跨计划占用/DONE 终态/依赖不存在/成环)/

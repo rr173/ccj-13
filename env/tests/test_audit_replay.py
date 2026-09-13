@@ -105,6 +105,14 @@ def make_task(client, sid, key="ct"):
     return r.json()["task_id"]
 
 
+def approve_task(client, tid, who, key):
+    """高风险补偿双人审批: 不同于创建者 alice 的审批人独立通过。"""
+    r = client.post(f"/api/admin/compensations/{tid}/approvals",
+                    json={"operator": who, "idempotency_key": key})
+    assert r.status_code in (200, 201), r.text
+    return r
+
+
 def _rechain(db, plan_id):
     """篡改 payload 后重算该计划流的哈希链, 隔离出非 chain_broken 的版本类校验。"""
     rows = (db.query(AuditEvent).filter(AuditEvent.stream_key == plan_id)
@@ -548,6 +556,9 @@ class TestCompensation:
         pv = client.get(f"/api/admin/audit-snapshots/{sid}/preview").json()
         assert all(a["execution_allowed"] is False for a in pv["actions"])
         tid = make_task(client, sid)
+        assert client.get(f"/api/admin/compensations/{tid}").json()["risk_level"] == "HIGH"
+        approve_task(client, tid, "bob", "cb-a1")
+        approve_task(client, tid, "carol", "cb-a2")
         r = client.post(f"/api/admin/compensations/{tid}/execute",
                         json={"operator": "alice", "idempotency_key": "run"})
         assert all(a["status"] == "FAILED" for a in r.json()["actions"])
@@ -778,6 +789,9 @@ class TestRecordCleanup:
         db.close()
         # 建任务执行: id=5 被删除, 撤销后按镜像恢复
         tid = make_task(client, sid, "clct")
+        assert client.get(f"/api/admin/compensations/{tid}").json()["risk_level"] == "HIGH"
+        approve_task(client, tid, "bob", "cl-a1")
+        approve_task(client, tid, "carol", "cl-a2")
         r = client.post(f"/api/admin/compensations/{tid}/execute",
                         json={"operator": "alice", "idempotency_key": "run"})
         assert r.json()["status"] == "COMPLETED"

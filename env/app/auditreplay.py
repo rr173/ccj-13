@@ -37,11 +37,14 @@ from sqlalchemy.orm import Session
 
 from . import plans, quality, service
 from .models import (
-    AUDIT_EVENT_TYPES, AUDIT_SNAPSHOT_STATUSES, COMP_TASK_ACTIVE_STATUSES,
-    COMP_TASK_STATUSES, IdempotencyKey, MigrationBatch, MigrationPlan, PlanStep,
-    QualityRuleVersion, QualityScan, RecordNew, RecordOld, AuditEvent,
-    AuditSnapshot, AuditSnapshotBatch, AuditSnapshotEvent, CompensationAction,
-    CompensationTask, CompensationTaskEvent,
+    AUDIT_EVENT_TYPES, AUDIT_SNAPSHOT_STATUSES, COMP_APPROVAL_INVALIDATE_REASONS,
+    COMP_REQUIRED_APPROVALS, COMP_RISK_LEVELS,
+    COMP_TASK_ACTIVE_STATUSES, COMP_TASK_CANCELABLE_STATUSES,
+    COMP_TASK_STATUSES, IdempotencyKey,
+    MigrationBatch, MigrationPlan, PlanStep, QualityRuleVersion, QualityScan,
+    RecordNew, RecordOld, AuditEvent, AuditSnapshot, AuditSnapshotBatch,
+    AuditSnapshotEvent, CompensationAction, CompensationApproval,
+    CompensationTask, CompensationTaskEvent, CompensationWindow,
 )
 
 GLOBAL_STREAM = "global"
@@ -970,11 +973,23 @@ def _lock_creation(session: Session) -> None:
         session.execute(text("SELECT pg_advisory_xact_lock(20260924)"))
 
 
-def create_task(session: Session, *, operator: str, snapshot_id: str) -> CompensationTask:
+def _derive_risk(snap: AuditSnapshot, previews: list[dict]) -> str:
+    """按动作构成推导补偿风险分级: 仅回填为低风险; 含清理/解冻等破坏性动作
+    (或取消计划的补偿)为高风险, 必须双人审批。"""
+    types = {p["action_type"] for p in previews}
+    if snap.plan_status_at_create == "CANCELED":
+        return "HIGH"
+    return "HIGH" if types - {"record_backfill"} else "LOW"
+
+
+def create_task(session: Session, *, operator: str, snapshot_id: str,
+                risk_level: str | None = None) -> CompensationTask:
     """基于 VALID 快照创建补偿任务(推导动作落 PENDING 并排队)。
 
     同一快照同时至多一个非终态任务: 重复创建幂等返回已有任务。
     REJECTED/不存在快照拒绝; CANCELED 计划允许建任务(动作可预览), 但执行拒绝。
+    风险分级按动作构成自动推导(可显式指定, 仅允许升为 HIGH):
+    HIGH 任务创建即 PENDING, 必须收集两名不同于创建者的操作者审批后才能执行。
     """
     snap = get_snapshot(session, snapshot_id)
     with _append_lock:
@@ -990,10 +1005,22 @@ def create_task(session: Session, *, operator: str, snapshot_id: str) -> Compens
                 f"快照 {snapshot_id} 校验状态为 REJECTED, 不允许生成补偿任务: "
                 + "; ".join(r["message"] for r in (snap.reasons or [])[:3]))
         previews = derive_actions(session, snap)
+        derived = _derive_risk(snap, previews)
+        if risk_level is not None:
+            if risk_level not in COMP_RISK_LEVELS:
+                raise AuditReplayStateError(
+                    f"风险等级必须是 {COMP_RISK_LEVELS} 之一(收到 {risk_level!r})")
+            # 只允许比推导结果更保守(LOW 不能被降级)
+            risk = "HIGH" if risk_level == "HIGH" or derived == "HIGH" else "LOW"
+        else:
+            risk = derived
+        approval = "PENDING" if risk == "HIGH" else "NOT_REQUIRED"
         task = CompensationTask(
             id="CT" + uuid.uuid4().hex[:10], snapshot_id=snapshot_id,
             plan_id=snap.plan_id, plan_status=snap.plan_status_at_create,
             status="QUEUED", total_actions=len(previews),
+            risk_level=risk, approval_status=approval,
+            approval_round=(1 if risk == "HIGH" else 0),
             created_by=operator, updated_by=operator)
         session.add(task)
         session.flush()
@@ -1007,7 +1034,15 @@ def create_task(session: Session, *, operator: str, snapshot_id: str) -> Compens
             session, task, "create", operator,
             reason=(f"基于快照 {snapshot_id}(计划 {snap.plan_id}, "
                     f"{snap.plan_status_at_create})创建补偿任务, "
-                    f"{len(previews)} 个待补偿动作"))
+                    f"{len(previews)} 个待补偿动作, 风险等级 {risk}"
+                    + (", 高风险须两名不同操作者独立审批" if risk == "HIGH"
+                       else ", 低风险免审批")))
+        if risk == "HIGH":
+            _emit_comp_control(
+                session, task, operator=operator, action="approval_pending",
+                reason="高风险补偿任务已创建, 等待两名不同于创建者的操作者独立审批",
+                detail={"risk_level": risk, "required_approvals":
+                        COMP_REQUIRED_APPROVALS, "round": 1})
         session.flush()
         return task
 
@@ -1028,11 +1063,663 @@ def _append_comp_event(session: Session, task: CompensationTask, action,
     return rows[0].global_seq
 
 
+def _emit_comp_control(session: Session, task: CompensationTask, *,
+                       operator: str, action: str, reason: str | None,
+                       detail: dict | None = None,
+                       dedupe_token: str | None = None) -> None:
+    """审批/窗口类编排事件: 同时落任务事件流水与统一事件流(COMP_APPROVAL/
+    COMP_WINDOW), 不写业务审计原事件。dedupe 默认含随机串(每次状态变化独立留痕)。"""
+    kind = "window" if action.startswith(("window", "window_pause",
+                                          "window_resume")) else "approval"
+    event_type = "COMP_WINDOW" if kind == "window" else "COMP_APPROVAL"
+    _add_task_event(session, task, f"{kind}.{action}", operator,
+                    reason=(reason[:500] if reason else None), detail=detail)
+    append_event(
+        session, event_type=event_type, operator=operator,
+        plan_ids=[task.plan_id], source="system",
+        payload={"task_id": task.id, "action": action,
+                 "reason": (reason[:500] if reason else None),
+                 "detail": detail or {}},
+        dedupe_token=(dedupe_token
+                      or f"comp:{kind}:{action}:{task.id}:{uuid.uuid4().hex[:10]}"))
+
+
 def _evaluate_action_gate(session: Session, task: CompensationTask) -> tuple[bool, dict]:
     """执行前实时复核质量门禁: PASS/NOT_CONFIGURED 放行; 否则拒绝(不越过门禁)。"""
     gate = quality.evaluate_gate(session, task.plan_id)
     allowed = quality.gate_allows_execution(gate)
     return allowed, gate
+
+
+# ======================================================================
+# ---------- 双人审批: 依据指纹 / 通过 / 拒绝 / 自动失效 ----------
+# ======================================================================
+
+def _batch_versions_of(session: Session, task: CompensationTask) -> list[dict]:
+    """审批依据: 任务涉及批次的当前版本(phase/epoch/freeze_version)。"""
+    bids = sorted({a.batch_id for a in task.actions if a.batch_id})
+    out: list[dict] = []
+    for bid in bids:
+        b = session.get(MigrationBatch, bid)
+        if b is None:
+            out.append({"batch_id": bid, "exists": False})
+            continue
+        out.append({"batch_id": bid, "exists": True, "phase": b.phase,
+                    "epoch": b.epoch,
+                    "freeze_version": b.freeze_version,
+                    "active_schema": b.active_schema})
+    return out
+
+
+def compute_approval_basis(session: Session, task: CompensationTask) -> dict:
+    """审批依据指纹: 审批"依据的是什么"在收集完成后不得变化。
+
+    覆盖: 快照(状态/目标点/流边界/TTL 到期)、质量门禁(状态/规则版本与摘要/
+    最新扫描)、计划状态、批次版本(phase/epoch/freeze_version)。"""
+    snap = session.get(AuditSnapshot, task.snapshot_id)
+    gate = quality.evaluate_gate(session, task.plan_id)
+    plan = session.get(MigrationPlan, task.plan_id)
+    return {
+        "snapshot": {
+            "id": task.snapshot_id,
+            "exists": snap is not None,
+            "status": snap.status if snap else None,
+            "target_at": snap.target_at.isoformat() if snap and snap.target_at else None,
+            "last_stream_seq": snap.last_stream_seq if snap else None,
+            "last_global_seq": snap.last_global_seq if snap else None,
+            "last_stream_hash": snap.last_stream_hash if snap else None,
+            "expires_at": snap.expires_at.isoformat() if snap and snap.expires_at else None,
+            "expired": is_expired(snap) if snap else True,
+        },
+        "gate": {
+            "status": gate.get("status"),
+            "rule_version": gate.get("current_rule_version"),
+            "rule_digest": gate.get("current_rule_digest"),
+            "latest_scan_id": gate.get("latest_scan_id"),
+            "latest_scan_status": gate.get("latest_scan_status"),
+        },
+        "plan_status": plan.status if plan else None,
+        "batches": _batch_versions_of(session, task),
+    }
+
+
+def _basis_drift(basis: dict | None, current: dict) -> list[dict]:
+    """比对审批依据与当前状态, 返回变化原因列表(机器码 + 人类可读说明)。"""
+    drifts: list[dict] = []
+    if not basis:
+        return drifts
+    old_snap = basis.get("snapshot") or {}
+    new_snap = current.get("snapshot") or {}
+    if not new_snap.get("exists"):
+        drifts.append(_reason("snapshot_changed",
+                              f"快照 {old_snap.get('id')} 已不存在, 审批依据丢失"))
+    else:
+        if new_snap.get("expired"):
+            drifts.append(_reason(
+                "snapshot_expired",
+                f"快照 {new_snap.get('id')} 已超过有效期(至 {new_snap.get('expires_at')}), "
+                "已收集审批自动失效, 请重新生成快照后重新审批"))
+        for k, label in (("status", "校验状态"), ("target_at", "目标时间点"),
+                         ("last_stream_seq", "流边界顺序号"),
+                         ("last_global_seq", "全局顺序号"),
+                         ("last_stream_hash", "流哈希边界")):
+            if old_snap.get(k) != new_snap.get(k):
+                drifts.append(_reason(
+                    "snapshot_changed",
+                    f"快照 {label}发生变化: {old_snap.get(k)!r} -> {new_snap.get(k)!r}",
+                    field=k, old=old_snap.get(k), new=new_snap.get(k)))
+                break
+    old_gate, new_gate = basis.get("gate") or {}, current.get("gate") or {}
+    for k, label in (("status", "质量门禁状态"),
+                     ("rule_version", "规则版本"),
+                     ("rule_digest", "规则内容摘要"),
+                     ("latest_scan_id", "最新质量扫描")):
+        if old_gate.get(k) != new_gate.get(k):
+            drifts.append(_reason(
+                "gate_status_changed",
+                f"{label}发生变化: {old_gate.get(k)!r} -> {new_gate.get(k)!r}, "
+                "审批依据的门禁状态已不是审批时状态, 已收集审批自动失效",
+                field=k, old=old_gate.get(k), new=new_gate.get(k)))
+            break
+    if basis.get("plan_status") != current.get("plan_status"):
+        drifts.append(_reason(
+            "plan_status_changed",
+            f"计划状态发生变化: {basis.get('plan_status')!r} -> "
+            f"{current.get('plan_status')!r}, 已收集审批自动失效"))
+    old_batches = {b["batch_id"]: b for b in (basis.get("batches") or [])}
+    for b in current.get("batches") or []:
+        ob = old_batches.get(b["batch_id"], {})
+        if not b.get("exists"):
+            drifts.append(_reason("batch_version_gap",
+                                  f"批次 {b['batch_id']} 已不存在, 审批依据丢失",
+                                  batch_id=b["batch_id"]))
+            continue
+        for k, label in (("phase", "阶段"), ("epoch", "epoch"),
+                         ("freeze_version", "冻结版本"),
+                         ("active_schema", "当前结构")):
+            if ob.get(k) != b.get(k):
+                drifts.append(_reason(
+                    "batch_version_gap",
+                    f"批次 {b['batch_id']} {label}发生变化: {ob.get(k)!r} -> "
+                    f"{b.get(k)!r}, 已收集审批自动失效",
+                    batch_id=b["batch_id"], field=k,
+                    old=ob.get(k), new=b.get(k)))
+                break
+    return drifts
+
+
+def _current_round_approvals(session: Session, task: CompensationTask,
+                             decision: str | None = None) -> list[CompensationApproval]:
+    q = (session.query(CompensationApproval)
+         .filter(CompensationApproval.task_id == task.id,
+                 CompensationApproval.approval_round == task.approval_round))
+    if decision:
+        q = q.filter(CompensationApproval.decision == decision)
+    return q.order_by(CompensationApproval.id).all()
+
+
+def _active_approvals(session: Session, task: CompensationTask) -> list[CompensationApproval]:
+    """当前轮次仍有效的通过记录。"""
+    return _current_round_approvals(session, task, "APPROVED")
+
+
+def _sync_approval_status(session: Session, task: CompensationTask) -> None:
+    """按当前轮次审批记录重算任务审批状态(不处理依据失效)。
+
+    REJECTED 结论只在"当轮仍是最新轮次"时有效 —— 拒绝时已开启新一轮,
+    故新一轮提交通过后这里自然回到 PENDING/APPROVED。"""
+    if task.risk_level != "HIGH":
+        task.approval_status = "NOT_REQUIRED"
+        return
+    approvers = {a.operator for a in _active_approvals(session, task)}
+    if len(approvers) >= COMP_REQUIRED_APPROVALS:
+        task.approval_status = "APPROVED"
+    elif approvers:
+        # 新一轮收集(含失效/拒绝后重新提交): 已有通过但不足两人
+        task.approval_status = "PENDING"
+    elif task.approval_status == "INVALIDATED":
+        pass  # 空窗期保留 INVALIDATED, 页面展示"已失效待重新审批"
+    else:
+        task.approval_status = "PENDING"
+
+
+def _invalidate_approvals(session: Session, task: CompensationTask, *,
+                          reason_code: str, message: str,
+                          operator: str = "system") -> bool:
+    """使当前轮次已收集的全部通过审批失效(只追加留痕, 原行置 INVALIDATED),
+    审批状态置 INVALIDATED, 开启新一轮收集。返回是否发生了失效。"""
+    if reason_code not in COMP_APPROVAL_INVALIDATE_REASONS:
+        raise ValueError(f"未知审批失效原因: {reason_code}")
+    active = _active_approvals(session, task)
+    had_any = bool(active or _current_round_approvals(session, task, "REJECTED"))
+    at = now_utc_naive()
+    for a in active:
+        a.decision = "INVALIDATED"
+        a.invalidated_reason = reason_code
+        a.invalidated_by = operator
+        a.invalidated_at = at
+    prev_round = task.approval_round
+    task.approval_round += 1
+    task.approval_status = "INVALIDATED"
+    task.approval_basis = None
+    task.reject_reason = None
+    if active:
+        names = ", ".join(sorted({a.operator for a in active}))
+        _emit_comp_control(
+            session, task, operator=operator, action="approval_invalidated",
+            reason=f"审批依据变化({reason_code}): {message}。第 {prev_round} 轮已收集的 "
+                   f"{len(active)} 条审批({names})自动失效, 需重新收集两名不同操作者审批",
+            detail={"reason_code": reason_code, "invalidated_round": prev_round,
+                    "new_round": task.approval_round,
+                    "invalidated_approvals": [a.id for a in active],
+                    "invalidated_by": [a.operator for a in active]})
+    elif had_any:
+        _emit_comp_control(
+            session, task, operator=operator, action="approval_invalidated",
+            reason=f"审批依据变化({reason_code}): {message}, 开启新一轮审批",
+            detail={"reason_code": reason_code, "invalidated_round": prev_round,
+                    "new_round": task.approval_round})
+    return bool(active)
+
+
+def check_approval_basis(session: Session, task: CompensationTask,
+                         *, commit: bool = False) -> list[dict]:
+    """复核当前审批依据是否仍与审批时一致; 不一致则自动失效已收集审批。
+
+    惰性失效入口(执行/tick/预约窗口/查询视图都可调用); worker sweep 周期性兜底。
+    返回检测到的变化原因列表(失效已落库时按 commit 决定提交)。"""
+    if task.risk_level != "HIGH":
+        return []
+    if task.status not in COMP_TASK_ACTIVE_STATUSES:
+        return []
+    basis = task.approval_basis
+    current = compute_approval_basis(session, task)
+    drifts = _basis_drift(basis, current)
+    if drifts:
+        first = drifts[0]
+        _invalidate_approvals(session, task, reason_code=first["code"],
+                              message=first["message"])
+        if commit:
+            session.commit()
+    return drifts
+
+
+def _require_executable_state(session: Session, task: CompensationTask,
+                              operator: str | None) -> None:
+    """执行/重试前的闸门(显式接口, 失败抛 AuditReplayStateError):
+    1. 高风险必须已收集两名不同操作者审批, 且审批依据未变化;
+    2. 执行操作者不能是审批人之一(执行人与审批人职责分离), 也不能是? ——
+       创建者可以执行(审批人不能是创建者已在审批侧保证);
+    3. 当前必须在预约执行窗口内(窗口外明确拒绝)。"""
+    if task.status in ("UNDO_RUNNING", "UNDO_PARTIAL", "UNDONE"):
+        raise AuditReplayStateError(
+            f"补偿任务 {task.id} 处于 {task.status}, 不能再执行")
+    if task.status == "CANCELED":
+        raise AuditReplayStateError(f"补偿任务 {task.id} 已取消, 不能执行")
+    # 审批依据实时复核: 变化则先失效, 再按失效状态拒绝
+    check_approval_basis(session, task)
+    if task.risk_level == "HIGH":
+        approvers = {a.operator for a in _active_approvals(session, task)}
+        if task.approval_status == "INVALIDATED" or len(approvers) < COMP_REQUIRED_APPROVALS:
+            raise AuditReplayStateError(
+                f"高风险补偿任务 {task.id} 尚未收集两名不同操作者的有效审批"
+                f"(当前有效审批 {len(approvers)}/{COMP_REQUIRED_APPROVALS}"
+                + (", 审批已因依据变化失效, 需重新审批"
+                   if task.approval_status == "INVALIDATED" else "")
+                + "), 不能执行")
+        if task.approval_status == "REJECTED":
+            raise AuditReplayStateError(
+                f"高风险补偿任务 {task.id} 的审批已被拒绝"
+                + (f": {task.reject_reason}" if task.reject_reason else "")
+                + ", 不能执行(需重新收集审批)")
+        if operator and operator in approvers:
+            raise AuditReplayStateError(
+                f"操作者 {operator} 是该补偿任务的审批人之一({sorted(approvers)}), "
+                "执行人不能同时是审批人, 请由未参与审批的操作者执行")
+    # 执行窗口: 窗口外明确拒绝(区别于 worker 的自动暂停)
+    wins = windows_of_task(session, task.id)
+    if wins and not in_any_task_window(wins):
+        ov = task_window_desc(wins)
+        raise AuditReplayStateError(
+            f"当前不在补偿任务 {task.id} 的预约执行窗口内, 禁止执行(窗口: {ov})")
+
+
+def approve_task(session: Session, task_id: str, operator: str) -> dict:
+    """高风险补偿任务双人审批: 提交一名操作者的独立通过。
+
+    - 低风险任务免审批, 审批操作拒绝(409);
+    - 审批人不能是任务创建者; 同一操作者在同一轮次重复审批幂等无副作用
+      (并发双提交由唯一约束兜底去重);
+    - 第一条通过时固化审批依据; 之后依据变化由 sweep/惰性复核自动失效;
+    - 收集满两名不同操作者 -> APPROVED。"""
+    task = get_task(session, task_id)
+    if task.status not in COMP_TASK_ACTIVE_STATUSES:
+        raise AuditReplayStateError(
+            f"补偿任务 {task.id} 当前状态 {task.status}, 审批已关闭")
+    if task.risk_level != "HIGH":
+        raise AuditReplayStateError(
+            f"补偿任务 {task.id} 是低风险任务, 免审批可直接执行")
+    if operator == task.created_by:
+        raise AuditReplayStateError(
+            f"审批人不能是任务创建者({task.created_by}), 操作者 {operator} "
+            "不能审批自己创建的补偿任务")
+    # 提交前先复核依据: 已有审批且依据变化 -> 失效后再把本次通过记入新一轮
+    check_approval_basis(session, task)
+    existing = next((a for a in _current_round_approvals(session, task)
+                     if a.operator == operator), None)
+    if existing is not None:
+        if existing.decision == "APPROVED":
+            return {"ok": True, "replayed": True, "already_in_state": True,
+                    "approval_status": task.approval_status,
+                    "approval_round": task.approval_round,
+                    "approved_by": sorted({a.operator for a in
+                                           _active_approvals(session, task)}),
+                    "detail": "该操作者在本轮已审批通过, 重复审批无副作用"}
+        if existing.decision == "REJECTED":
+            raise AuditReplayStateError(
+                f"操作者 {operator} 在本轮已拒绝审批, 请由其撤销拒绝或等待新一轮")
+        # INVALIDATED 行: 新一轮审批由轮次 +1 隔离, 不会走到这里(轮次不同)
+        raise AuditReplayStateError(
+            f"操作者 {operator} 本轮审批记录状态为 {existing.decision}, 不能重复提交")
+    basis = compute_approval_basis(session, task)
+    row = CompensationApproval(
+        task_id=task.id, approval_round=task.approval_round,
+        decision="APPROVED", operator=operator, basis=basis)
+    session.add(row)
+    try:
+        session.flush()
+    except IntegrityError:
+        # 并发双人审批去重: 同一(任务, 轮次, 操作者)唯一约束兜底
+        session.rollback()
+        task = get_task(session, task_id)
+        return {"ok": True, "replayed": True, "already_in_state": True,
+                "approval_status": task.approval_status,
+                "approval_round": task.approval_round,
+                "approved_by": sorted({a.operator for a in
+                                       _active_approvals(session, task)}),
+                "detail": f"操作者 {operator} 的并发审批已去重(数据库唯一约束)"}
+    if task.approval_basis is None:
+        task.approval_basis = basis
+    task.updated_by = operator
+    task.reject_reason = None
+    approvers_after = {a.operator for a in _active_approvals(session, task)}
+    _sync_approval_status(session, task)
+    _emit_comp_control(
+        session, task, operator=operator, action="approve",
+        reason=f"审批人 {operator} 独立审批通过(第 {task.approval_round} 轮, "
+               f"已收集 {len(approvers_after)}/{COMP_REQUIRED_APPROVALS} 名不同操作者)",
+        detail={"round": task.approval_round,
+                "approvers": sorted(approvers_after),
+                "required": COMP_REQUIRED_APPROVALS})
+    return {"ok": True, "approval_status": task.approval_status,
+            "approval_round": task.approval_round,
+            "approved_by": sorted(approvers_after),
+            "required_approvals": COMP_REQUIRED_APPROVALS,
+            "detail": (f"已收集 {len(approvers_after)}/{COMP_REQUIRED_APPROVALS} 名审批人"
+                       if task.approval_status != "APPROVED"
+                       else "两名不同操作者审批完成, 任务可以执行")}
+
+
+def reject_task(session: Session, task_id: str, operator: str,
+                reason: str) -> dict:
+    """高风险补偿任务审批拒绝(原因必填): 一名审批人拒绝即关闭闸门;
+    本轮已收集的通过记录置 SUPERSEDED, 任务审批状态 REJECTED, 开启新一轮收集。"""
+    task = get_task(session, task_id)
+    if task.status not in COMP_TASK_ACTIVE_STATUSES:
+        raise AuditReplayStateError(
+            f"补偿任务 {task.id} 当前状态 {task.status}, 审批已关闭")
+    if task.risk_level != "HIGH":
+        raise AuditReplayStateError(f"补偿任务 {task.id} 是低风险任务, 免审批")
+    if operator == task.created_by:
+        raise AuditReplayStateError(
+            f"审批人不能是任务创建者({task.created_by})")
+    existing_rej = next((a for a in _current_round_approvals(session, task, "REJECTED")
+                         if a.operator == operator), None)
+    if existing_rej is not None:
+        return {"ok": True, "already_in_state": True,
+                "approval_status": "REJECTED",
+                "approval_round": task.approval_round,
+                "detail": "该操作者已拒绝审批, 重复拒绝无副作用"}
+    basis = compute_approval_basis(session, task)
+    session.add(CompensationApproval(
+        task_id=task.id, approval_round=task.approval_round,
+        decision="REJECTED", operator=operator, reason=reason[:500], basis=basis))
+    session.flush()
+    # 本轮已收集的通过全部被拒绝结论取代(只追加留痕)
+    superseded = _active_approvals(session, task)
+    at = now_utc_naive()
+    for a in superseded:
+        a.decision = "SUPERSEDED"
+        a.invalidated_reason = "rejection_reset"
+        a.invalidated_by = operator
+        a.invalidated_at = at
+    prev_round = task.approval_round
+    task.approval_round += 1
+    task.approval_status = "REJECTED"
+    task.approval_basis = None
+    task.reject_reason = reason[:500]
+    task.updated_by = operator
+    _emit_comp_control(
+        session, task, operator=operator, action="reject",
+        reason=f"审批人 {operator} 拒绝补偿执行, 原因: {reason}; 第 {prev_round} 轮 "
+               f"已收集的 {len(superseded)} 条通过失效, 需重新收集两名审批",
+        detail={"round": prev_round, "new_round": task.approval_round,
+                "reject_reason": reason[:500],
+                "superseded_approvals": [a.id for a in superseded]})
+    return {"ok": True, "approval_status": "REJECTED",
+            "approval_round": task.approval_round,
+            "reject_reason": task.reject_reason,
+            "detail": "审批已拒绝并记录原因, 任务在重新收集两名审批前不能执行"}
+
+
+def cancel_task(session: Session, task_id: str, operator: str,
+                reason: str | None) -> CompensationTask:
+    """取消补偿任务(执行态可取消): 未执行动作不再执行, 已完成动作保留;
+    未决审批随任务取消置 TASK_CANCELED(历史保留), 审批状态 CANCELED。"""
+    task = get_task(session, task_id)
+    if task.status not in COMP_TASK_CANCELABLE_STATUSES:
+        raise AuditReplayStateError(
+            f"补偿任务 {task.id} 当前状态 {task.status}, 不允许取消"
+            f"(仅 {COMP_TASK_CANCELABLE_STATUSES} 可取消)")
+    from_status = task.status
+    task.status = "CANCELED"
+    task.canceled_by = operator
+    task.canceled_at = now_utc_naive()
+    task.cancel_reason = (reason or "")[:500] or None
+    task.current_action_seq = None
+    task.window_open = None
+    # 未决审批终止(只追加: APPROVED -> TASK_CANCELED; REJECTED 结论原样保留为历史)
+    at = now_utc_naive()
+    terminated = 0
+    for a in _current_round_approvals(session, task, "APPROVED"):
+        a.decision = "TASK_CANCELED"
+        a.invalidated_reason = "task_canceled"
+        a.invalidated_by = operator
+        a.invalidated_at = at
+        terminated += 1
+    if task.risk_level == "HIGH":
+        task.approval_status = "CANCELED"
+        task.approval_basis = None
+    _add_task_event(session, task, "cancel", operator,
+                    action_seq=None,
+                    reason=f"补偿任务被取消(原状态 {from_status}): "
+                           f"{reason or '未说明原因'}; 已完成动作保留, 未执行动作终止",
+                    detail={"from_status": from_status,
+                            "terminated_approvals": terminated})
+    append_event(
+        session, event_type="COMP_APPROVAL", operator=operator,
+        plan_ids=[task.plan_id], source="api",
+        payload={"task_id": task.id, "action": "task_canceled",
+                 "from_status": from_status,
+                 "reason": (reason or "")[:500],
+                 "terminated_approvals": terminated},
+        dedupe_token=f"comp:cancel:{task.id}:{uuid.uuid4().hex[:10]}")
+    return task
+
+
+# ======================================================================
+# ---------- 限定执行窗口: 预约 / 冲突检测 / 窗口外暂停与恢复 ----------
+# ======================================================================
+
+def windows_of_task(session: Session, task_id: str) -> list[CompensationWindow]:
+    return (session.query(CompensationWindow)
+            .filter(CompensationWindow.task_id == task_id)
+            .order_by(CompensationWindow.starts_at, CompensationWindow.id).all())
+
+
+def in_any_task_window(windows: list, at: datetime | None = None) -> bool:
+    if not windows:
+        return True
+    at = at or now_utc_naive()
+    return any(w.starts_at <= at <= w.ends_at for w in windows)
+
+
+def task_window_desc(windows: list) -> str:
+    if not windows:
+        return "无窗口限制"
+    return "; ".join(f"[{w.starts_at.isoformat()}Z, {w.ends_at.isoformat()}Z]"
+                     for w in windows)
+
+
+def _validate_comp_windows(raw: list[dict] | None) -> list[tuple[datetime, datetime]]:
+    if not raw:
+        return []
+    out: list[tuple[datetime, datetime]] = []
+    for i, w in enumerate(raw, 1):
+        if not isinstance(w, dict) or not w.get("starts_at") or not w.get("ends_at"):
+            raise AuditReplayStateError(f"第 {i} 个执行窗口必须包含 starts_at 与 ends_at")
+        try:
+            s = plans._parse_dt(w["starts_at"], f"第 {i} 个执行窗口 starts_at")
+            e = plans._parse_dt(w["ends_at"], f"第 {i} 个执行窗口 ends_at")
+        except plans.PlanValidationError as ex:
+            raise AuditReplayStateError("; ".join(ex.reasons))
+        if s >= e:
+            raise AuditReplayStateError(
+                f"第 {i} 个执行窗口 starts_at 必须早于 ends_at")
+        out.append((s, e))
+    return out
+
+
+def _overlap(s1: datetime, e1: datetime, s2: datetime, e2: datetime) -> bool:
+    return s1 <= e2 and s2 <= e1
+
+
+def window_conflicts(session: Session, task: CompensationTask,
+                     ranges: list[tuple[datetime, datetime]]) -> list[dict]:
+    """与其他活动补偿任务的窗口冲突: 时间区间重叠且动作批次集合相交。
+
+    返回占用者详情: 占用任务 id/创建者/窗口/冲突的批次与冲突时间段。"""
+    if not ranges:
+        return []
+    my_batches = {a.batch_id for a in task.actions if a.batch_id}
+    others = (session.query(CompensationTask)
+              .filter(CompensationTask.id != task.id,
+                      CompensationTask.status.in_(COMP_TASK_ACTIVE_STATUSES))
+              .order_by(CompensationTask.created_at, CompensationTask.id).all())
+    conflicts: list[dict] = []
+    for o in others:
+        ob = {a.batch_id for a in o.actions if a.batch_id}
+        shared = sorted(my_batches & ob)
+        if not shared:
+            continue
+        for w in windows_of_task(session, o.id):
+            for s, e in ranges:
+                if _overlap(s, e, w.starts_at, w.ends_at):
+                    cs, ce = max(s, w.starts_at), min(e, w.ends_at)
+                    conflicts.append({
+                        "task_id": o.id, "occupied_by": o.created_by,
+                        "occupier_snapshot_id": o.snapshot_id,
+                        "occupier_status": o.status,
+                        "occupier_window": {
+                            "starts_at": w.starts_at.isoformat() + "Z",
+                            "ends_at": w.ends_at.isoformat() + "Z"},
+                        "requested_window": {
+                            "starts_at": s.isoformat() + "Z",
+                            "ends_at": e.isoformat() + "Z"},
+                        "conflict_range": {
+                            "starts_at": cs.isoformat() + "Z",
+                            "ends_at": ce.isoformat() + "Z"},
+                        "shared_batches": shared,
+                    })
+    return conflicts
+
+
+def update_task_windows(session: Session, task_id: str, operator: str,
+                        windows: list[dict] | None) -> dict:
+    """预约/整体替换限定执行窗口(空列表清空)。
+
+    - 终态任务拒绝; 与其他活动补偿任务时间重叠且批次相交 -> 409 带占用者与冲突时间;
+    - 幂等: 与当前窗口完全一致的请求无副作用。"""
+    task = get_task(session, task_id)
+    if task.status not in COMP_TASK_ACTIVE_STATUSES:
+        raise AuditReplayStateError(
+            f"补偿任务 {task.id} 当前状态 {task.status}, 只能在活动状态预约执行窗口")
+    new_ranges = _validate_comp_windows(windows)
+    old = windows_of_task(session, task_id)
+    same = (len(old) == len(new_ranges)
+            and all((o.starts_at, o.ends_at) == (s, e)
+                    for o, (s, e) in zip(old, new_ranges)))
+    if same:
+        return {"ok": True, "already_in_state": True,
+                "window_open": task.window_open,
+                "detail": "执行窗口与当前完全一致, 预约请求无副作用"}
+    conflicts = window_conflicts(session, task, new_ranges)
+    if conflicts:
+        raise AuditReplayWindowConflict(conflicts)
+    for w in old:
+        session.delete(w)
+    session.flush()
+    for s, e in new_ranges:
+        session.add(CompensationWindow(task_id=task_id, starts_at=s, ends_at=e,
+                                       created_by=operator))
+    session.flush()
+    wins = windows_of_task(session, task_id)
+    task.window_open = None if not wins else in_any_task_window(wins)
+    task.window_pause_reason = None
+    task.updated_by = operator
+    desc = task_window_desc(wins)
+    _emit_comp_control(
+        session, task, operator=operator, action="window_update",
+        reason=f"预约/替换补偿执行窗口: {desc}",
+        detail={"windows": [{"starts_at": s.isoformat() + "Z",
+                             "ends_at": e.isoformat() + "Z"} for s, e in new_ranges]},
+        dedupe_token=f"comp:window:update:{task.id}:{uuid.uuid4().hex[:10]}")
+    if not new_ranges:
+        return {"ok": True, "window_open": None,
+                "detail": "已清空执行窗口, 补偿任务不再受时间窗口限制"}
+    return {"ok": True, "window_open": task.window_open,
+            "windows": [{"starts_at": w.starts_at.isoformat() + "Z",
+                         "ends_at": w.ends_at.isoformat() + "Z"} for w in wins],
+            "detail": f"执行窗口已预约为 {len(new_ranges)} 个区间: {desc}"}
+
+
+class AuditReplayWindowConflict(Exception):
+    """窗口与占用者冲突 -> 409, 携带占用者与冲突时间详情。"""
+
+    def __init__(self, conflicts: list[dict]):
+        super().__init__("补偿执行窗口冲突")
+        self.conflicts = conflicts
+
+
+def _apply_window_gate(session: Session, task: CompensationTask) -> bool:
+    """worker/tick 侧窗口闸门: 窗口外在动作边界自动暂停(保留已完成动作),
+    重新进入窗口自动继续。返回本 tick 是否允许推进。"""
+    wins = windows_of_task(session, task.id)
+    if not wins:
+        return True
+    within = in_any_task_window(wins)
+    if not within:
+        reason = (
+            f"已离开预约执行窗口, 在动作边界自动暂停, 已完成动作保留, "
+            f"重新进入窗口后自动继续(窗口: {task_window_desc(wins)})")
+        # window_open=False 可能在预约时(窗口在未来)就已写入; 只要尚无暂停
+        # 原因(首次 tick 或再次离开窗口)就落暂停留痕, 避免无原因的静默暂停
+        if task.window_open is not False or not task.window_pause_reason:
+            task.window_open = False
+            task.window_pause_reason = reason
+            task.updated_by = "system"
+            _emit_comp_control(
+                session, task, operator="system", action="window_pause",
+                reason=task.window_pause_reason,
+                detail={"windows": [{"starts_at": w.starts_at.isoformat() + "Z",
+                                     "ends_at": w.ends_at.isoformat() + "Z"}
+                                    for w in wins],
+                        "success_actions": task.success_actions},
+                dedupe_token=f"comp:window:pause:{task.id}:{uuid.uuid4().hex[:10]}")
+            session.commit()
+        return False
+    if task.window_open is False:
+        task.window_open = True
+        reason = task.window_pause_reason
+        task.window_pause_reason = None
+        task.updated_by = "system"
+        _emit_comp_control(
+            session, task, operator="system", action="window_resume",
+            reason="重新进入预约执行窗口, 补偿任务自动继续, 从下一个未完成动作执行"
+                   + (f"(暂停前: {reason})" if reason else ""),
+            detail={"success_actions": task.success_actions},
+            dedupe_token=f"comp:window:resume:{task.id}:{uuid.uuid4().hex[:10]}")
+        session.commit()
+    else:
+        task.window_open = True
+    return True
+
+
+def sweep_approval_drift(session: Session) -> list[dict]:
+    """worker 周期兜底: 复核所有活动高风险任务的审批依据, 变化即失效已收集审批。
+    返回每个失效任务的摘要(测试可断言)。"""
+    results: list[dict] = []
+    tasks = (session.query(CompensationTask)
+             .filter(CompensationTask.status.in_(COMP_TASK_ACTIVE_STATUSES),
+                     CompensationTask.risk_level == "HIGH")
+             .order_by(CompensationTask.id).all())
+    for t in tasks:
+        drifts = check_approval_basis(session, t)
+        if drifts:
+            session.commit()
+            results.append({"task_id": t.id, "drifts": drifts,
+                            "approval_round": t.approval_round})
+    return results
 
 
 def _execute_one_action(session: Session, task_id: str, action_seq: int,
@@ -1191,16 +1878,42 @@ def _refresh_task_counters(session: Session, task: CompensationTask) -> None:
     task.undone_actions = sum(1 for a in acts if a.status == "UNDONE")
 
 
+def _execution_approved(session: Session, task: CompensationTask) -> bool:
+    """worker 侧审批闸门: 低风险放行; 高风险须当前轮次两名不同操作者有效通过。"""
+    if task.risk_level != "HIGH":
+        return True
+    approvers = {a.operator for a in _active_approvals(session, task)}
+    return (task.approval_status == "APPROVED"
+            and len(approvers) >= COMP_REQUIRED_APPROVALS)
+
+
 def run_execution_tick(session: Session, task_id: str,
-                       *, include_failed: bool = False) -> bool:
+                       *, include_failed: bool = False,
+                       operator: str | None = None,
+                       enforce_approval: bool = True) -> bool:
     """认领(QUEUED->RUNNING)并执行下一个 PENDING 动作; 无动作时收口任务。
 
     返回是否执行了动作。单个动作 = 单个事务边界(见 _execute_one_action 内部
     恰好提交一次): 部分失败不回滚已成功动作。worker 正常执行只取 PENDING ——
-    FAILED 动作必须由运维显式 retry_action, 避免门禁未恢复时每 tick 空转。"""
+    FAILED 动作必须由运维显式 retry_action, 避免门禁未恢复时每 tick 空转。
+
+    编排闸门: 高风险任务审批依据变化先自动失效审批(惰性), 未集齐两名审批不推进
+    (保持 QUEUED 等审批, 不占执行态); 预约窗口外在动作边界自动暂停
+    (已完成动作保留), 重新进入窗口自动继续。"""
     task = _lock_task(session, task_id)
     if task.status not in ("QUEUED", "RUNNING", "PARTIAL"):
         session.rollback()
+        return False
+    # 审批依据实时复核(可能使已收集审批失效, 独立事务留痕)
+    if check_approval_basis(session, task, commit=True):
+        session.rollback()
+    task = _lock_task(session, task_id)
+    if enforce_approval and not _execution_approved(session, task):
+        # 未集齐有效审批: 保持 QUEUED 等审批, 不认领不执行(显式 execute 已 409)
+        session.rollback()
+        return False
+    # 窗口闸门: 窗口外自动暂停/重新进入自动继续(内部按需提交)
+    if not _apply_window_gate(session, task):
         return False
     if task.status == "QUEUED":
         task.status = "RUNNING"
@@ -1215,13 +1928,15 @@ def run_execution_tick(session: Session, task_id: str,
         session.commit()
         return False
     task.current_action_seq = action.seq
-    task.updated_by = task.created_by
+    task.updated_by = operator or task.created_by
     action_seq = action.seq
-    operator = task.created_by
+    # worker 以创建者身份落地动作(审批闸门已保证创建者不是任一名审批人);
+    # 显式 execute 传入的操作者在 execute_all 入口已校验"审批人不能执行"
+    action_operator = operator or task.created_by
     # 单动作事务: 认领/claim 事件随该动作一起提交(内部提交后 identity map
     # 可能持有过期状态, 执行函数内部按 id 重新读取)
     session.expire_all()
-    _execute_one_action(session, task_id, action_seq, operator)
+    _execute_one_action(session, task_id, action_seq, action_operator)
     return True
 
 
@@ -1252,11 +1967,14 @@ def execute_all(session: Session, task_id: str, operator: str) -> CompensationTa
     """同步执行所有 PENDING 动作(测试/运维确定性驱动): 循环 tick 直到无 PENDING。
 
     FAILED 动作不在自动循环内重试(必须显式 retry_action); 遇 FAILED 即收口为
-    PARTIAL, 后续 PENDING 仍会继续执行。"""
+    PARTIAL, 后续 PENDING 仍会继续执行。高风险任务须两名不同操作者审批通过,
+    且执行人不能是审批人之一; 审批依据变化自动失效审批; 窗口外明确拒绝。"""
     task = get_task(session, task_id)
     if task.status in ("UNDO_RUNNING", "UNDO_PARTIAL", "UNDONE"):
         raise AuditReplayStateError(f"补偿任务 {task_id} 处于 {task.status}, 不能再执行")
-    # 快照过期: 执行拒绝(撤销不受此限)
+    # 入口闸门: 审批(含依据实时复核)/职责分离/执行窗口, 不满足 409
+    _require_executable_state(session, task, operator)
+    # 快照过期: 执行拒绝(撤销不受此限; 审批依据复核也会捕捉到)
     snap = get_snapshot(session, task.snapshot_id)
     if is_expired(snap):
         raise AuditReplayStateError(
@@ -1265,12 +1983,12 @@ def execute_all(session: Session, task_id: str, operator: str) -> CompensationTa
     guard = 0
     # 无待补偿动作的任务也要正确收口(QUEUED -> COMPLETED)
     if not any(a.status == "PENDING" for a in get_task(session, task_id).actions):
-        run_execution_tick(session, task_id)
+        run_execution_tick(session, task_id, operator=operator)
     while True:
         task = get_task(session, task_id)
         if not any(a.status == "PENDING" for a in task.actions):
             break
-        ran = run_execution_tick(session, task_id)
+        ran = run_execution_tick(session, task_id, operator=operator)
         if not ran:
             break
         guard += 1
@@ -1284,8 +2002,10 @@ def retry_action(session: Session, task_id: str, action_seq: int,
     """逐动作失败重试: 仅 FAILED 动作可重试。
 
     幂等: 成功动作再次请求直接返回; 副作用本身按确定性 action_key 去重
-    (COMP_EXECUTED 事件同键不重复追加)。重试成功且无未决动作 -> COMPLETED。"""
+    (COMP_EXECUTED 事件同键不重复追加)。重试成功且无未决动作 -> COMPLETED。
+    重试同样过审批/职责分离/窗口闸门(高风险任务审批失效后重试被拒)。"""
     task = get_task(session, task_id)
+    _require_executable_state(session, task, operator)
     snap = get_snapshot(session, task.snapshot_id)
     if is_expired(snap):
         raise AuditReplayStateError(
@@ -1323,12 +2043,17 @@ def undo_all(session: Session, task_id: str, operator: str) -> CompensationTask:
 
     撤销也是补偿, 只追加 COMP_UNDONE 事件(关联原 COMP_EXECUTED 事件);
     撤销不要求质量门禁通过(回滚不允许被 TTL/门禁卡死), 但记录当时门禁状态。
-    动作逐个独立事务, 部分撤销失败停在 UNDO_PARTIAL, 可继续撤销。"""
+    动作逐个独立事务, 部分撤销失败停在 UNDO_PARTIAL, 可继续撤销。
+    CANCELED 任务若已有成功动作, 也允许撤销(已落地的补偿必须能回滚)。"""
     task = get_task(session, task_id)
-    if task.status not in ("COMPLETED", "PARTIAL", "UNDO_PARTIAL"):
+    if task.status not in ("COMPLETED", "PARTIAL", "UNDO_PARTIAL", "CANCELED"):
         raise AuditReplayStateError(
             f"补偿任务 {task_id} 当前状态 {task.status}, 不允许撤销"
-            "(仅 COMPLETED/PARTIAL/UNDO_PARTIAL 可撤销)")
+            "(仅 COMPLETED/PARTIAL/UNDO_PARTIAL/CANCELED 可撤销)")
+    if task.status == "CANCELED" and not any(
+            a.status == "SUCCESS" for a in task.actions):
+        raise AuditReplayStateError(
+            f"补偿任务 {task_id} 已取消且无已执行动作, 无需撤销")
     task.status = "UNDO_RUNNING"
     task.updated_by = operator
     _add_task_event(session, task, "undo.start", operator,
@@ -1514,7 +2239,10 @@ def boot_recover_compensation(session: Session) -> None:
 
     - RUNNING 任务回到 QUEUED(worker 重新认领续跑, PENDING/FAILED 动作进度保留);
     - UNDO_RUNNING 回到 UNDO_PARTIAL(继续撤销, 已 UNDONE 动作保留);
-    - 动作的 UNDOING 复位为 SUCCESS(撤销未提交, 可重新撤销)。
+    - 动作的 UNDOING 复位为 SUCCESS(撤销未提交, 可重新撤销);
+    - 高风险活动任务复核审批依据(快照/门禁/计划状态可能在停机期间变化),
+      已变化的审批自动失效;
+    - 执行窗口边界按当前时刻重新判定(窗口暂停/恢复不丢, 不偷跑)。
     """
     tasks = session.query(CompensationTask).order_by(CompensationTask.id).all()
     for t in tasks:
@@ -1537,6 +2265,34 @@ def boot_recover_compensation(session: Session) -> None:
             if a.status == "UNDOING":
                 a.status = "SUCCESS"
                 a.last_error = "重启恢复: 撤销未完成, 复位为 SUCCESS 可重新撤销"
+                dirty = True
+        # 执行窗口对账: 边界持久化在 compensation_windows 表, 按当前时刻重判
+        if t.status in COMP_TASK_ACTIVE_STATUSES:
+            wins = windows_of_task(session, t.id)
+            if wins:
+                within = in_any_task_window(wins)
+                if not within and t.window_open is not False:
+                    t.window_open = False
+                    t.window_pause_reason = (
+                        "重启对账: 当前不在预约执行窗口内, 保持暂停, "
+                        "重新进入窗口后续跑(已完成动作保留)")
+                    _add_task_event(session, t, "window.boot_pause", "system",
+                                    reason=t.window_pause_reason)
+                    dirty = True
+                elif within and t.window_open is False:
+                    t.window_open = True
+                    t.window_pause_reason = None
+                    _add_task_event(session, t, "window.boot_resume", "system",
+                                    reason="重启对账: 已重新进入预约执行窗口, worker 将自动继续")
+                    dirty = True
+                elif t.window_open is None:
+                    t.window_open = within
+                    dirty = True
+        if dirty:
+            session.commit()
+        # 审批依据复核(独立事务, 可能使审批失效并开启新一轮)
+        if t.status in COMP_TASK_ACTIVE_STATUSES and t.risk_level == "HIGH":
+            if check_approval_basis(session, t, commit=True):
                 dirty = True
         if dirty:
             session.commit()
@@ -1570,6 +2326,11 @@ class CompensationWorker:
         from .db import SessionLocal
         db = SessionLocal()
         try:
+            # 周期兜底: 审批依据(快照/门禁/计划状态)变化使已收集审批自动失效
+            try:
+                sweep_approval_drift(db)
+            except Exception:
+                db.rollback()
             claimed = claim_due_tasks(db)
             run_ids = [r[0] for r in (db.query(CompensationTask.id)
                                       .filter(CompensationTask.status.in_(
@@ -1701,8 +2462,43 @@ def action_to_dict(a: CompensationAction) -> dict:
     }
 
 
+def approval_to_dict(a: CompensationApproval) -> dict:
+    return {
+        "id": a.id, "approval_round": a.approval_round,
+        "decision": a.decision, "operator": a.operator,
+        "reason": a.reason,
+        "invalidated_reason": a.invalidated_reason,
+        "invalidated_by": a.invalidated_by,
+        "invalidated_at": a.invalidated_at.isoformat() if a.invalidated_at else None,
+        "created_at": a.created_at.isoformat() if a.created_at else None,
+    }
+
+
 def task_to_dict(task: CompensationTask, *, with_actions: bool = True,
-                 with_events: bool = True) -> dict:
+                 with_events: bool = True,
+                 session: Session | None = None) -> dict:
+    windows = list(task.windows) if task.windows is not None else []
+    window_dicts = [{
+        "starts_at": w.starts_at.isoformat() + "Z",
+        "ends_at": w.ends_at.isoformat() + "Z",
+        "created_by": w.created_by,
+        "created_at": w.created_at.isoformat() if w.created_at else None,
+    } for w in sorted(windows, key=lambda w: (w.starts_at, w.id))]
+    in_window = in_any_task_window(windows)
+    approval_rows = (list(task.approvals) if task.approvals is not None else [])
+    approval_rows = sorted(approval_rows, key=lambda a: a.id)
+    active = [a for a in approval_rows
+              if a.approval_round == task.approval_round and a.decision == "APPROVED"]
+    invalidation_history = [
+        {"id": a.id, "approval_round": a.approval_round,
+         "operator": a.operator, "reason_code": a.invalidated_reason,
+         "reason": a.reason, "decision": a.decision,
+         "invalidated_by": a.invalidated_by,
+         "invalidated_at": a.invalidated_at.isoformat() if a.invalidated_at else None,
+         "created_at": a.created_at.isoformat() if a.created_at else None}
+        for a in approval_rows
+        if a.decision in ("INVALIDATED", "SUPERSEDED", "TASK_CANCELED", "REJECTED")
+    ]
     out = {
         "task_id": task.id, "snapshot_id": task.snapshot_id,
         "plan_id": task.plan_id, "plan_status": task.plan_status,
@@ -1711,6 +2507,26 @@ def task_to_dict(task: CompensationTask, *, with_actions: bool = True,
         "undone_actions": task.undone_actions,
         "current_action_seq": task.current_action_seq,
         "last_error": task.last_error, "failure_reason": task.failure_reason,
+        # 风险分级与双人审批
+        "risk_level": task.risk_level,
+        "approval_status": task.approval_status,
+        "approval_round": task.approval_round,
+        "required_approvals": (COMP_REQUIRED_APPROVALS
+                               if task.risk_level == "HIGH" else 0),
+        "approved_by": sorted({a.operator for a in active}),
+        "reject_reason": task.reject_reason,
+        "approvals": [approval_to_dict(a) for a in approval_rows],
+        "active_approvals": [approval_to_dict(a) for a in active],
+        "approval_invalidations": invalidation_history,
+        "canceled_by": task.canceled_by,
+        "canceled_at": task.canceled_at.isoformat() if task.canceled_at else None,
+        "cancel_reason": task.cancel_reason,
+        # 预约执行窗口
+        "windows": window_dicts,
+        "has_windows": bool(windows),
+        "window_open": (None if not windows else task.window_open),
+        "in_window": in_window,
+        "window_pause_reason": task.window_pause_reason,
         "created_by": task.created_by, "updated_by": task.updated_by,
         "started_at": task.started_at.isoformat() if task.started_at else None,
         "finished_at": task.finished_at.isoformat() if task.finished_at else None,

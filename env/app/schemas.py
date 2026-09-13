@@ -272,11 +272,40 @@ class CompensationCreate(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
     snapshot_id: str = Field(min_length=1)
+    risk_level: Optional[str] = None              # 可选: 显式 HIGH(默认按动作构成推导)
 
 
 class CompensationAction(BaseModel):
     operator: str = Field(min_length=1)
     idempotency_key: str = Field(min_length=1)
+
+
+class CompensationApprovalAction(BaseModel):
+    operator: str = Field(min_length=1)           # 审批人(不能是创建者/执行人)
+    idempotency_key: str = Field(min_length=1)
+
+
+class CompensationRejectAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    reason: str = Field(min_length=1)             # 拒绝原因必填, 落审批历史并阻止执行
+
+
+class CompensationWindowIn(BaseModel):
+    starts_at: str = Field(min_length=1)          # ISO 8601 UTC
+    ends_at: str = Field(min_length=1)
+
+
+class CompensationWindowAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    windows: list[CompensationWindowIn] = []      # 整体替换; 空列表=清空窗口限制
+
+
+class CompensationCancelAction(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1)
+    reason: Optional[str] = None                  # 取消原因(关联审批历史)
 
 
 class CompensationRetry(BaseModel):

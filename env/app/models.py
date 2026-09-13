@@ -1032,6 +1032,8 @@ AUDIT_EVENT_TYPES = (
     "COMP_EXECUTED",    # 补偿动作执行成功(只追加, 不改原事件)
     "COMP_FAILED",      # 补偿动作执行失败(只追加, 可重试)
     "COMP_UNDONE",      # 补偿动作撤销(只追加, 关联原执行事件)
+    "COMP_APPROVAL",    # 补偿审批: 通过/拒绝/失效/任务取消(只追加)
+    "COMP_WINDOW",      # 补偿执行窗口: 预约/替换/清空/窗口外暂停/重新进入继续(只追加)
 )
 # 允许运维显式补录 / 回放校验接受的乱序时钟偏移(秒):
 # event_ts 早于流上一事件超过该阈值即视为乱序, 显式补录直接拒绝,
@@ -1201,15 +1203,18 @@ class AuditSnapshotBatch(Base):
 #                                    +--部分动作失败--> PARTIAL(可逐动作/整任务重试)
 #   RUNNING/PARTIAL --undo--> UNDO_RUNNING --全部撤销成功--> UNDONE(终态)
 #                                        +--部分撤销失败--> UNDO_PARTIAL(可继续撤销)
+#   QUEUED/RUNNING/PARTIAL --cancel--> CANCELED(终态, 已完成动作保留, 不再执行)
 #   重启对账: 遗留 RUNNING/UNDO_RUNNING 回到 QUEUED/UNDO_RUNNING 安全位置续跑,
 #             动作级进度(PENDING/SUCCESS/FAILED/UNDONE)与失败原因持久化保留。
 COMP_TASK_STATUSES = (
     "QUEUED", "RUNNING", "PARTIAL", "COMPLETED",
-    "UNDO_RUNNING", "UNDO_PARTIAL", "UNDONE",
+    "UNDO_RUNNING", "UNDO_PARTIAL", "UNDONE", "CANCELED",
 )
-COMP_TASK_TERMINAL_STATUSES = ("COMPLETED", "UNDONE")
+COMP_TASK_TERMINAL_STATUSES = ("COMPLETED", "UNDONE", "CANCELED")
 COMP_TASK_ACTIVE_STATUSES = ("QUEUED", "RUNNING", "PARTIAL",
                             "UNDO_RUNNING", "UNDO_PARTIAL")
+# 可被取消的执行态(撤销态不允许取消; CANCELED 只作用于执行流程)
+COMP_TASK_CANCELABLE_STATUSES = ("QUEUED", "RUNNING", "PARTIAL")
 COMP_TASK_UNDO_STATUSES = ("UNDO_RUNNING", "UNDO_PARTIAL", "UNDONE")
 # 补偿动作状态:
 #   PENDING 待执行; SUCCESS 执行成功; FAILED 执行失败(last_error 保留, 可重试);
@@ -1220,6 +1225,43 @@ COMP_ACTION_STATUSES = ("PENDING", "SUCCESS", "FAILED", "SKIPPED", "UNDOING", "U
 #   record_cleanup  当前新表有而目标时点基线没有(__extra__) -> 删除多余新表记录
 #   batch_unfreeze  批次未走到预期终态(取消计划中仍 FROZEN/...) -> 恢复到可写 NORMAL
 COMP_ACTION_TYPES = ("record_backfill", "record_cleanup", "batch_unfreeze")
+
+# ---------- 补偿风险分级 / 双人审批 / 失效留痕 ----------
+# 风险等级(创建补偿任务时按动作构成自动推导):
+#   LOW   仅 record_backfill(按目标时点基线回填/修正), 免审批可直接执行;
+#   HIGH  含 record_cleanup(删除多余数据)/batch_unfreeze(解冻批次)等破坏性动作,
+#         必须收集两名不同操作者的独立 APPROVED 才能执行。
+COMP_RISK_LEVELS = ("LOW", "HIGH")
+# 审批状态(任务级, 仅高风险使用; 低风险恒 NOT_REQUIRED):
+#   NOT_REQUIRED 低风险免审批
+#   PENDING      高风险, 已收集审批不足两人, 不可执行
+#   APPROVED     已收集当前审批轮次两名不同操作者的独立通过, 可以执行
+#   REJECTED     任一审批人拒绝(带原因), 闸门关闭, 需重新收集两轮通过
+#   INVALIDATED  审批收集后审批依据(快照/质量门禁/计划状态)发生变化,
+#                已收集审批全部失效, 需重新收集
+#   CANCELED     任务被取消(终态), 审批不再有效
+COMP_APPROVAL_STATUSES = (
+    "NOT_REQUIRED", "PENDING", "APPROVED", "REJECTED", "INVALIDATED", "CANCELED")
+# 单条审批记录状态(只追加): APPROVED=通过; REJECTED=拒绝(带原因);
+# INVALIDATED=审批依据变化被系统失效; SUPERSEDED=拒绝新审批时被新轮次取代;
+# TASK_CANCELED=任务被取消, 未决审批随之终止。
+COMP_APPROVAL_DECISION_STATES = (
+    "APPROVED", "REJECTED", "INVALIDATED", "SUPERSEDED", "TASK_CANCELED")
+# 高风险补偿执行所需的独立审批人数(两名不同操作者)
+COMP_REQUIRED_APPROVALS = 2
+# 审批失效原因(机器可读):
+#   snapshot_expired    快照超过有效期
+#   snapshot_changed    快照状态/目标点/流边界变化
+#   gate_status_changed 质量门禁状态变化(规则版本/数据指纹/扫描/阻断问题)
+#   plan_status_changed 计划状态变化(如被取消)
+#   batch_version_gap   批次版本变化(epoch/freeze_version/阶段漂移)
+#   task_canceled       任务被取消, 未决审批终止
+#   rejection_reset     一名审批人拒绝, 此前已收集的通过失效
+#   task_rerun          (保留) 新一轮审批收集
+COMP_APPROVAL_INVALIDATE_REASONS = (
+    "snapshot_expired", "snapshot_changed", "gate_status_changed",
+    "plan_status_changed", "batch_version_gap", "task_canceled",
+    "rejection_reset")
 
 
 class CompensationTask(Base):
@@ -1262,6 +1304,21 @@ class CompensationTask(Base):
     current_action_seq = Column(Integer, nullable=True)
     last_error = Column(String(500), nullable=True)
     failure_reason = Column(String(500), nullable=True)
+    # ---------- 风险分级与双人审批 ----------
+    risk_level = Column(String(8), nullable=False, default="LOW")
+    approval_status = Column(String(16), nullable=False, default="NOT_REQUIRED")
+    # 当前审批轮次: 每次失效/拒绝重新收集 +1; 审批记录只追加并带轮次
+    approval_round = Column(Integer, nullable=False, default=0)
+    reject_reason = Column(String(500), nullable=True)   # 最近一次拒绝原因
+    # 当前轮次审批依据指纹(JSON): 首轮收集时固化; 之后复核变化即使审批失效
+    approval_basis = Column(JSON, nullable=True)
+    canceled_by = Column(String(128), nullable=True)
+    canceled_at = Column(DateTime, nullable=True)
+    cancel_reason = Column(String(500), nullable=True)
+    # ---------- 限定执行窗口运行态 ----------
+    # None=未预约窗口(不限制); True/False=最近一次判定在窗口内/窗口外(窗口暂停)
+    window_open = Column(Boolean, nullable=True)
+    window_pause_reason = Column(String(500), nullable=True)
     created_by = Column(String(128), nullable=False)
     updated_by = Column(String(128), nullable=True)
     started_at = Column(DateTime, nullable=True)
@@ -1273,6 +1330,10 @@ class CompensationTask(Base):
                            order_by="CompensationAction.seq")
     events = relationship("CompensationTaskEvent", cascade="all, delete-orphan",
                           order_by="desc(CompensationTaskEvent.id)")
+    windows = relationship("CompensationWindow", cascade="all, delete-orphan",
+                           order_by="CompensationWindow.starts_at")
+    approvals = relationship("CompensationApproval", cascade="all, delete-orphan",
+                             order_by="CompensationApproval.id")
 
 
 class CompensationAction(Base):
@@ -1331,3 +1392,60 @@ class CompensationTaskEvent(Base):
     operator = Column(String(128), nullable=False)
     reason = Column(String(500), nullable=True)
     detail = Column(JSON, nullable=True)
+
+
+class CompensationApproval(Base):
+    """补偿任务双人审批记录(只追加): 高风险补偿执行前必须收集同一审批轮次内
+    两名不同操作者的独立通过。审批人不能是任务创建者, 也不能是执行操作者。
+
+    - 同一(任务, 审批轮次, 审批人)至多一条有效结论(唯一约束兜底并发去重);
+    - 审批依据(快照/质量门禁/计划/批次版本)变化时, 当前轮次全部 APPROVED 记录
+      被置 INVALIDATED 并记录原因, 任务审批状态回到 INVALIDATED 需重新收集;
+    - 任一审批人拒绝(REJECTED 记录带原因), 该轮次其余通过置 SUPERSEDED,
+      任务审批状态为 REJECTED, 重新收集开启新一轮;
+    - 任务取消时未决记录置 TASK_CANCELED, 全部历史保留可查。"""
+
+    __tablename__ = "compensation_approvals"
+    __table_args__ = (
+        # 同一轮次同一审批人只有一条结论: 并发双人审批去重的数据库兜底
+        UniqueConstraint("task_id", "approval_round", "operator",
+                         name="uq_comp_approval_round_operator"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(32), ForeignKey("compensation_tasks.id"),
+                     nullable=False, index=True)
+    approval_round = Column(Integer, nullable=False, default=1)
+    decision = Column(String(16), nullable=False)         # APPROVED/REJECTED/INVALIDATED/...
+    operator = Column(String(128), nullable=False)
+    reason = Column(String(500), nullable=True)           # 拒绝/失效原因
+    # 该条结论提交时任务审批依据指纹(事后可核对是"依据什么批准的")
+    basis = Column(JSON, nullable=True)
+    # 失效留痕(只追加行的状态化字段): 失效原因/操作者(系统)/时刻
+    invalidated_reason = Column(String(32), nullable=True)
+    invalidated_by = Column(String(128), nullable=True)
+    invalidated_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class CompensationWindow(Base):
+    """补偿任务的限定执行窗口(闭区间 [starts_at, ends_at], UTC 存储):
+    任务只在任一窗口内执行动作; 窗口外在动作边界自动暂停(保留已完成动作),
+    重新进入窗口后 worker 自动继续; 窗口外显式执行/重试明确拒绝。
+
+    预约/替换窗口时与其他活动补偿任务做批次重叠检测: 时间重叠且动作批次集合
+    相交即冲突, 明确返回占用者与冲突时间。无窗口行的任务不受时间限制。"""
+
+    __tablename__ = "compensation_windows"
+    __table_args__ = (
+        UniqueConstraint("task_id", "starts_at", "ends_at",
+                         name="uq_comp_window"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    task_id = Column(String(32), ForeignKey("compensation_tasks.id"),
+                     nullable=False, index=True)
+    starts_at = Column(DateTime, nullable=False)
+    ends_at = Column(DateTime, nullable=False)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow)

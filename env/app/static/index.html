@@ -336,7 +336,7 @@
 
 <div class="card" style="background:#f4fbf7;border-color:#a5d6a7">
   <b>审计事件回放与补偿</b>
-  <span class="muted">不可变顺序事件流 · 时间点快照校验(连续性/规则版本/批次版本) · 补偿预览/幂等执行/失败重试/整体撤销</span>
+  <span class="muted">不可变顺序事件流 · 时间点快照校验(连续性/规则版本/批次版本) · 补偿风险分级/双人审批/执行窗口 · 预览/幂等执行/失败重试/整体撤销</span>
   <div style="margin-top:8px">
     <b>事件链查询</b>:
     计划 <input id="arPlanId" size="10" placeholder="plan_id">
@@ -2242,7 +2242,10 @@ function arShowMsg(ok, text) {
   el.textContent = text;
 }
 function arBadge(status) {
-  return `<span class="badge AR_${status}">${status}</span>`;
+  const cls = ['INVALIDATED','SUPERSEDED','TASK_CANCELED','REJECTED','FAILED','UNDO_PARTIAL'].includes(status)
+    ? 'AR_FAILED' : ['APPROVED','SUCCESS','UNDONE','COMPLETED','PASS','VALID'].includes(status)
+    ? 'QL_PASS' : `AR_${status}`;
+  return `<span class="badge ${cls}">${status}</span>`;
 }
 function arEscape(s) {
   return String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -2410,9 +2413,27 @@ async function arPreview(sid) {
 async function arCreateComp(sid) {
   const r = await arPost('/api/admin/compensations',
     { operator: operator(), idempotency_key: arKey(), snapshot_id: sid });
-  arShowMsg(r.ok, r.ok ? `补偿任务 ${r.json.task_id} 已创建并排队`
+  arShowMsg(r.ok, r.ok ? `补偿任务 ${r.json.task_id} 已创建并排队(风险 ${r.json.risk_level}, 审批 ${r.json.approval_status})`
     : ('创建失败: ' + (r.json.detail.reason || r.status)));
   refresh();
+}
+
+function arCompRiskBadge(t) {
+  if (t.risk_level === 'HIGH') {
+    const map = {PENDING: '待双人审批', APPROVED: '双人已审批', REJECTED: '审批被拒绝',
+                 INVALIDATED: '审批已失效', CANCELED: '任务已取消'};
+    const cls = t.approval_status === 'APPROVED' ? 'QL_PASS'
+      : (t.approval_status === 'INVALIDATED' || t.approval_status === 'REJECTED') ? 'AR_FAILED' : 'QL_BLOCKER';
+    return `<span class="badge AR_FAILED">高风险</span>
+      <span class="badge ${cls}">审批: ${arEscape(map[t.approval_status]||t.approval_status)}</span>`;
+  }
+  return '<span class="badge QL_PASS">低风险·免审批</span>';
+}
+
+function arCompWindowBadge(t) {
+  if (!t.has_windows) return '<span class="muted">无窗口限制</span>';
+  if (t.in_window) return '<span class="badge QL_PASS">窗口内</span>';
+  return '<span class="badge AR_FAILED">窗口外·已暂停</span>';
 }
 
 function arRenderComps(tasks) {
@@ -2420,18 +2441,79 @@ function arRenderComps(tasks) {
   if (!tasks || !tasks.length) { box.innerHTML = '<span class="muted">尚无补偿任务</span>'; return; }
   box.innerHTML = tasks.map(t => `
     <div class="card" style="margin:6px 0;padding:10px">
-      <div>${arBadge(t.status)} <b>${t.task_id}</b> 快照 ${arEscape(t.snapshot_id)}
-        计划 ${arEscape(t.plan_id)} <span class="muted">(${arEscape(t.plan_status)})</span>
+      <div>${arBadge(t.status)} <b>${t.task_id}</b> ${arCompRiskBadge(t)} ${arCompWindowBadge(t)}
+        快照 ${arEscape(t.snapshot_id)} 计划 ${arEscape(t.plan_id)}
+        <span class="muted">(${arEscape(t.plan_status)})</span>
         <span class="muted">成功 ${t.success_actions}/${t.total_actions} 失败 ${t.failed_actions} 已撤销 ${t.undone_actions}</span>
       </div>
       <div class="muted">${arEscape(t.last_error||'')} 创建者 ${arEscape(t.created_by)}</div>
       <div style="margin-top:6px">
         <button onclick="arCompAct('${t.task_id}','execute')">执行</button>
-        <button class="plain" onclick="arCompView('${t.task_id}')">详情</button>
+        <button class="plain" onclick="arCompView('${t.task_id}')">详情/审批/窗口</button>
+        <button class="plain" onclick="arCompWindow('${t.task_id}')">预约窗口</button>
+        <button class="danger" onclick="arCompCancel('${t.task_id}')">取消任务</button>
         <button class="danger" onclick="arCompAct('${t.task_id}','undo')">整体撤销</button>
       </div>
       <div id="arc-${t.task_id}"></div>
     </div>`).join('');
+}
+
+async function arCompApprove(tid) {
+  const who = prompt('审批人(不能是创建者, 两名不同操作者各提交一次):', operator());
+  if (!who) return;
+  const r = await arPost(`/api/admin/compensations/${tid}/approvals`,
+    { operator: who, idempotency_key: arKey() });
+  arShowMsg(r.ok, r.ok ? (`审批已提交: ${r.json.approval_status} (` +
+    (r.json.approved_by||[]).join(',') + ')') : ('审批失败: ' + (r.json.detail.reason || r.status)));
+  refresh(); arCompView(tid);
+}
+
+async function arCompReject(tid) {
+  const who = prompt('拒绝审批人:', operator());
+  if (!who) return;
+  const reason = prompt('拒绝原因(必填):', '');
+  if (!reason) return;
+  const r = await arPost(`/api/admin/compensations/${tid}/rejections`,
+    { operator: who, idempotency_key: arKey(), reason });
+  arShowMsg(r.ok, r.ok ? '已拒绝, 需重新收集两名审批' : ('拒绝失败: ' + (r.json.detail.reason || r.status)));
+  refresh(); arCompView(tid);
+}
+
+async function arCompWindow(tid) {
+  const s = prompt('窗口开始(本地时间, 例 2026-09-13 22:00, 留空=清空窗口):', '');
+  if (s === null) return;
+  let windows = [];
+  if (s) {
+    const e = prompt('窗口结束(本地时间):', '');
+    if (!e) return;
+    const conv = v => new Date(v).toISOString().replace(/\.\d+Z$/, 'Z');
+    windows = [{ starts_at: conv(s), ends_at: conv(e) }];
+  }
+  const r = await arFetch2('/api/admin/compensations/' + tid + '/windows', {
+    method: 'PUT', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ operator: operator(), idempotency_key: arKey(), windows })});
+  if (!r.ok && r.json.detail && r.json.detail.conflicts) {
+    const cs = r.json.detail.conflicts.map(c =>
+      `占用任务 ${c.task_id}(创建者 ${c.occupied_by}), 冲突时间 ${c.conflict_range.starts_at} ~ ${c.conflict_range.ends_at}, 批次 ${(c.shared_batches||[]).join(',')}`
+    ).join('\n');
+    arShowMsg(false, '窗口冲突:\n' + cs);
+  } else {
+    arShowMsg(r.ok, r.ok ? '执行窗口已更新' : ('窗口预约失败: ' + (r.json.detail.reason || r.status)));
+  }
+  refresh(); arCompView(tid);
+}
+
+async function arCompCancel(tid) {
+  const reason = prompt('取消原因:', '不再需要该补偿');
+  if (reason === null) return;
+  const r = await arPost(`/api/admin/compensations/${tid}/cancel`,
+    { operator: operator(), idempotency_key: arKey(), reason });
+  arShowMsg(r.ok, r.ok ? '补偿任务已取消, 已完成动作保留' : ('取消失败: ' + (r.json.detail.reason || r.status)));
+  refresh(); arCompView(tid);
+}
+
+function arFetch2(url, opts) {
+  return fetch(url, opts).then(async r => ({ ok: r.ok, status: r.status, json: await r.json().catch(()=>({})) }));
 }
 
 async function arCompView(tid) {
@@ -2447,10 +2529,42 @@ async function arCompView(tid) {
   const evs = (t.events||[]).slice(0,15).map(e => `<tr>
     <td class="muted">${(e.ts||'').replace('T',' ').slice(0,19)}</td><td>${arEscape(e.event)}</td>
     <td>${e.action_seq??'-'}</td><td>${arEscape(e.operator)}</td><td class="muted">${arEscape(e.reason||'')}</td></tr>`).join('');
+  // 双人审批区
+  let approv = '';
+  if (t.risk_level === 'HIGH') {
+    const rows = (t.approvals||[]).map(a => `<tr>
+      <td>${a.approval_round}</td><td>${arEscape(a.operator)}</td>
+      <td>${arBadge(a.decision)}</td>
+      <td class="muted">${arEscape(a.invalidated_reason||'')}</td>
+      <td class="muted">${(a.invalidated_at||'').replace('T',' ').slice(0,19)}</td>
+      <td class="muted">${arEscape(a.reason||'')}</td></tr>`).join('');
+    approv = `<b style="display:inline-block;margin-top:6px">审批(轮次 ${t.approval_round}, 需 ${t.required_approvals} 名不同操作者; 已通过: ${(t.approved_by||[]).join(', ')||'无'})</b>
+      ${t.reject_reason?`<div class="err">最近拒绝原因: ${arEscape(t.reject_reason)}</div>`:''}
+      <div style="margin:4px 0">
+        <button onclick="arCompApprove('${tid}')">提交审批通过</button>
+        <button class="danger" onclick="arCompReject('${tid}')">拒绝审批</button>
+      </div>
+      <table><thead><tr><th>轮次</th><th>审批人</th><th>结论</th><th>失效原因</th><th>失效时间</th><th>说明</th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="6" class="muted">无审批记录</td></tr>'}</tbody></table>`;
+    const inv = (t.approval_invalidations||[]).map(x => `<li>第 ${x.approval_round} 轮 ${arEscape(x.operator)}:
+      <b>${arEscape(x.reason_code||x.decision)}</b>
+      ${x.invalidated_by?`(${arEscape(x.invalidated_by)} @ ${(x.invalidated_at||'').replace('T',' ').slice(0,19)})`:''}</li>`).join('');
+    if (inv) approv += `<div style="margin-top:4px"><b>审批失效历史:</b><ul class="err">${inv}</ul></div>`;
+  }
+  // 执行窗口区
+  let wbox = '<b style="display:inline-block;margin-top:6px">预约执行窗口</b> ' + arCompWindowBadge(t);
+  if (t.has_windows) {
+    const ws = (t.windows||[]).map(w => `<li>${(w.starts_at||'').replace('T',' ').slice(0,19)} ~ ${(w.ends_at||'').replace('T',' ').slice(0,19)}</li>`).join('');
+    wbox += `<ul style="margin:4px 0">${ws}</ul>`;
+  }
+  if (t.window_pause_reason) wbox += `<div class="err">暂停原因: ${arEscape(t.window_pause_reason)}</div>`;
+  if (t.status === 'CANCELED') wbox += `<div class="err">任务已取消(${arEscape(t.canceled_by||'')}): ${arEscape(t.cancel_reason||'')}</div>`;
   document.getElementById('arc-'+tid).innerHTML =
     `<table style="margin-top:6px"><thead><tr><th>#</th><th>类型</th><th>记录</th><th>状态</th><th>尝试</th>
       <th>门禁</th><th>失败原因</th><th>执行者/执行事件</th><th>撤销者/撤销事件</th><th></th></tr></thead>
      <tbody>${acts}</tbody></table>
+     ${approv}
+     <div style="margin-top:6px">${wbox}</div>
      <b style="display:inline-block;margin-top:6px">任务事件</b>
      <table><thead><tr><th>时间</th><th>事件</th><th>动作</th><th>操作者</th><th>原因</th></tr></thead>
      <tbody>${evs}</tbody></table>`;
