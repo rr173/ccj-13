@@ -448,6 +448,12 @@ RESOLVED ──reopen(管理员, 可改派)──▶ ASSIGNED
 固定查询时点分页(稳定游标) + 每包卡片(完成率/异常/待处理争议/最近事件) + 与
 分页一致的 CSV 导出, 并保留查询/导出操作日志。
 
+**看板页面**: `GET /admin/evidence/receipt-audit`(返回静态 HTML, 浏览器打开即可;
+控制台首页"证据封存分发与离线校验"卡片内有入口链接)。页面调用下方全部
+`/api/admin/evidence/receipt-audit/...` 接口: 创建固定时点查询后展示每包卡片
+(完成率/异常数量/待处理争议/最近 5 条事件), 按严格顺序游标逐页翻取事件流,
+并可生成/下载与分页同源同序的 CSV 导出。
+
 ### POST /api/admin/evidence/receipt-audit/queries · 创建固定时点查询
 请求 `{operator, package_id?, recipient?, status?[], kinds?[], start_ts?, end_ts?}`
 (时间均 ISO 8601 闭区间)。创建时固定条件指纹与读取边界(`upper_receipt_ts` 创建

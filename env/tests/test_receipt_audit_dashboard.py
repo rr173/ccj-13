@@ -993,3 +993,29 @@ class TestPersistenceAcrossSessions:
         r2 = next_page(client, q["query_id"],
                        cursor=r1["cursor"]["next_cursor"], limit=2)
         assert r2.status_code == 200
+
+
+# ======================================================================
+# ---------- 看板页面接入(页面路由 / 首页入口) ----------
+# ======================================================================
+
+class TestDashboardPage:
+    def test_dashboard_page_served(self, client):
+        r = client.get("/admin/evidence/receipt-audit")
+        assert r.status_code == 200
+        assert r.headers["content-type"].startswith("text/html")
+        assert "回执审计看板" in r.text
+        # 页面直接调用本轮已实现的查询/分页/导出接口(BASE 常量 + 路径模板)
+        assert f"const BASE = '{BASE}'" in r.text
+        assert "`${BASE}/queries`" in r.text
+        assert "/pages" in r.text and "/exports" in r.text
+
+    def test_homepage_links_to_dashboard(self, client):
+        home = client.get("/").text
+        assert 'href="/admin/evidence/receipt-audit"' in home
+
+    def test_unknown_api_query_still_404(self, client):
+        # 页面接入不改变 API 的 404 语义
+        r = client.get(f"{BASE}/queries/RAQ00000000000000")
+        assert r.status_code == 404
+        assert r.json()["detail"]["code"] == "query_not_found"

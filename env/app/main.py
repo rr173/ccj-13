@@ -3210,4 +3210,12 @@ def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
 
 
+@app.get("/admin/evidence/receipt-audit", include_in_schema=False)
+def receipt_audit_dashboard():
+    """回执审计看板页面(只读): 包卡片(完成率/异常/待处理争议/最近事件) +
+    固定时点查询 + 严格顺序游标分页 + CSV 导出。页面调用 /api/.../receipt-audit
+    下本轮已实现的接口。"""
+    return FileResponse(os.path.join(STATIC_DIR, "receipt_audit.html"))
+
+
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")

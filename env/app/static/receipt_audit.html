@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>回执审计看板 · 证据分发/回执/争议只读视图</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 20px; color: #222; }
+  h1 { font-size: 20px; }
+  h2 { font-size: 15px; margin: 18px 0 8px; }
+  .card { border: 1px solid #ddd; border-radius: 8px; padding: 14px 16px; margin-bottom: 14px; }
+  .pkg-card { border: 1px solid #ce93d8; background: #faf5fc; border-radius: 8px;
+              padding: 12px 14px; margin-bottom: 10px; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 12px; color: #fff;
+           font-weight: 600; font-size: 12px; }
+  .ACTIVE { background: #2e7d32; } .EXPIRED { background: #ef6c00; }
+  .REVOKED { background: #c62828; } .PENDING_PROCESS { background: #ef6c00; }
+  .RECOVERED { background: #2e7d32; }
+  .tag { display: inline-block; background: #eceff1; border: 1px solid #b0bec5;
+         color: #37474f; border-radius: 10px; padding: 1px 8px; font-size: 11px;
+         margin: 1px 2px 1px 0; }
+  .tag.ok { background: #e8f5e9; border-color: #2e7d32; color: #1b5e20; }
+  .tag.err { background: #ffebee; border-color: #c62828; color: #b71c1c; }
+  .tag.warn { background: #fff3e0; border-color: #ef6c00; color: #e65100; }
+  .tag.info { background: #e3f2fd; border-color: #1565c0; color: #0d47a1; }
+  button { padding: 6px 12px; margin: 2px 4px 2px 0; border: 0; border-radius: 6px;
+           background: #6a1b9a; color: #fff; cursor: pointer; font-size: 12px; }
+  button.plain { background: #546e7a; }
+  button:disabled { background: #aaa; cursor: not-allowed; }
+  input, select { padding: 6px 8px; border: 1px solid #ccc; border-radius: 4px; margin-right: 6px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #e0e0e0; padding: 4px 8px; text-align: left; vertical-align: top; }
+  th { background: #f5f5f5; }
+  pre { background: #fafafa; border: 1px solid #eee; padding: 8px; overflow: auto; font-size: 12px; }
+  .msg { margin-top: 8px; font-size: 13px; white-space: pre-wrap; }
+  .err { color: #c62828; } .ok { color: #2e7d32; }
+  .muted { color: #777; font-size: 12px; }
+  .bar { background: #eee; border-radius: 4px; height: 10px; min-width: 120px; width: 100%; }
+  .bar > div { background: #6a1b9a; height: 10px; border-radius: 4px; }
+  .metric { display: inline-block; margin-right: 18px; font-size: 13px; }
+  .metric b { font-size: 15px; }
+  .filters label { font-size: 12px; color: #555; margin-right: 2px; }
+  a { color: #6a1b9a; }
+  .snap { background: #f3e5f5; border: 1px solid #ce93d8; border-radius: 6px;
+          padding: 8px 12px; font-size: 12px; }
+</style>
+</head>
+<body>
+<h1>回执审计看板
+  <span class="muted">证据分发 / 回执 / 争议只读视图 · 查询即固定时点快照 ·
+    <a href="/">← 返回控制台</a></span>
+</h1>
+
+<div class="card filters">
+  <b>新建固定时点查询</b>
+  <span class="muted">创建即在同一读取边界物化升序快照(回执上界=创建时刻, 争议事件上界=全库最大事件 id);
+    之后新增回执/争议不会插入本查询, 卡片完成率/异常/争议同样停留在固定时点</span>
+  <div style="margin-top:8px">
+    操作者 <input id="operator" value="admin" size="10">
+    分发包 <input id="fPackage" size="22" placeholder="EDP...(可空=全部)">
+    接收方 <input id="fRecipient" size="12" placeholder="auditor1(可空)">
+  </div>
+  <div style="margin-top:6px">
+    <label>状态(回执/争议, 多选=或)</label>
+    <select id="fStatus" multiple size="3" style="vertical-align:top;min-width:230px">
+      <optgroup label="回执类型">
+        <option value="SIGNED">SIGNED 签收</option>
+        <option value="PARTIAL">PARTIAL 部分异常</option>
+        <option value="REJECTED">REJECTED 拒收</option>
+      </optgroup>
+      <optgroup label="争议状态">
+        <option value="OPEN">OPEN 待指派</option>
+        <option value="ASSIGNED">ASSIGNED 处理中</option>
+        <option value="RESOLVED">RESOLVED 待关闭</option>
+        <option value="CLOSED">CLOSED 已关闭</option>
+      </optgroup>
+    </select>
+    <label>条目类型</label>
+    <select id="fKinds" multiple size="2" style="vertical-align:top">
+      <option value="RECEIPT">RECEIPT 回执</option>
+      <option value="DISPUTE_EVENT">DISPUTE_EVENT 争议事件</option>
+    </select>
+    <label>时间起(UTC)</label>
+    <input id="fStart" type="datetime-local" step="1" style="width:175px">
+    <label>止</label>
+    <input id="fEnd" type="datetime-local" step="1" style="width:175px">
+    <label>每页</label>
+    <input id="fLimit" type="number" value="20" min="1" max="500" style="width:70px">
+    <button onclick="raCreateQuery()">创建查询</button>
+    <button class="plain" onclick="raLoadHistory()">刷新查询历史</button>
+  </div>
+  <div id="raMsg" class="msg"></div>
+</div>
+
+<div id="raSnapshot" style="display:none"></div>
+<div id="raPackages"></div>
+
+<div class="card" id="raFeedCard" style="display:none">
+  <b>事件流(固定快照 · 严格顺序游标分页)</b>
+  <span class="muted">按 (事件时间, 类型序 回执&lt;争议, id) 升序; 游标必须逐页使用,
+    跳页/重复/跨查询会被服务端拒绝</span>
+  <div id="raPages" style="margin-top:6px"></div>
+  <table style="margin-top:6px">
+    <thead><tr>
+      <th>#</th><th>类型</th><th>事件时间(UTC)</th><th>分发包</th><th>接收方</th>
+      <th>状态</th><th>回执/争议</th><th>事件计数/动作</th><th>操作者</th><th>摘要</th>
+    </tr></thead>
+    <tbody id="raFeed"></tbody>
+  </table>
+  <div style="margin-top:8px">
+    <button id="raPrevBtn" class="plain" onclick="raPrevPage()" disabled>上一页(本快照不可回退)</button>
+    <button id="raNextBtn" onclick="raNextPage()">下一页</button>
+    <span id="raPageInfo" class="muted"></span>
+  </div>
+  <div style="margin-top:10px;border-top:1px dashed #ce93d8;padding-top:8px">
+    <button onclick="raCreateExport()">导出当前快照 CSV(与分页同源同序)</button>
+    <button class="plain" onclick="raLoadExports()">刷新导出记录</button>
+    <span class="muted">空结果导出只含表头; 同(查询, 幂等键)重放返回同一文件; 导出不依赖翻页进度</span>
+  </div>
+  <div id="raExports" style="margin-top:6px"></div>
+</div>
+
+<div class="card">
+  <b>查询历史</b> <span class="muted">最近 30 个固定查询(点击载入卡片与翻页留痕)</span>
+  <div id="raHistory" style="margin-top:6px"><span class="muted">尚未载入</span></div>
+</div>
+
+<script>
+const BASE = '/api/admin/evidence/receipt-audit';
+const state = {
+  query: null,        // 当前查询(创建/详情响应: 含 packages 卡片)
+  cursor: null,       // 下一页游标(本页面顺序取回, 与服务端 last_cursor 同步)
+  pageNo: 0,          // 已展示页数
+  limit: 20,
+  midflight: false,   // 载入的历史查询已在别处翻页: 本页面无法接续游标
+};
+
+function raMsg(msg, cls='') {
+  const el = document.getElementById('raMsg');
+  el.className = 'msg ' + cls;
+  el.textContent = msg;
+}
+function raEsc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function raKey() {
+  return 'ra-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+}
+function raOp() { return document.getElementById('operator').value.trim() || 'admin'; }
+
+function selectedValues(id) {
+  return [...document.getElementById(id).selectedOptions].map(o => o.value);
+}
+// datetime-local(浏览器本地时区) -> UTC ISO; 空则 null
+function localInputToIso(id) {
+  const v = document.getElementById(id).value;
+  if (!v) return null;
+  const d = new Date(v);
+  if (isNaN(d)) return null;
+  return d.toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+function fmtTs(ts) {
+  return ts ? raEsc(ts.replace('T', ' ').replace(/\.\d+.*$/, '').replace('Z',''))
+            : '<span class="muted">-</span>';
+}
+function pct(x) { return (x * 100).toFixed(1) + '%'; }
+
+async function raPost(url, body) {
+  const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'},
+                              body: JSON.stringify(body)});
+  let j = null; try { j = await r.json(); } catch (e) {}
+  return {ok: r.ok, status: r.status, json: j};
+}
+async function raGet(url) {
+  const r = await fetch(url);
+  let j = null; try { j = await r.json(); } catch (e) {}
+  return {ok: r.ok, status: r.status, json: j};
+}
+function raErr(j, status) {
+  const d = j && j.detail;
+  if (d && typeof d === 'object') return `[${d.code || status}] ${d.reason || JSON.stringify(d)}`;
+  return `[${status}] ${JSON.stringify(j)}`;
+}
+
+// ---------- 创建查询 ----------
+
+async function raCreateQuery() {
+  const body = {
+    operator: raOp(),
+    idempotency_key: raKey(),
+    package_id: document.getElementById('fPackage').value.trim() || null,
+    recipient: document.getElementById('fRecipient').value.trim() || null,
+    status: selectedValues('fStatus') || null,
+    kinds: selectedValues('fKinds') || null,
+    start_ts: localInputToIso('fStart'),
+    end_ts: localInputToIso('fEnd'),
+  };
+  state.limit = Math.max(1, Math.min(500,
+    parseInt(document.getElementById('fLimit').value || '20', 10)));
+  raMsg('创建固定时点查询中…');
+  const res = await raPost(`${BASE}/queries`, body);
+  if (!res.ok) { raMsg('查询被拒绝: ' + raErr(res.json, res.status), 'err'); return; }
+  const q = res.json;
+  raBindQuery(q);
+  raMsg(`查询 ${q.query_id} 已固定于 ${q.fixed_at}(UTC): ${q.total_items} 条事件 /
+    ${q.package_count} 个分发包${q.empty ? ' · 空结果(导出仍只含表头)' : ''}`, 'ok');
+  raLoadHistory();
+  // 自动取第一页
+  raNextPage();
+}
+
+function raBindQuery(q, midflight=false) {
+  state.query = q;
+  state.cursor = null;
+  state.pageNo = 0;
+  state.midflight = midflight;
+  raRenderSnapshot(q);
+  raRenderPackages(q.packages || []);
+  document.getElementById('raFeedCard').style.display = '';
+  document.getElementById('raFeed').innerHTML =
+    '<tr><td colspan="10" class="muted">点击"下一页"读取快照第一页</td></tr>';
+  document.getElementById('raPageInfo').textContent = '';
+  document.getElementById('raNextBtn').disabled = false;
+  document.getElementById('raNextBtn').textContent = '下一页';
+  document.getElementById('raExports').innerHTML = '';
+}
+
+// ---------- 固定时点/边界信息 ----------
+
+function raRenderSnapshot(q) {
+  const host = document.getElementById('raSnapshot');
+  host.style.display = '';
+  const f = q.filters || {};
+  host.innerHTML = `<div class="snap">
+    <b>查询 ${raEsc(q.query_id)}</b>
+    <span class="tag ${q.status === 'CLOSED' ? 'ok' : 'info'}">${q.status}</span>
+    <span class="muted">创建者 ${raEsc(q.created_by || '-')} · 创建于 ${raEsc(q.created_at || '-')}</span><br>
+    <span class="muted">固定时点 fixed_at: <b>${raEsc(q.fixed_at)}</b> ·
+      回执上界 ≤ ${raEsc(q.boundary.upper_receipt_ts)} ·
+      争议事件 id ≤ ${q.boundary.upper_dispute_event_id}</span><br>
+    <span class="muted">条件: 包 ${raEsc(f.package_id || '全部')} ·
+      接收方 ${raEsc(f.recipient || '全部')} ·
+      状态 ${raEsc((f.status || []).join(',') || '全部')} ·
+      类型 ${raEsc((f.kinds || []).join(',') || '全部')} ·
+      时间 ${raEsc(f.start_ts || '…')} ~ ${raEsc(f.end_ts || '…')}</span><br>
+    <span class="muted">快照摘要 feed_digest: <code>${raEsc(q.feed_digest)}</code>
+      · 条目 ${q.total_items} · 已交付页 ${q.pages_delivered}</span>
+  </div>`;
+}
+
+// ---------- 包卡片 ----------
+
+function distBadge(status) {
+  if (!status) return '<span class="muted">-</span>';
+  const label = {PENDING_PROCESS: '待处理', RECOVERED: '已恢复'}[status] || status;
+  return `<span class="badge ${raEsc(status)}">${label}</span>`;
+}
+
+function raRenderPackages(pkgs) {
+  const host = document.getElementById('raPackages');
+  if (!pkgs.length) {
+    host.innerHTML = '<div class="card muted">固定边界内没有任何分发包/分派</div>';
+    return;
+  }
+  host.innerHTML = `<h2>分发包汇总(${pkgs.length}) ·
+    <span class="muted">完成率/异常/待处理争议只受 分发包/接收方 过滤影响,
+      不受时间/状态/类型过滤影响; 最近事件取自本查询快照</span></h2>` +
+    pkgs.map(raRenderPackageCard).join('');
+}
+
+function raRenderPackageCard(p) {
+  const rate = p.completion_rate || 0;
+  const anomalies = (p.anomaly_receipt_count || 0) + (p.anomaly_event_count || 0);
+  const recent = (p.recent_events || []).map(e => `
+    <tr>
+      <td class="muted">${fmtTs(e.event_ts)}</td>
+      <td>${e.kind === 'RECEIPT'
+          ? '<span class="tag info">回执</span>'
+          : '<span class="tag warn">争议</span>'}</td>
+      <td>${raEsc(e.recipient || '-')}</td>
+      <td><span class="tag">${raEsc(e.status || '-')}</span></td>
+      <td class="muted">${e.kind === 'RECEIPT'
+          ? raEsc(e.receipt_id || '')
+          : `${raEsc(e.dispute_id || '')} · ${raEsc(e.dispute_event || '')}`}</td>
+      <td class="muted">${raEsc(e.operator || '')} ${raEsc(e.summary || '')}</td>
+    </tr>`).join('')
+    || '<tr><td colspan="6" class="muted">本查询快照内该包无事件(卡片仍按固定边界统计整体处置情况)</td></tr>';
+  return `<div class="pkg-card">
+    <div>
+      ${distBadge(p.status)}
+      <b>${raEsc(p.package_id)}</b>
+      <span class="muted">计划 ${raEsc(p.plan_id || '-')}</span>
+      ${p.open_dispute_count
+        ? `<span class="tag err">待处理争议 ${p.open_dispute_count}/${p.dispute_count}</span>`
+        : (p.dispute_count
+            ? `<span class="tag ok">争议 ${p.dispute_count}(均关闭)</span>`
+            : '<span class="tag">无争议</span>')}
+      ${anomalies ? `<span class="tag warn">异常 ${anomalies}(回执 ${p.anomaly_receipt_count} · 事件 ${p.anomaly_event_count})</span>`
+                  : '<span class="tag ok">无异常</span>'}
+    </div>
+    <div style="margin:8px 0">
+      <span class="metric">完成率 <b>${pct(rate)}</b>
+        <span class="muted">(${p.completed_receipts}/${p.total_recipients})</span></span>
+      <span class="metric"><span class="tag ok">签收 ${p.signed}</span></span>
+      <span class="metric"><span class="tag warn">部分 ${p.partial}</span></span>
+      <span class="metric"><span class="tag err">拒收 ${p.rejected}</span></span>
+      <span class="metric"><span class="tag">待回执 ${p.pending}</span></span>
+      <span class="metric"><span class="tag warn">逾期 ${p.overdue}</span></span>
+    </div>
+    <div class="bar"><div style="width:${(rate * 100).toFixed(1)}%"></div></div>
+    <details style="margin-top:8px">
+      <summary class="muted">最近事件(快照内最多 5 条)</summary>
+      <table style="margin-top:4px"><thead><tr>
+        <th>时间</th><th>类型</th><th>接收方</th><th>状态</th><th>回执/争议</th><th>操作者/摘要</th>
+      </tr></thead><tbody>${recent}</tbody></table>
+    </details>
+  </div>`;
+}
+
+// ---------- 分页 ----------
+
+async function raNextPage() {
+  if (!state.query) { raMsg('请先创建查询', 'err'); return; }
+  if (state.midflight) {
+    raMsg('该历史查询已在别处翻页, 本页面没有上一页签发的游标(严格顺序游标禁止重取/跳页); '
+      + '请新建查询从第一页开始翻页', 'err');
+    return;
+  }
+  const qid = state.query.query_id;
+  const body = {operator: raOp(), limit: state.limit};
+  if (state.cursor) body.cursor = state.cursor;
+  const res = await raPost(`${BASE}/queries/${qid}/pages`, body);
+  if (!res.ok) {
+    raMsg('翻页被拒绝: ' + raErr(res.json, res.status)
+      + ' —— 固定游标不可回退/复用; 请新建查询重新翻页', 'err');
+    return;
+  }
+  const pg = res.json;
+  state.cursor = pg.cursor.next_cursor;
+  state.pageNo += 1;
+  raRenderFeedPage(pg);
+  // 同步查询状态(末页 CLOSED / pages_delivered)
+  state.query.status = pg.query_status;
+  state.query.pages_delivered = pg.pages_delivered;
+}
+
+function raPrevPage() { /* 严格顺序游标: 快照不允许回退取页(重取会被服务端拒绝) */ }
+
+function raRenderFeedPage(pg) {
+  const rows = (pg.items || []).map(it => {
+    const kind = it.kind === 'RECEIPT'
+      ? '<span class="tag info">回执</span>'
+      : '<span class="tag warn">争议事件</span>';
+    const ref = it.kind === 'RECEIPT'
+      ? raEsc(it.receipt_id || '')
+      : `${raEsc(it.dispute_id || '')}`;
+    const detail = it.kind === 'RECEIPT'
+      ? `${it.confirmed_count ?? '-'}/${it.total_required ?? '-'} 确认`
+        + (it.anomaly_count ? ` · 异常 ${it.anomaly_count}` : '')
+        + (it.rejected_event_count ? ` · 拒认 ${it.rejected_event_count}` : '')
+      : `${raEsc(it.dispute_event || '')} `
+        + `<span class="muted">${raEsc(it.from_status || '∅')}→${raEsc(it.to_status || '·')}</span>`;
+    return `<tr>
+      <td>${it.position}</td>
+      <td>${kind}</td>
+      <td class="muted">${fmtTs(it.event_ts)}</td>
+      <td class="muted">${raEsc(it.package_id || '')}</td>
+      <td>${raEsc(it.recipient || '')}</td>
+      <td><span class="tag">${raEsc(it.status || '')}</span></td>
+      <td class="muted">${ref}</td>
+      <td class="muted">${detail}</td>
+      <td class="muted">${raEsc(it.operator || '')}</td>
+      <td class="muted">${raEsc(it.summary || '')}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('raFeed').innerHTML = rows
+    || '<tr><td colspan="10" class="muted">本页无条目(空快照或已到末尾)</td></tr>';
+  document.getElementById('raPageInfo').textContent =
+    `第 ${pg.page_no} 页 · 本页 ${pg.item_count} 条 · 位置 ${pg.cursor.position}/${pg.total_items}`
+    + ` · 查询 ${pg.query_status} · 摘要 ${(pg.page_digest || '').slice(0, 16)}…`
+    + (pg.empty ? ' · 空结果' : '');
+  document.getElementById('raNextBtn').disabled = !pg.cursor.has_more;
+  document.getElementById('raNextBtn').textContent =
+    pg.cursor.has_more ? '下一页' : '已到快照末尾(查询 CLOSED)';
+}
+
+// ---------- CSV 导出 ----------
+
+async function raCreateExport() {
+  if (!state.query) { raMsg('请先创建查询', 'err'); return; }
+  const res = await raPost(
+    `${BASE}/queries/${state.query.query_id}/exports`,
+    {operator: raOp(), idempotency_key: raKey()});
+  if (!res.ok) { raMsg('导出失败: ' + raErr(res.json, res.status), 'err'); return; }
+  raMsg(`CSV 已生成: ${res.json.file_name} · ${res.json.row_count} 行 ·
+    ${res.json.file_size} 字节 · sha256 ${res.json.file_digest.slice(0,16)}…`, 'ok');
+  raLoadExports();
+}
+
+async function raLoadExports() {
+  const qid = state.query ? state.query.query_id : null;
+  const url = qid ? `${BASE}/exports?query_id=${encodeURIComponent(qid)}` : `${BASE}/exports`;
+  const res = await raGet(url);
+  const host = document.getElementById('raExports');
+  if (!res.ok) { host.innerHTML = '<span class="err">导出记录加载失败</span>'; return; }
+  if (!res.json.length) { host.innerHTML = '<span class="muted">尚无导出</span>'; return; }
+  host.innerHTML = '<table><thead><tr><th>导出</th><th>行</th><th>字节</th>'
+    + '<th>下载次数</th><th>摘要</th><th>创建时间</th><th></th></tr></thead><tbody>'
+    + res.json.map(e => `<tr>
+      <td><b>${raEsc(e.export_id)}</b><div class="muted">${raEsc(e.file_name)}</div></td>
+      <td>${e.row_count}${e.empty ? ' <span class="tag">仅表头</span>' : ''}</td>
+      <td>${e.file_size}</td>
+      <td>${e.download_count}</td>
+      <td class="muted">${raEsc(e.file_digest.slice(0,16))}…</td>
+      <td class="muted">${raEsc((e.created_at||'').replace('T',' ').replace(/\.\d+.*$/,''))}</td>
+      <td><a href="${e.download_url}?operator=${encodeURIComponent(raOp())}"
+            target="_blank">▶ 下载 CSV</a></td>
+    </tr>`).join('') + '</tbody></table>';
+}
+
+// ---------- 查询历史 ----------
+
+async function raLoadHistory() {
+  const res = await raGet(`${BASE}/queries?limit=30`);
+  const host = document.getElementById('raHistory');
+  if (!res.ok) { host.innerHTML = '<span class="err">历史加载失败</span>'; return; }
+  if (!res.json.length) { host.innerHTML = '<span class="muted">尚无看板查询</span>'; return; }
+  host.innerHTML = '<table><thead><tr><th>查询</th><th>固定时点</th><th>条目</th>'
+    + '<th>包</th><th>条件</th><th>状态/翻页</th><th>创建者</th><th></th></tr></thead><tbody>'
+    + res.json.map(q => {
+      const f = q.filters || {};
+      const cond = [f.package_id && `包 ${f.package_id}`,
+                    f.recipient && `接收方 ${f.recipient}`,
+                    (f.status || []).length && `状态 ${f.status.join('/')}`,
+                    (f.kinds || []).length && `类型 ${f.kinds.join('/')}`,
+                    (f.start_ts || f.end_ts) && '时间窗']
+        .filter(Boolean).join(' · ') || '无过滤';
+      return `<tr>
+        <td><a href="javascript:raLoadQuery('${q.query_id}')"><b>${q.query_id}</b></a></td>
+        <td class="muted">${raEsc((q.fixed_at||'').replace('T',' ').replace(/\.\d+.*$/,''))}</td>
+        <td>${q.total_items}${q.empty ? ' <span class="tag">空</span>' : ''}</td>
+        <td>${q.package_count}</td>
+        <td class="muted">${raEsc(cond)}</td>
+        <td><span class="tag ${q.status==='CLOSED'?'ok':'info'}">${q.status}</span>
+            <span class="muted">已交付 ${q.pages_delivered} 页</span></td>
+        <td class="muted">${raEsc(q.created_by)}</td>
+        <td><button class="plain" onclick="raLoadQuery('${q.query_id}')">载入</button></td>
+      </tr>`;
+    }).join('') + '</tbody></table>';
+}
+
+async function raLoadQuery(qid) {
+  const res = await raGet(`${BASE}/queries/${qid}`);
+  if (!res.ok) { raMsg('载入查询失败: ' + raErr(res.json, res.status), 'err'); return; }
+  const q = res.json;
+  state.limit = Math.max(1, Math.min(500,
+    parseInt(document.getElementById('fLimit').value || '20', 10)));
+  // 历史查询若在别处已开始翻页, 本页面不持有上一页游标, 严格顺序规则会拒绝重取
+  const midflight = q.status !== 'CLOSED' && (q.pages_delivered || 0) > 0;
+  raBindQuery(q, midflight);
+  if (q.status === 'CLOSED') {
+    raMsg(`已载入历史查询 ${qid}(固定于 ${q.fixed_at}, 已 CLOSED): `
+      + '卡片/导出可查看; 翻页幂等回显终止空页', 'ok');
+    document.getElementById('raFeed').innerHTML =
+      '<tr><td colspan="10" class="muted">该固定快照已翻完(CLOSED); 点击"下一页"幂等回显终止空页</td></tr>';
+  } else if (midflight) {
+    raMsg(`已载入进行中的历史查询 ${qid}: 已交付 ${q.pages_delivered} 页, `
+      + '本页面不持有最近游标, 不能跳回重取(严格顺序游标); 可查看卡片/导出, 或新建查询重新翻页', 'err');
+    document.getElementById('raFeed').innerHTML =
+      '<tr><td colspan="10" class="muted">该查询已开始翻页(严格游标不可回退/重取): '
+      + '请新建查询从第一页开始; 卡片与 CSV 导出仍可正常使用</td></tr>';
+    document.getElementById('raNextBtn').disabled = true;
+  } else {
+    raMsg(`已载入历史查询 ${qid}(固定于 ${q.fixed_at}, 尚未翻页), 正在取第一页…`, 'ok');
+    raNextPage();
+  }
+  raLoadExports();
+}
+
+raLoadHistory();
+</script>
+</body>
+</html>

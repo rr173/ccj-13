@@ -846,6 +846,9 @@ OPEN ─两名不同操作者对固定范围全部事件签署→ archive → AR
   `GET .../queries/{id}`(详情含卡片/翻页留痕)、`GET .../exports` 列表。
   CSV 目录可用 `RECEIPT_AUDIT_STORE_DIR` 配置(默认分发存储目录下
   `receipt-audit/`), 游标签名可用 `RECEIPT_AUDIT_CURSOR_SECRET` 固定。
+- **看板页面**: 浏览器打开 `GET /admin/evidence/receipt-audit`(控制台首页
+  "证据封存分发"卡片内有入口), 创建固定时点查询后查看每包完成率/异常/待处理
+  争议/最近事件, 支持严格游标分页与 CSV 导出。
 
 ## 运行
 
