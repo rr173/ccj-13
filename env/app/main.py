@@ -12,14 +12,15 @@ from .models import (
     REVIEW_STATUSES, ArchiveCleanupPlan, AuditLog, AuditSnapshot,
     CompensationTask, EvidenceExport, EvidenceReview, EvidenceSession,
     MigrationBatch, MigrationPlan, QUALITY_ISSUE_STATUSES,
-    QUALITY_SCAN_STATUSES, QualityScan, RecordNew, RecordOld, ReplayArchive,
-    ReplayBatchOp, ReplayCheckpoint, ReplayTask,
+    QUALITY_SCAN_STATUSES, QualityScan, RECEIPT_AUDIT_OPERATIONS, RecordNew,
+    RecordOld, ReplayArchive, ReplayBatchOp, ReplayCheckpoint, ReplayTask,
 )
 from .plans import PlanWorker
 from .quality import QualityWorker
 from .replay import ReplayWorker
 from . import (archives, auditreplay, cleanup, disputes, distribution,
-               evidence, plans, quality, replay, reviews, service)
+               evidence, plans, quality, receiptaudit, replay, reviews,
+               service)
 from .schemas import (
     AdminAction, ArchiveAction, ArchiveCreate, ArchiveRetention,
     AuditEventNote, AuditSnapshotCreate, BatchCreate, CheckpointCreate, CleanupAction,
@@ -38,6 +39,7 @@ from .schemas import (
     EvidenceSessionCreate, PlanAction, PlanCreate, PlanRejectAction,
     PlanWindowAction, QualityExemptionCreate, QualityExemptionRevoke,
     QualityFixCreate, QualityRulesSave, QualityScanAction, QualityScanCreate,
+    ReceiptAuditExportCreate, ReceiptAuditPageQuery, ReceiptAuditQueryCreate,
     RecordIn, RecoverAction, ReplayAction, ReplayCreate, ReviewBatchAssign,
     ReviewBatchReview, ReviewConfirm, ReviewReopen, ReviewSubmit,
 )
@@ -240,6 +242,7 @@ def startup():
         archives.ensure_store_dir()
         evidence.ensure_store_dir()
         distribution.ensure_store_dir()
+        receiptaudit.ensure_store_dir()
     finally:
         db.close()
     if _worker_enabled():
@@ -2939,6 +2942,147 @@ def list_evidence_disputes(status_filter: str | None = None,
         db, status_filter=status_filter, package_id=package_id,
         assignee=assignee, pending_only=pending_only, limit=limit)
     return [disputes.dispute_to_dict(d, with_events=False) for d in rows]
+
+
+# ---------- 回执审计看板(固定时点查询 / 稳定游标 / 一致 CSV 导出) ----------
+
+def _receipt_audit_error(e: Exception):
+    raise HTTPException(status_code=getattr(e, "status_code", 409), detail={
+        "error": "receipt_audit_error", "reason": str(e),
+        "code": getattr(e, "code", "receipt_audit_conflict"),
+        **(getattr(e, "extra", {}) or {})})
+
+
+@app.post("/api/admin/evidence/receipt-audit/queries", status_code=201)
+def create_receipt_audit_query(body: ReceiptAuditQueryCreate,
+                               db: Session = Depends(get_db)):
+    """创建回执/争议看板查询(创建即固定查询时点与筛选条件)。
+
+    固定 upper_receipt_ts(创建时刻)与 upper_dispute_event_id(全库最大争议
+    事件自增 id) 作为读取边界, 并把边界内符合筛选的回执与争议事件物化为升序
+    快照。之后新增的回执/争议事件不会插入本查询的分页结果。未知接收方/分发包
+    显式 404; 非法时间范围/状态/类型 422。"""
+    try:
+        q = receiptaudit.create_query(
+            db, operator=body.operator, package_id=body.package_id,
+            recipient=body.recipient, status=body.status, kinds=body.kinds,
+            start_ts=_parse_iso(body.start_ts, "start_ts"),
+            end_ts=_parse_iso(body.end_ts, "end_ts"))
+    except receiptaudit.ReceiptAuditError as e:
+        receiptaudit.record_rejection(
+            db, "query.create", operator=body.operator,
+            code=getattr(e, "code", "receipt_audit_conflict"),
+            reason=str(e), detail=getattr(e, "extra", None))
+        db.rollback()
+        _receipt_audit_error(e)
+    return receiptaudit.query_to_dict(q)
+
+
+@app.get("/api/admin/evidence/receipt-audit/queries")
+def list_receipt_audit_queries(package_id: str | None = None,
+                               recipient: str | None = None,
+                               limit: int = 50,
+                               db: Session = Depends(get_db)):
+    """看板查询历史(可按分发包/接收方过滤, 按创建时间倒序)。"""
+    rows = receiptaudit.list_queries(
+        db, package_id=package_id, recipient=recipient, limit=limit)
+    return [receiptaudit.query_to_dict(q, with_summaries=False) for q in rows]
+
+
+@app.get("/api/admin/evidence/receipt-audit/queries/{query_id}")
+def get_receipt_audit_query(query_id: str,
+                            db: Session = Depends(get_db)):
+    """查询详情: 固定条件/边界、包汇总(完成率/异常/待处理争议/最近事件)、
+    快照摘要与翻页进度。"""
+    try:
+        q = receiptaudit.get_query(db, query_id)
+    except receiptaudit.ReceiptAuditError as e:
+        _receipt_audit_error(e)
+    return receiptaudit.query_to_dict(q, with_summaries=True, with_pages=True)
+
+
+@app.post("/api/admin/evidence/receipt-audit/queries/{query_id}/pages")
+def receipt_audit_next_page(query_id: str, body: ReceiptAuditPageQuery,
+                            db: Session = Depends(get_db)):
+    """沿固定查询按时间顺序翻下一页(稳定游标)。
+
+    无游标只能取第一页; 游标必须是本查询上一页签发的 next_cursor ——
+    跳页、重复使用、跨查询、条件指纹不符、签名损坏一律拒绝。空结果/已到末尾
+    幂等返回空页并关闭查询。"""
+    try:
+        return receiptaudit.page_query(
+            db, query_id, operator=body.operator, cursor=body.cursor,
+            limit=body.limit)
+    except receiptaudit.ReceiptAuditError as e:
+        db.rollback()
+        _receipt_audit_error(e)
+
+
+@app.post("/api/admin/evidence/receipt-audit/queries/{query_id}/exports",
+          status_code=201)
+def create_receipt_audit_export(query_id: str, body: ReceiptAuditExportCreate,
+                                db: Session = Depends(get_db)):
+    """基于固定查询生成 CSV 导出(同步落盘, 行序与分页结果严格一致)。
+
+    CSV 直接读取查询创建时物化的同一快照; 空结果导出只含表头。同一
+    (查询, 幂等键) 重放幂等返回首次导出; 幂等键被其他查询复用 -> 409。"""
+    try:
+        exp = receiptaudit.create_export(
+            db, query_id, operator=body.operator,
+            idempotency_key=body.idempotency_key)
+    except receiptaudit.ReceiptAuditError as e:
+        # create_export 的拒绝路径(含幂等键跨查询复用)已自行提交操作日志,
+        # 这里不再 rollback, 以免抹掉拒绝留痕
+        _receipt_audit_error(e)
+    return receiptaudit.export_to_dict(exp)
+
+
+@app.get("/api/admin/evidence/receipt-audit/exports")
+def list_receipt_audit_exports(query_id: str | None = None,
+                               limit: int = 100,
+                               db: Session = Depends(get_db)):
+    """看板 CSV 导出记录(可按查询过滤)。"""
+    rows = receiptaudit.list_exports(db, query_id=query_id, limit=limit)
+    return [receiptaudit.export_to_dict(e) for e in rows]
+
+
+@app.get("/api/admin/evidence/receipt-audit/exports/{export_id}")
+def get_receipt_audit_export(export_id: str,
+                             db: Session = Depends(get_db)):
+    try:
+        exp = receiptaudit.get_export(db, export_id)
+    except receiptaudit.ReceiptAuditError as e:
+        _receipt_audit_error(e)
+    return receiptaudit.export_to_dict(exp)
+
+
+@app.get("/api/admin/evidence/receipt-audit/exports/{export_id}/download")
+def download_receipt_audit_export(export_id: str, operator: str = "system",
+                                  db: Session = Depends(get_db)):
+    """下载导出 CSV(字节与创建时一致; 每次下载仅累加计数并写操作日志)。"""
+    try:
+        exp = receiptaudit.get_export(db, export_id)
+        path = receiptaudit.export_path_for_download(db, exp, operator)
+    except receiptaudit.ReceiptAuditError as e:
+        db.rollback()
+        _receipt_audit_error(e)
+    return FileResponse(path, media_type="text/csv; charset=utf-8",
+                        filename=exp.file_name)
+
+
+@app.get("/api/admin/evidence/receipt-audit/operation-logs")
+def list_receipt_audit_logs(query_id: str | None = None,
+                            operation: str | None = None,
+                            limit: int = 200,
+                            db: Session = Depends(get_db)):
+    """看板查询/导出操作日志(只追加; 含被拒绝请求的 ok=false 与 reason_code)。"""
+    if operation is not None and operation not in RECEIPT_AUDIT_OPERATIONS:
+        raise HTTPException(status_code=422, detail={
+            "error": "invalid_operation",
+            "reason": f"操作类型必须是 {list(RECEIPT_AUDIT_OPERATIONS)} 之一"})
+    rows = receiptaudit.list_op_logs(
+        db, query_id=query_id, operation=operation, limit=limit)
+    return [receiptaudit.op_log_to_dict(r) for r in rows]
 
 
 # ---------- 记录读写(按所属批次的闸门 + 双读) ----------

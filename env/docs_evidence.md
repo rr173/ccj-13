@@ -439,3 +439,56 @@ RESOLVED ──reopen(管理员, 可改派)──▶ ASSIGNED
 | `package_expired` / `package_pending_process` / `package_revoked` | 分发包过期/待处理/撤销，不能新开争议 |
 | `not_distribution_admin` / `not_dispute_admin` | 非包创建管理员执行管理员动作（403） |
 | `idempotency_reuse` | 同一幂等键被不同请求复用 |
+
+---
+
+# 回执审计看板 · 接口补充
+
+管理员只读看板: 按分发包/接收方/状态/时间范围/条目类型查询**回执与争议事件**,
+固定查询时点分页(稳定游标) + 每包卡片(完成率/异常/待处理争议/最近事件) + 与
+分页一致的 CSV 导出, 并保留查询/导出操作日志。
+
+### POST /api/admin/evidence/receipt-audit/queries · 创建固定时点查询
+请求 `{operator, package_id?, recipient?, status?[], kinds?[], start_ts?, end_ts?}`
+(时间均 ISO 8601 闭区间)。创建时固定条件指纹与读取边界(`upper_receipt_ts` 创建
+时刻 / `upper_dispute_event_id` 争议事件全库最大自增 id), 物化升序快照。
+返回 `query_id / fixed_at / boundary / filters / total_items / empty /
+feed_digest / packages[]`(卡片: completion_rate 4 位小数、anomaly_receipt_count、
+anomaly_event_count、open_dispute_count、pending/overdue/signed/partial/rejected、
+recent_events 最近 5 条)。
+拒绝: 422 `invalid_time_range`/`invalid_status`/`invalid_kind`/`result_too_large`;
+404 `recipient_unknown`/`package_not_found`。
+
+### POST /api/admin/evidence/receipt-audit/queries/{id}/pages · 严格顺序翻页
+`{operator, cursor?, limit?(1..500, 默认 50)}`。按 `(event_ts, kind 序, id)`
+升序返回 `items[]`(RECEIPT: receipt_id/receipt_type/逐事件计数; DISPUTE_EVENT:
+dispute_id/dispute_event/from_status/to_status)与
+`cursor{next_cursor, has_more, position}`、`page_no`、`total_items`、`page_digest`。
+无游标只能取首页; 末页后查询 CLOSED, 重复请求幂等返回空页。
+拒绝: 409 `cursor_required`(已开始后无游标)/ `cursor_reused`(重复或旧页码)/
+`cursor_invalid`(跳页/非本查询最近游标)/ `cursor_other_query`(跨查询)/
+`cursor_filters_mismatch`(查询条件变化)/ 422 `cursor_invalid`(签名损坏);
+404 `query_not_found`。所有拒绝都写操作日志。
+
+### POST /api/admin/evidence/receipt-audit/queries/{id}/exports · CSV 导出
+`{operator, idempotency_key}`。同步生成 CSV(utf-8-sig, 表头固定 17 列)并落盘,
+行序/行内容与同查询分页结果逐项一致(不依赖翻页进度); 空结果只含表头。
+返回 `export_id / row_count / file_digest / feed_digest / file_size / empty /
+download_url`。同 (查询, 幂等键) 重放返回同一导出; 异键重复导出生成相同字节
+(同 `file_digest`); 键被其他查询复用 → 409 `idempotency_reuse`。
+
+### GET /api/admin/evidence/receipt-audit/exports/{id}/download
+下载 `text/csv`(文件名 `receipt-audit-{query_id}-{export_id}.csv`),
+每次下载仅累加 `download_count` 并写 `query.export_download` 日志;
+文件缺失 → 404 `export_file_missing`。
+
+### 只读目录
+`GET .../receipt-audit/queries[?package_id=&recipient=&limit=]` 查询历史;
+`GET .../receipt-audit/queries/{id}` 详情(卡片 + pages[] 翻页留痕);
+`GET .../receipt-audit/exports[?query_id=&limit=]` 导出记录;
+`GET .../receipt-audit/exports/{id}` 导出元数据。
+
+### GET /api/admin/evidence/receipt-audit/operation-logs[?query_id=&operation=&limit=]
+只追加操作日志, 倒序返回。`operation ∈ query.create | query.page | query.export |
+query.export_download`; 每条含 `ok / reason_code / detail / ts / operator`,
+被拒绝的请求 `ok=false` 且带机器可读 `reason_code`。

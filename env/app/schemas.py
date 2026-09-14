@@ -510,3 +510,29 @@ class EvidenceDisputeReopen(BaseModel):
     reason: str = Field(min_length=1, max_length=2000)        # 退回原因(必填)
     new_assignee: Optional[str] = Field(default=None,
                                         min_length=1, max_length=64)
+
+
+# ---------- 回执审计看板(固定时点 / 稳定游标 / CSV 导出) ----------
+
+class ReceiptAuditQueryCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    package_id: Optional[str] = Field(default=None, min_length=1, max_length=32)
+    recipient: Optional[str] = Field(default=None,
+                                     min_length=1, max_length=64)
+    # 状态白名单: SIGNED/PARTIAL/REJECTED(回执) ∪ OPEN/ASSIGNED/RESOLVED/
+    # CLOSED(争议) ∪ PENDING/OVERDUE(未回执分派, 仅影响包汇总)
+    status: Optional[list[str]] = None
+    kinds: Optional[list[str]] = None      # RECEIPT | DISPUTE_EVENT
+    start_ts: Optional[str] = None         # ISO 8601 闭区间(按回执/事件时间)
+    end_ts: Optional[str] = None
+
+
+class ReceiptAuditPageQuery(BaseModel):
+    operator: str = Field(min_length=1)
+    cursor: Optional[str] = None           # 上一页签发的 next_cursor(严格顺序)
+    limit: Optional[int] = Field(default=None, ge=1, le=500)
+
+
+class ReceiptAuditExportCreate(BaseModel):
+    operator: str = Field(min_length=1)
+    idempotency_key: str = Field(min_length=1, max_length=128)

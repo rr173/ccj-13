@@ -803,6 +803,50 @@ OPEN ─两名不同操作者对固定范围全部事件签署→ archive → AR
   摘要、结论、关闭信息、事件流水与只读快照; 包详情/回执列表嵌入争议摘要,
   `/api/status` 附 `evidence_disputes`。状态全部落库, 服务重启后完整保留。
 
+### 回执审计看板(receipt_audit_queries)
+
+在分发/回执/争议域之上的管理员只读看板: 按**分发包、接收方、状态、时间范围与
+条目类型(RECEIPT/DISPUTE_EVENT)**查询回执与争议事件, 结果按
+`(事件时间, 类型序, 自增 id)` 稳定升序分页, 并返回每包卡片(完成率/异常数量/
+待处理争议/最近事件)与一致的 CSV 导出。
+
+- **固定查询时点**: `POST /api/admin/evidence/receipt-audit/queries` 创建即
+  快照 —— 固定筛选条件与条件指纹, 并在同一进程锁内确定边界
+  (`upper_receipt_ts`=创建时刻, `upper_dispute_event_id`=争议事件全库最大自增
+  id), 把边界内符合条件的条目一次性物化为升序 `feed_json`。之后新增的回执/
+  争议事件不会插入已开始查询的分页结果; 争议单后续状态流转也不改变快照条目与
+  包卡片(争议状态按边界内事件重放, 分派完成数按边界内回执回算)。
+- **稳定游标严格顺序**: `POST .../queries/{id}/pages {cursor?, limit?}`。游标
+  为 HMAC 签名不透明串(query_id + 下一条目位置 + 下一页码 + 条件指纹)。
+  无游标只能取第一页(已开始后无游标 `cursor_required`); 游标必须等于本查询上
+  一页签发的游标 —— 跳页(`cursor_invalid`)、重复使用(`cursor_reused`)、
+  跨查询(`cursor_other_query`)、条件指纹不符(`cursor_filters_mismatch`)、
+  签名损坏(422 `cursor_invalid`)一律拒绝。末页后查询置 CLOSED, 重复取末页
+  幂等返回空页。每页追加 `receipt_audit_pages` 留痕与 `page_digest`。
+- **包卡片**: 范围(分发包/接收方)内每个包都有卡片, 不受时间窗口/状态/类型
+  过滤影响: `completion_rate`(已完成回执分派/总分派, 4 位小数)、
+  `anomaly_receipt_count`(PARTIAL/REJECTED 回执)、`anomaly_event_count`
+  (逐事件异常+拒认条数)、`open_dispute_count`(边界内非 CLOSED 争议)、
+  `pending/overdue/signed/partial/rejected` 与 `recent_events`(查询快照内该包
+  最近 5 条)。
+- **CSV 导出**: `POST .../queries/{id}/exports {idempotency_key}` 同步渲染并
+  落盘, 直接读取同一 `feed_json`, 行序/行内容与分页逐项一致; 持久化
+  `file_digest`(CSV 字节 sha256)与 `feed_digest`(快照摘要)。**空结果导出只含
+  表头**, 仍是合法 CSV。同 (查询, 幂等键) 重放返回同一导出; 不同幂等键重复导出
+  字节完全一致; 幂等键被另一查询复用 → 409 `idempotency_reuse`。导出不依赖翻页
+  进度; `GET .../exports/{id}/download` 下载 text/csv 并累加计数。
+- **明确错误响应**: 空结果 200 且 `empty=true`(分页返回空页并关闭); 非法时间
+  范围 422 `invalid_time_range`; 非法状态/类型 422; 未知接收方 404
+  `recipient_unknown`; 未知分发包 404 `package_not_found`; 查询/导出不存在 404。
+- **操作日志**: `GET /api/admin/evidence/receipt-audit/operation-logs
+  [?query_id=&operation=]` 返回只追加日志, 覆盖 `query.create` /
+  `query.page` / `query.export` / `query.export_download`; **被拒绝的请求也以
+  `ok=false` + `reason_code` 留痕**(独立短事务提交, 不受错误回滚影响)。
+- 其它: `GET .../receipt-audit/queries`(历史, 可按包/接收方过滤)、
+  `GET .../queries/{id}`(详情含卡片/翻页留痕)、`GET .../exports` 列表。
+  CSV 目录可用 `RECEIPT_AUDIT_STORE_DIR` 配置(默认分发存储目录下
+  `receipt-audit/`), 游标签名可用 `RECEIPT_AUDIT_CURSOR_SECRET` 固定。
+
 ## 运行
 
 ```bash

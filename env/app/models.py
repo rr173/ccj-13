@@ -2295,3 +2295,143 @@ class EvidenceDistributionExtensionApproval(Base):
     reason = Column(String(500), nullable=True)            # REJECTED 时必填
     basis = Column(JSON, nullable=True)                    # 审批时复核依据
     created_at = Column(DateTime, default=_utcnow)
+
+
+# ---------- 回执审计看板(固定查询时点 / 稳定游标 / 一致 CSV 导出) ----------
+# 看板条目类型: RECEIPT=接收回执(含状态 SIGNED/PARTIAL/REJECTED),
+#              DISPUTE_EVENT=争议单生命周期事件(打开/指派/结论/关闭/退回)
+RECEIPT_AUDIT_KINDS = ("RECEIPT", "DISPUTE_EVENT")
+# 看板状态过滤白名单(回执类型 ∪ 分派状态 ∪ 争议单状态)
+RECEIPT_AUDIT_STATUSES = (
+    "SIGNED", "PARTIAL", "REJECTED",          # 回执类型(也是已完成分派状态)
+    "PENDING", "OVERDUE",                     # 分派尚未回执(包汇总/未完成数)
+    "OPEN", "ASSIGNED", "RESOLVED", "CLOSED",  # 争议单状态
+)
+# 查询/导出动作操作日志的动作类型
+RECEIPT_AUDIT_OPERATIONS = (
+    "query.create", "query.page", "query.export",
+    "query.export_download", "query.rejected",
+)
+
+
+class ReceiptAuditQuery(Base):
+    """回执审计看板查询(创建即固定): 固定筛选条件、固定查询时点与读取边界。
+
+    - filters_json 固化规范化后的筛选条件(分发包/接收方/状态/时间范围/类型),
+      之后翻页/导出一律忽略请求上的条件, 不允许"游标带着另一套条件"使用;
+    - 固定边界 upper_receipt_id / upper_dispute_event_id 为创建时刻两类事件的
+      全库最大自增 id: 之后新增回执/争议事件 id 更大, 永远不会插入本查询结果;
+    - feed_json 为固定边界内按 (事件时间, 类型序, id) 升序物化的完整条目快照
+      (条目内含创建时刻的状态副本), 翻页与 CSV 导出读取同一快照, 天然一致;
+    - 翻页严格顺序: cursor 必须是本查询上一页签发的游标, 跳页/重页/跨查询/
+      改条件一律拒绝; pages_delivered / last_cursor 单调推进, 跨请求持久化。"""
+
+    __tablename__ = "receipt_audit_queries"
+    __table_args__ = (
+        Index("ix_receipt_audit_q_created", "created_at"),
+        Index("ix_receipt_audit_q_creator", "created_by"),
+    )
+
+    id = Column(String(34), primary_key=True)               # "RAQ" + 随机串
+    # 固定筛选条件(规范化 JSON, 创建后不可变)
+    filters_json = Column(JSON, nullable=False)
+    filters_hash = Column(String(64), nullable=False)       # 条件指纹(游标配对校验)
+    package_id = Column(String(32), nullable=True, index=True)
+    recipient = Column(String(64), nullable=True, index=True)
+    start_ts = Column(DateTime, nullable=True)
+    end_ts = Column(DateTime, nullable=True)
+    # 创建时刻固定的读取边界: 回执按 submitted_at(服务端时刻), 争议事件按
+    # 自增 id(全库最大流水)。物化快照在同一把进程锁内完成, 之后新事件不进入本查询
+    upper_receipt_ts = Column(DateTime, nullable=True)
+    upper_dispute_event_id = Column(Integer, nullable=False, default=0)
+    fixed_at = Column(DateTime, nullable=False)
+    # 固定结果集快照(升序条目数组)与汇总(每包完成率/异常/待处理争议/最近事件)
+    feed_json = Column(JSON, nullable=False, default=list)
+    feed_digest = Column(String(64), nullable=False)        # 快照摘要(分页/导出复算)
+    total_items = Column(Integer, nullable=False, default=0)
+    summaries_json = Column(JSON, nullable=False, default=list)
+    package_count = Column(Integer, nullable=False, default=0)
+    # 翻页状态(严格顺序, 单调推进)
+    pages_delivered = Column(Integer, nullable=False, default=0)
+    last_cursor = Column(String(300), nullable=True)
+    last_position = Column(Integer, nullable=False, default=0)  # 已交付到的条目下标
+    status = Column(String(16), nullable=False, default="ACTIVE", index=True)
+    closed_at = Column(DateTime, nullable=True)
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+
+    pages = relationship("ReceiptAuditPage", cascade="all, delete-orphan",
+                         order_by="ReceiptAuditPage.page_no")
+    exports = relationship("ReceiptAuditExport", cascade="all, delete-orphan",
+                           order_by="ReceiptAuditExport.created_at")
+
+
+class ReceiptAuditPage(Base):
+    """看板每次成功翻页的只追加留痕: 页码、条目区间、条数与该页快照摘要,
+    供审计核对"哪些条目已向谁交付"。"""
+
+    __tablename__ = "receipt_audit_pages"
+    __table_args__ = (
+        UniqueConstraint("query_id", "page_no", name="uq_receipt_audit_page_no"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    query_id = Column(String(34), ForeignKey("receipt_audit_queries.id"),
+                      nullable=False, index=True)
+    page_no = Column(Integer, nullable=False)
+    from_position = Column(Integer, nullable=False)        # 快照内起始下标(含)
+    to_position = Column(Integer, nullable=False)          # 快照内结束下标(不含)
+    item_count = Column(Integer, nullable=False, default=0)
+    page_digest = Column(String(64), nullable=False)       # 该页条目规范化摘要
+    created_by = Column(String(128), nullable=False)
+    created_at = Column(DateTime, default=_utcnow)
+
+
+class ReceiptAuditExport(Base):
+    """看板查询的 CSV 导出(幂等): 直接物化固定快照, 与同查询分页结果逐项一致。
+
+    - CSV 在创建时一次性生成并落盘, 行序/行内容与 feed_json 完全一致;
+    - 同一 (查询, 幂等键) 重放返回首次导出; 不同幂等键对同一查询重复导出
+      得到字节完全相同的 CSV(同 file_digest), 各自留痕;
+    - 下载不改变导出内容, 仅累加 download_count 并写操作日志。"""
+
+    __tablename__ = "receipt_audit_exports"
+    __table_args__ = (
+        Index("ix_receipt_audit_export_q", "query_id"),
+    )
+
+    id = Column(String(34), primary_key=True)               # "RAE" + 随机串
+    query_id = Column(String(34), ForeignKey("receipt_audit_queries.id"),
+                      nullable=False, index=True)
+    operator = Column(String(128), nullable=False)
+    row_count = Column(Integer, nullable=False, default=0)  # 数据行数(不含表头)
+    file_name = Column(String(160), nullable=False)
+    file_path = Column(String(500), nullable=False)
+    file_size = Column(Integer, nullable=False, default=0)
+    file_digest = Column(String(64), nullable=False)        # CSV 字节 sha256
+    feed_digest = Column(String(64), nullable=False)        # 来源快照摘要
+    idempotency_key = Column(String(128), nullable=True, unique=True)
+    download_count = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=_utcnow, index=True)
+
+
+class ReceiptAuditOpLog(Base):
+    """看板查询/导出操作日志(只追加): 查询创建、翻页(含拒绝原因)、导出创建、
+    CSV 下载全部留痕; 被拒绝的请求(非法时间范围/未知接收方/游标跳页重页改条件)
+    也以 ok=false + reason_code 记录, 便于审计追踪。"""
+
+    __tablename__ = "receipt_audit_op_logs"
+    __table_args__ = (
+        Index("ix_receipt_audit_op_query", "query_id"),
+        Index("ix_receipt_audit_op_ts", "ts"),
+    )
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    ts = Column(DateTime, default=_utcnow, index=True)
+    operation = Column(String(32), nullable=False, index=True)
+    query_id = Column(String(34), nullable=True, index=True)
+    export_id = Column(String(34), nullable=True)
+    operator = Column(String(128), nullable=False)
+    ok = Column(Boolean, nullable=False, default=True)
+    reason_code = Column(String(48), nullable=True)
+    detail = Column(JSON, nullable=True)
